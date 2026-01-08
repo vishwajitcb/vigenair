@@ -113,7 +113,7 @@ class VideoMetadata:
           video_timestamp,
           encoded_user_id,
       ) = components
-      self.transcription_service = TranscriptionService.WHISPER
+      self.transcription_service = TranscriptionService.GEMINI
     else:
       raise ValueError(
           f'Invalid metadata format: expected 3 or 4 components, '
@@ -178,7 +178,7 @@ class TriggerFile:
 
   def is_extractor_audio_trigger(self) -> bool:
     return (
-        'wav' == self.file_ext and self.file_name_ext.endswith(
+        'wav' == self.file_ext and self.file_name.endswith(
             ConfigService.INPUT_EXTRACTION_AUDIO_FILENAME_SUFFIX
         )
     )
@@ -186,7 +186,7 @@ class TriggerFile:
   def is_extractor_video_trigger(self) -> bool:
     return (
         self.file_ext and VideoExtension.has_value(self.file_ext)
-        and self.file_name_ext.endswith(
+        and self.file_name.endswith(
             ConfigService.INPUT_EXTRACTION_VIDEO_FILENAME_SUFFIX
         )
     )

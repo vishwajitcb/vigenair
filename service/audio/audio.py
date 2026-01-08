@@ -292,41 +292,61 @@ def _transcribe_gemini(
         and response.candidates[0].content.parts[0].text
     ):
       text = response.candidates[0].content.parts[0].text
+      logging.info('TRANSCRIPTION - Gemini response: %s', text)
       result = (
           re.search(ConfigService.TRANSCRIBE_AUDIO_PATTERN, text, re.DOTALL)
       )
-      logging.info('TRANSCRIPTION - %s', text)
-      video_language = result.group(1)
-      language_probability = result.group(2)
-      transcription_dataframe = (
-          pd.read_csv(io.StringIO(result.group(3)), usecols=[
-              0, 1, 2
-          ]).dropna(axis=1, how='all').rename(
-              columns={
-                  'Start': 'start_s',
-                  'End': 'end_s',
-                  'Transcription': 'transcript',
-              }
-          ).assign(
-              audio_segment_id=lambda df: range(1,
-                                                len(df) + 1),
-              start_s=lambda df: df['start_s'].
-              apply(Utils.timestring_to_seconds),
-              end_s=lambda df: df['end_s'].apply(Utils.timestring_to_seconds),
-              duration_s=lambda df: df['end_s'] - df['start_s'],
+      if not result:
+        logging.error(
+            'TRANSCRIPTION - Gemini response did not match expected format. '
+            'Pattern: %s, Response: %s',
+            ConfigService.TRANSCRIBE_AUDIO_PATTERN,
+            text[:500] if len(text) > 500 else text,
+        )
+      else:
+        video_language = result.group(1).strip()
+        language_probability = result.group(2).strip()
+        csv_content = result.group(3)
+        subtitles_content = result.group(4)
+        logging.info(
+            'TRANSCRIPTION - Parsed: language=%s, confidence=%s',
+            video_language,
+            language_probability,
+        )
+        if csv_content.strip():
+          transcription_dataframe = (
+              pd.read_csv(io.StringIO(csv_content), usecols=[
+                  0, 1, 2
+              ]).dropna(axis=1, how='all').rename(
+                  columns={
+                      'Start': 'start_s',
+                      'End': 'end_s',
+                      'Transcription': 'transcript',
+                  }
+              ).assign(
+                  audio_segment_id=lambda df: range(1,
+                                                    len(df) + 1),
+                  start_s=lambda df: df['start_s'].
+                  apply(Utils.timestring_to_seconds),
+                  end_s=lambda df: df['end_s'].apply(Utils.timestring_to_seconds),
+                  duration_s=lambda df: df['end_s'] - df['start_s'],
+              )
           )
-      )
-      subtitles_content = result.group(4)
+        else:
+          logging.warning('TRANSCRIPTION - CSV content is empty')
     else:
       logging.warning(
-          'Could not transcribe audio! Returning empty transcription...'
+          'Could not transcribe audio! No response from Gemini. '
+          'Returning empty transcription...'
       )
   # Execution should continue regardless of the underlying exception
   # pylint: disable=broad-exception-caught
-  except Exception:
+  except Exception as e:
     logging.exception(
-        'Encountered error during transcription! '
-        'Returning empty transcription...'
+        'TRANSCRIPTION - Encountered error during transcription for %s: %s. '
+        'Returning empty transcription...',
+        audio_file_path,
+        str(e),
     )
 
   subtitles_output_path = audio_file_path.replace(
@@ -335,12 +355,23 @@ def _transcribe_gemini(
   with open(subtitles_output_path, 'w', encoding='utf8') as f:
     if subtitles_content:
       f.write(subtitles_content)
+      logging.info(
+          'TRANSCRIPTION - VTT file written successfully for %s',
+          audio_file_path,
+      )
     else:
-      pass
+      # Write a minimal valid VTT header so downstream processing doesn't fail
+      f.write('WEBVTT\n\n')
+      logging.warning(
+          'TRANSCRIPTION - No subtitles content, wrote empty VTT for %s',
+          audio_file_path,
+      )
 
   logging.info(
-      'TRANSCRIPTION - transcript for %s written successfully!',
+      'TRANSCRIPTION - transcript for %s completed (rows=%d, language=%s)',
       audio_file_path,
+      len(transcription_dataframe),
+      video_language,
   )
   return transcription_dataframe, video_language, float(language_probability)
 
@@ -377,8 +408,34 @@ def _transcribe_whisper(
       word_timestamps=True,
   )
 
-  video_language = languages.get(alpha2=info.language).name
+  # Handle language detection with fallback for unsupported language codes
+  video_language = ConfigService.DEFAULT_VIDEO_LANGUAGE
   language_probability = info.language_probability
+  if info.language:
+    try:
+      lang_info = languages.get(alpha2=info.language)
+      if lang_info:
+        video_language = lang_info.name
+      else:
+        logging.warning(
+            'TRANSCRIPTION - Language code "%s" not found in ISO-639, '
+            'using default: %s',
+            info.language,
+            ConfigService.DEFAULT_VIDEO_LANGUAGE,
+        )
+    except (KeyError, AttributeError) as e:
+      logging.warning(
+          'TRANSCRIPTION - Error getting language name for code "%s": %s. '
+          'Using default: %s',
+          info.language,
+          e,
+          ConfigService.DEFAULT_VIDEO_LANGUAGE,
+      )
+  else:
+    logging.warning(
+        'TRANSCRIPTION - No language detected, using default: %s',
+        ConfigService.DEFAULT_VIDEO_LANGUAGE,
+    )
 
   results = list(segments)
   results_dict = []

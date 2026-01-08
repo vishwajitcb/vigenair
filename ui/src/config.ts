@@ -23,7 +23,7 @@ import {PROMPTS} from './prompts';
  */
 export const CONFIG = {
     cloudStorage: {
-        bucket: '<gcs-bucket>',
+        bucket: 'chai-shots-465914-vigenair',
         endpointBase: 'https://storage.googleapis.com/storage/v1',
         uploadEndpointBase: 'https://storage.googleapis.com/upload/storage/v1',
         authenticatedEndpointBase: 'https://storage.mtls.cloud.google.com',
@@ -45,8 +45,8 @@ export const CONFIG = {
     },
     vertexAi: {
         endpoint: 'aiplatform.googleapis.com',
-        projectId: '<gcp-project-id>',
-        location: '<vertexai-region>',
+        projectId: 'chai-shots-465914',
+        location: 'us-central1',
         quotaLimitDelay: 10 * 1000, // 10s,
         model: 'gemini-2.5-flash',
         modelParams: {
@@ -70,7 +70,7 @@ export const CONFIG = {
     videoFolderNameSeparator: '--',
     videoFolderNoAudioSuffix: 'n',
     videoIntelligenceConfidenceThreshold: 0.7,
-    defaultTranscriptionService: 'whisper', // whisper | gemini
+    defaultTranscriptionService: 'gemini', // whisper | gemini
     defaultCacheExpiration: 60, // in seconds
     defaultDuration: 30, // in seconds
     retryDelay: 6000, // in milliseconds

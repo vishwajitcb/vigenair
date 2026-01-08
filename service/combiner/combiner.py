@@ -677,6 +677,14 @@ def _create_cropped_video(
   w = matches.group(1) if matches else None
   h = matches.group(2) if matches else None
 
+  # Skip cropping if dimensions are 0 (video already in target aspect ratio)
+  if w == '0' or h == '0':
+    logging.info(
+        'RENDERING - Skipping crop for %s (dimensions w=%s, h=%s indicate '
+        'video is already in target aspect ratio)', format_type, w, h
+    )
+    return None
+
   if w and h:
     file_name = Combiner.CROP_FILENAME_TEMPLATE.format(
         format_type=format_type, video_ext=video_ext

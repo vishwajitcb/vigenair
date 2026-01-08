@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-gcloud config set project <gcp-project-id>
+gcloud config set project chai-shots-465914
 gcloud services enable cloudresourcemanager.googleapis.com
 gcloud services enable compute.googleapis.com
-gcloud auth application-default set-quota-project <gcp-project-id>
-printf "\nINFO - GCP project set to '<gcp-project-id>' successfully!\n"
+gcloud auth application-default set-quota-project chai-shots-465914
+printf "\nINFO - GCP project set to 'chai-shots-465914' successfully!\n"
 
 test $? -eq 0 || exit

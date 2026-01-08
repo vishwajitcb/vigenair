@@ -22,6 +22,8 @@ const spawn = require("cross-spawn");
 
 export const DEFAULT_GCP_REGION = "us-central1";
 export const DEFAULT_GCS_LOCATION = "us";
+export const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
+export const DEFAULT_WHISPER_MODEL = "small";
 const GCS_BUCKET_NAME_SUFFIX = "-vigenair";
 const USE_TERRAFORM_FOR_GCP_DEPLOYMENT = false;
 
@@ -30,6 +32,8 @@ interface Config {
   gcpRegion?: string;
   gcsLocation?: string;
   vertexAiRegion?: string;
+  geminiModel?: string;
+  whisperModel?: string;
 }
 
 interface ConfigReplace {
@@ -230,6 +234,11 @@ export class UserConfigManager {
       });
     };
 
+    // Preserve model settings from existing config before git checkout
+    const existingConfig = UserConfigManager.getUserConfig();
+    const geminiModel = existingConfig.geminiModel || DEFAULT_GEMINI_MODEL;
+    const whisperModel = existingConfig.whisperModel || DEFAULT_WHISPER_MODEL;
+
     console.log();
     console.log("Reverting local changes...");
     spawn.sync("git checkout -- ./service/.env.yaml", {
@@ -317,6 +326,34 @@ export class UserConfigManager {
         paths: ["./ui/src/config.ts"],
       });
     }
+
+    // Apply preserved model settings (replace defaults with saved values)
+    if (geminiModel !== DEFAULT_GEMINI_MODEL) {
+      console.log(`Applying saved Gemini model: ${geminiModel}`);
+      configReplace({
+        regex: DEFAULT_GEMINI_MODEL,
+        replacement: geminiModel,
+        paths: [
+          "./service/.env.yaml",
+          "./service/config/config.py",
+          "./ui/src/config.ts",
+        ],
+      });
+    }
+    if (whisperModel !== DEFAULT_WHISPER_MODEL) {
+      console.log(`Applying saved Whisper model: ${whisperModel}`);
+      configReplace({
+        regex: `CONFIG_TRANSCRIPTION_MODEL_WHISPER: ${DEFAULT_WHISPER_MODEL}`,
+        replacement: `CONFIG_TRANSCRIPTION_MODEL_WHISPER: ${whisperModel}`,
+        paths: ["./service/.env.yaml"],
+      });
+      configReplace({
+        regex: `'CONFIG_TRANSCRIPTION_MODEL_WHISPER', '${DEFAULT_WHISPER_MODEL}'`,
+        replacement: `'CONFIG_TRANSCRIPTION_MODEL_WHISPER', '${whisperModel}'`,
+        paths: ["./service/config/config.py"],
+      });
+    }
+
     fs.writeFileSync(
       ".config.json",
       JSON.stringify({
@@ -324,6 +361,8 @@ export class UserConfigManager {
         gcpRegion,
         gcsLocation,
         vertexAiRegion,
+        geminiModel,
+        whisperModel,
       })
     );
     console.log();
