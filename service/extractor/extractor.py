@@ -140,8 +140,11 @@ class Extractor:
       )
 
       # Delete the local .mov file to prevent it from being re-uploaded
-      os.remove(input_video_file_path)
-      logging.info('EXTRACTOR - Deleted local .mov file')
+      try:
+        os.remove(input_video_file_path)
+        logging.info('EXTRACTOR - Deleted local .mov file')
+      except OSError as e:
+        logging.warning('EXTRACTOR - Failed to delete .mov file: %s', str(e))
 
       # Use the MP4 file for all subsequent processing
       input_video_file_path = mp4_file_path
@@ -157,11 +160,15 @@ class Extractor:
       temp_mp4_path = None
       if converted_from_mov:
         temp_mp4_path = input_video_file_path + '.temp'
-        os.rename(input_video_file_path, temp_mp4_path)
-        logging.info(
-            'EXTRACTOR - Temporarily moved converted mp4 to prevent duplicate '
-            'upload'
-        )
+        try:
+          os.rename(input_video_file_path, temp_mp4_path)
+          logging.info(
+              'EXTRACTOR - Temporarily moved converted mp4 to prevent duplicate '
+              'upload'
+          )
+        except OSError as e:
+          logging.error('EXTRACTOR - Failed to move MP4 temporarily: %s', str(e))
+          temp_mp4_path = None  # Don't try to restore if move failed
 
       StorageService.upload_gcs_dir(
           source_directory=tmp_dir,
@@ -171,8 +178,11 @@ class Extractor:
 
       # Move mp4 back for subsequent processing
       if temp_mp4_path:
-        os.rename(temp_mp4_path, input_video_file_path)
-        logging.info('EXTRACTOR - Restored converted mp4 for processing')
+        try:
+          os.rename(temp_mp4_path, input_video_file_path)
+          logging.info('EXTRACTOR - Restored converted mp4 for processing')
+        except OSError as e:
+          logging.error('EXTRACTOR - Failed to restore MP4: %s', str(e))
 
     with concurrent.futures.ProcessPoolExecutor() as process_executor:
       futures = {
@@ -938,14 +948,16 @@ def _cut_and_annotate_av_segment(
             av_segment_id, str(e)
         )
         result = re.search(ConfigService.SEGMENT_ANNOTATIONS_PATTERN, text)
-        if result:
-          description = result.group(2)
-          keywords = result.group(3)
+        if result and len(result.groups()) >= 3:
+          description = result.group(2) or ''
+          keywords = result.group(3) or ''
         else:
           logging.warning(
               'ANNOTATION - Pattern did not match for segment %s!',
               av_segment_id,
           )
+          description = ''
+          keywords = ''
     else:
       logging.warning(
           'ANNOTATION - Could not annotate segment %s!', av_segment_id

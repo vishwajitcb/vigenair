@@ -37,6 +37,7 @@ import pandas as pd
 import storage as StorageService
 import utils as Utils
 import vertexai
+from google.api_core import exceptions as api_exceptions
 from vertexai.generative_models import GenerativeModel, Part
 
 
@@ -239,27 +240,35 @@ class Combiner:
       with open(finalise_file_path, 'w', encoding='utf8'):
         pass
 
-      StorageService.upload_gcs_file(
-          file_path=finalise_file_path,
-          bucket_name=self.gcs_bucket_name,
-          destination_file_name=str(
-              pathlib.Path(self.render_file.gcs_folder, finalise_file_path)
-          ),
-      )
+      try:
+        StorageService.upload_gcs_file(
+            file_path=finalise_file_path,
+            bucket_name=self.gcs_bucket_name,
+            destination_file_name=str(
+                pathlib.Path(self.render_file.gcs_folder, finalise_file_path)
+            ),
+        )
+      except api_exceptions.PreconditionFailed:
+        logging.info(
+            'RENDER_FINALISE - File already exists (uploaded by another instance), '
+            'skipping: %s', finalise_file_path
+        )
 
   def finalise_render(self):
     """Combines all generated <id>_combos.json into a single one."""
     logging.info('COMBINER - Finalising rendering...')
     tmp_dir = tempfile.mkdtemp()
-    render_output_dicts = [
-        json.loads(json_file_contents.decode('utf-8'))
-        for json_file_contents in StorageService.filter_files(
-            bucket_name=self.gcs_bucket_name,
-            prefix=f'{self.render_file.gcs_folder}/',
-            suffix=ConfigService.OUTPUT_COMBINATIONS_FILE,
-            fetch_content=True,
-        )
-    ]
+    render_output_dicts = []
+    for json_file_contents in StorageService.filter_files(
+        bucket_name=self.gcs_bucket_name,
+        prefix=f'{self.render_file.gcs_folder}/',
+        suffix=ConfigService.OUTPUT_COMBINATIONS_FILE,
+        fetch_content=True,
+    ):
+      try:
+        render_output_dicts.append(json.loads(json_file_contents.decode('utf-8')))
+      except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        logging.warning('COMBINER - Failed to parse combo output file: %s', str(e))
     output = {}
     for render_output_dict in render_output_dicts:
       for k, v in render_output_dict.items():
@@ -287,7 +296,8 @@ class Combiner:
 
   def render(self):
     """Renders a single video based on the input rendering settings."""
-    variant_id = self.render_file.file_name.split('_')[0]
+    parts = self.render_file.file_name.split('_')
+    variant_id = parts[0] if parts else '1'
     logging.info('COMBINER - Starting rendering variant %s...', variant_id)
     tmp_dir = tempfile.mkdtemp()
     root_video_folder = self.render_file.gcs_root_folder
@@ -312,7 +322,8 @@ class Combiner:
     # If download failed and file was input.mov, try input.mp4
     # (for backwards compatibility with old .mov files)
     if video_file_path is None and video_file_name.endswith('input.mov'):
-      folder = video_file_name.rsplit('/', 1)[0]
+      rsplit_result = video_file_name.rsplit('/', 1)
+      folder = rsplit_result[0] if len(rsplit_result) > 1 else ''
       mp4_file_name = f'{folder}/input.mp4'
       logging.info(
           'RENDERING - input.mov not found, trying input.mp4: %s',
@@ -408,12 +419,20 @@ class Combiner:
         bucket_name=self.gcs_bucket_name,
         fetch_contents=True,
     )
-    video_variant = list(
-        map(
-            _video_variant_mapper,
-            enumerate(json.loads(render_file_contents.decode('utf-8'))),
-        )
-    )[0]
+    try:
+      render_data = json.loads(render_file_contents.decode('utf-8'))
+      if not isinstance(render_data, list) or len(render_data) == 0:
+        raise ValueError('Render file must contain a non-empty list')
+      video_variants = list(map(_video_variant_mapper, enumerate(render_data)))
+      if not video_variants:
+        raise ValueError('No video variants found in render file')
+      video_variant = video_variants[0]
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+      logging.error('COMBINER - Failed to parse render file JSON: %s', str(e))
+      raise ValueError(f'Invalid JSON in render file: {str(e)}') from e
+    except (ValueError, IndexError) as e:
+      logging.error('COMBINER - Invalid render file structure: %s', str(e))
+      raise
     combos_dir = tempfile.mkdtemp()
     rendered_combos = {}
     rendered_variant_paths = _render_video_variant(
@@ -501,7 +520,8 @@ class Combiner:
     # If download failed and file was input.mov, try input.mp4
     # (for backwards compatibility with old .mov files)
     if video_file_path is None and video_file_name.endswith('input.mov'):
-      folder = video_file_name.rsplit('/', 1)[0]
+      rsplit_result = video_file_name.rsplit('/', 1)
+      folder = rsplit_result[0] if len(rsplit_result) > 1 else ''
       mp4_file_name = f'{folder}/input.mp4'
       logging.info(
           'RENDERING - input.mov not found, trying input.mp4: %s',
@@ -684,8 +704,13 @@ def _create_cropped_video(
     first_line = f.readline().strip()
   matches = re.search(r'crop w (.*), crop h (.*);', first_line)
 
-  w = matches.group(1) if matches else None
-  h = matches.group(2) if matches else None
+  w = None
+  h = None
+  if matches and len(matches.groups()) >= 2:
+    w = matches.group(1)
+    h = matches.group(2)
+  elif matches:
+    logging.warning('RENDERING - Crop regex matched but missing groups: %s', first_line)
 
   # Skip cropping if dimensions are 0 (video already in target aspect ratio)
   if w == '0' or h == '0':
@@ -1215,7 +1240,14 @@ def _render_format(
         'RENDER_FORMAT - %s: Renaming temp file to final output',
         format_type_str
     )
-    os.rename(actual_output, output_video_path)
+    try:
+      os.rename(actual_output, output_video_path)
+    except OSError as e:
+      logging.error(
+          'RENDER_FORMAT - Failed to rename %s to %s: %s',
+          actual_output, output_video_path, str(e)
+      )
+      raise
 
   output = {
       'path': format_name,

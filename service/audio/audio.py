@@ -123,12 +123,25 @@ def combine_subtitle_files(
         else:
           combined_content += line
 
-      _, end = lines[-3].strip().split(' --> ')
-      last_timestamp += datetime.timedelta(
-          minutes=int(end[:2]),
-          seconds=int(end[3:5]),
-          milliseconds=int(end[6:]),
-      )
+      # Find the last timestamp line to update last_timestamp for next file
+      last_timestamp_line = None
+      for i in range(len(lines) - 1, -1, -1):
+        if ' --> ' in lines[i]:
+          last_timestamp_line = lines[i]
+          break
+
+      if last_timestamp_line:
+        try:
+          _, end = last_timestamp_line.strip().split(' --> ')
+          last_timestamp += datetime.timedelta(
+              minutes=int(end[:2]),
+              seconds=int(end[3:5]),
+              milliseconds=int(end[6:]),
+          )
+        except (ValueError, IndexError) as e:
+          logging.warning('AUDIO - Failed to parse last timestamp from subtitle file: %s', str(e))
+      else:
+        logging.warning('AUDIO - No timestamp found in subtitle file')
 
   with open(subtitles_output_path, 'w', encoding='utf-8') as f:
     f.write(combined_content)
@@ -214,15 +227,34 @@ def split_audio(
       pathlib.Path(output_dir, f'{prefix}{ConfigService.OUTPUT_MUSIC_FILE}')
   )
 
-  shutil.move(
-      f'{base_path}/{ConfigService.OUTPUT_SPEECH_FILE}',
-      vocals_file_path if prefix else output_dir
-  )
-  shutil.move(
-      f'{base_path}/{ConfigService.OUTPUT_MUSIC_FILE}',
-      music_file_path if prefix else output_dir
-  )
-  os.rmdir(base_path)
+  src_vocals = f'{base_path}/{ConfigService.OUTPUT_SPEECH_FILE}'
+  src_music = f'{base_path}/{ConfigService.OUTPUT_MUSIC_FILE}'
+  dest_vocals = vocals_file_path if prefix else output_dir
+  dest_music = music_file_path if prefix else output_dir
+
+  try:
+    if os.path.exists(src_vocals):
+      shutil.move(src_vocals, dest_vocals)
+    else:
+      logging.warning('AUDIO - Vocals file not found: %s', src_vocals)
+  except Exception as e:
+    logging.error('AUDIO - Failed to move vocals file: %s', str(e))
+    raise
+
+  try:
+    if os.path.exists(src_music):
+      shutil.move(src_music, dest_music)
+    else:
+      logging.warning('AUDIO - Music file not found: %s', src_music)
+  except Exception as e:
+    logging.error('AUDIO - Failed to move music file: %s', str(e))
+    raise
+
+  try:
+    if os.path.exists(base_path) and os.path.isdir(base_path):
+      os.rmdir(base_path)
+  except OSError as e:
+    logging.warning('AUDIO - Failed to remove temp directory %s: %s', base_path, str(e))
 
   return vocals_file_path, music_file_path
 

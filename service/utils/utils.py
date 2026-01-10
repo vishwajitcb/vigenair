@@ -274,8 +274,16 @@ def execute_subprocess_commands(
 
 def timestring_to_seconds(timestring: str) -> float:
   """Converts a timestring in the format mm:ss.SSS to seconds."""
-  minutes, seconds = map(float, timestring.split(':'))
-  return minutes*60 + seconds
+  try:
+    parts = timestring.split(':')
+    if len(parts) != 2:
+      logging.warning('UTILS - Invalid timestring format: %s, expected mm:ss.SSS', timestring)
+      return 0.0
+    minutes, seconds = map(float, parts)
+    return minutes * 60 + seconds
+  except (ValueError, AttributeError) as e:
+    logging.warning('UTILS - Error parsing timestring "%s": %s', timestring, str(e))
+    return 0.0
 
 
 def rename_chunks(result: Sequence[str], file_suffix: str):
@@ -283,10 +291,15 @@ def rename_chunks(result: Sequence[str], file_suffix: str):
   for output_file_path in result:
     file_name, file_ext = os.path.splitext(output_file_path)
     file_name = file_name.replace(file_suffix, '')
-    os.rename(
-        output_file_path,
-        f'{file_name}-{len(result)}{file_suffix}{file_ext}',
-    )
+    new_path = f'{file_name}-{len(result)}{file_suffix}{file_ext}'
+    try:
+      os.rename(output_file_path, new_path)
+    except OSError as e:
+      logging.error(
+          'UTILS - Failed to rename chunk %s to %s: %s',
+          output_file_path, new_path, str(e)
+      )
+      raise
 
 
 def get_media_duration(input_file_path: str) -> float:
