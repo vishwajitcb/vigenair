@@ -38,6 +38,7 @@ import pandas as pd
 import storage as StorageService
 import utils as Utils
 import vertexai
+from google.api_core import exceptions as api_exceptions
 from vertexai.generative_models import GenerativeModel, Part
 import video as VideoService
 
@@ -174,22 +175,34 @@ class Extractor:
         logging.info('EXTRACTOR - Restored converted mp4 for processing')
 
     with concurrent.futures.ProcessPoolExecutor() as process_executor:
-      concurrent.futures.wait([
+      futures = {
           process_executor.submit(
               AudioExtractor.process_audio,
               output_dir=tmp_dir,
               input_audio_file_path=input_audio_file_path,
               gcs_bucket_name=self.gcs_bucket_name,
               media_file=self.media_file,
-          ),
+          ): 'audio_processing',
           process_executor.submit(
               VideoExtractor.process_video,
               output_dir=tmp_dir,
               input_video_file_path=input_video_file_path,
               media_file=self.media_file,
               gcs_bucket_name=self.gcs_bucket_name,
+          ): 'video_processing',
+      }
+      for future in concurrent.futures.as_completed(futures):
+        task_name = futures[future]
+        try:
+          future.result()
+          logging.info('EXTRACTOR - %s completed successfully', task_name)
+        except Exception as e:
+          logging.error(
+              'EXTRACTOR - %s FAILED with error: %s',
+              task_name,
+              str(e),
+              exc_info=True,
           )
-      ])
 
   def extract_audio(self):
     """Extracts audio information from the input video."""
@@ -401,13 +414,19 @@ class Extractor:
       with open(finalise_file_path, 'w', encoding='utf8'):
         pass
 
-      StorageService.upload_gcs_file(
-          file_path=finalise_file_path,
-          bucket_name=self.gcs_bucket_name,
-          destination_file_name=str(
-              pathlib.Path(self.media_file.gcs_folder, finalise_file_path)
-          ),
-      )
+      try:
+        StorageService.upload_gcs_file(
+            file_path=finalise_file_path,
+            bucket_name=self.gcs_bucket_name,
+            destination_file_name=str(
+                pathlib.Path(self.media_file.gcs_folder, finalise_file_path)
+            ),
+        )
+      except api_exceptions.PreconditionFailed:
+        logging.info(
+            'EXTRACT_FINALISE - File already exists (uploaded by another instance), '
+            'skipping: %s', finalise_file_path
+        )
 
   def finalise_extraction(self):
     """Combines all analysis outpus and creates the optimised segments."""

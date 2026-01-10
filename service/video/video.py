@@ -21,11 +21,14 @@ import json
 import logging
 import os
 import pathlib
+import random
 import re
+import time
 from typing import Any, Dict, Sequence, Tuple
 
 import config as ConfigService
 import pandas as pd
+from google.api_core import exceptions as api_exceptions
 from google.cloud import videointelligence
 
 
@@ -262,6 +265,7 @@ def _run_video_intelligence(
     bucket_name: str,
     gcs_input_path: str,
     gcs_output_path: str,
+    max_retries: int = 5,
 ) -> videointelligence.VideoAnnotationResults:
   """Runs video analysis via the Video AI API and returns the results.
 
@@ -269,6 +273,7 @@ def _run_video_intelligence(
     bucket_name: The GCS bucket name where the video is stored.
     gcs_input_path: The path to the input video file in GCS.
     gcs_output_path: The path to the output analysis file in GCS.
+    max_retries: Maximum number of retries on rate limit errors.
 
   Returns:
     The annotation results from the Video AI API.
@@ -295,17 +300,43 @@ def _run_video_intelligence(
       face_detection_config=face_config,
   )
 
-  operation = video_client.annotate_video(
-      request={
-          'features': features,
-          'input_uri': f'gs://{bucket_name}/{gcs_input_path}',
-          'output_uri': f'gs://{bucket_name}/{gcs_output_path}',
-          'video_context': context,
-      }
-  )
+  # Retry with exponential backoff on rate limit errors
+  for attempt in range(max_retries):
+    try:
+      # Add random jitter to avoid thundering herd
+      if attempt > 0:
+        wait_time = (2 ** attempt) + random.uniform(0, 1)
+        logging.info(
+            'VIDEO_ANALYSIS - Retry attempt %d, waiting %.1fs before retry...',
+            attempt + 1,
+            wait_time,
+        )
+        time.sleep(wait_time)
 
-  result = operation.result(timeout=3600)
-  return result.annotation_results[0]
+      operation = video_client.annotate_video(
+          request={
+              'features': features,
+              'input_uri': f'gs://{bucket_name}/{gcs_input_path}',
+              'output_uri': f'gs://{bucket_name}/{gcs_output_path}',
+              'video_context': context,
+          }
+      )
+
+      result = operation.result(timeout=3600)
+      return result.annotation_results[0]
+
+    except api_exceptions.ResourceExhausted as e:
+      logging.warning(
+          'VIDEO_ANALYSIS - Rate limit hit (attempt %d/%d): %s',
+          attempt + 1,
+          max_retries,
+          str(e),
+      )
+      if attempt == max_retries - 1:
+        raise  # Re-raise on final attempt
+
+  # Should never reach here, but just in case
+  raise RuntimeError('Max retries exceeded for video analysis')
 
 
 def get_visual_shots_data(

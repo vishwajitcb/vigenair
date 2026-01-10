@@ -46,6 +46,12 @@ CONFIG_MAX_VIDEO_CHUNK_SIZE = float(
         f'{5 * 1e8}'  # 0.5 GB
     )
 )
+CONFIG_MAX_VIDEO_CHUNK_DURATION = float(
+    os.environ.get(
+        'CONFIG_MAX_VIDEO_CHUNK_DURATION',
+        '300'  # 5 minutes - prevents Video Intelligence API timeout
+    )
+)
 CONFIG_MAX_AUDIO_CHUNK_SIZE = float(
     os.environ.get(
         'CONFIG_MAX_AUDIO_CHUNK_SIZE',
@@ -113,7 +119,10 @@ OUTPUT_AV_SEGMENTS_DIR = 'av_segments_cuts'
 OUTPUT_ANALYSIS_CHUNKS_DIR = 'analysis_chunks'
 OUTPUT_COMBINATION_ASSETS_DIR = 'assets'
 
-GCS_BASE_URL = 'https://storage.mtls.cloud.google.com'
+# Use standard public GCS URL for browser-accessible video playback
+# mTLS endpoint (storage.mtls.cloud.google.com) requires client certificates
+# that browsers don't have, causing "No video with supported format" errors
+GCS_BASE_URL = 'https://storage.googleapis.com'
 
 SEGMENT_SCREENSHOT_EXT = '.jpg'
 SEGMENT_ANNOTATIONS_PATTERN = '(.*Description:\n?)?(.*)\n*Keywords:\n?(.*)'
@@ -209,6 +218,13 @@ TRANSCRIBE_AUDIO_CONFIG = {
         'thinking_budget': 0,
     },
 }
+# Flexible patterns to extract transcription components separately
+# This allows handling responses where CSV or VTT blocks may be missing
+TRANSCRIBE_AUDIO_LANGUAGE_PATTERN = r'Language:\s*(.+?)(?:\n|$)'
+TRANSCRIBE_AUDIO_CONFIDENCE_PATTERN = r'Confidence:\s*([\d.]+)'
+TRANSCRIBE_AUDIO_CSV_PATTERN = r'```csv\s*\n(.*?)```'
+TRANSCRIBE_AUDIO_VTT_PATTERN = r'```vtt\s*\n(.*?)```'
+# Legacy combined pattern (kept for backwards compatibility)
 TRANSCRIBE_AUDIO_PATTERN = '.*Language: ?(.*)\n*.*Confidence: ?(.*)\n*```csv\n(.*)```\n*```vtt\n(.*)```'
 
 ENHANCE_SEGMENT_ANNOTATIONS_CONFIG = {

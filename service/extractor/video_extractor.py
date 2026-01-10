@@ -21,12 +21,14 @@ from an input video file.
 import logging
 import os
 import pathlib
+import time
 from typing import Sequence
 
 import config as ConfigService
 import storage as StorageService
 import utils as Utils
 import video as VideoService
+from google.api_core import exceptions as api_exceptions
 
 
 def process_video(
@@ -34,6 +36,7 @@ def process_video(
     input_video_file_path: str,
     media_file: Utils.TriggerFile,
     gcs_bucket_name: str,
+    chunk_upload_delay: int = 60,  # Delay between chunk uploads in seconds
 ):
   """Creates video chunks to be analysed."""
   video_chunks = _get_video_chunks(
@@ -42,12 +45,40 @@ def process_video(
   )
   size = len(video_chunks)
   logging.info('EXTRACTOR - processing video with %d chunks...', size)
-  StorageService.upload_gcs_dir(
-      source_directory=output_dir,
-      bucket_name=gcs_bucket_name,
-      target_dir=media_file.gcs_folder,
-  )
-  if size == 1:
+
+  if size > 1:
+    # Upload video chunks with staggered delays to avoid API rate limiting
+    # Each chunk upload triggers a Cloud Function that calls Video Intelligence API
+    for i, chunk_path in enumerate(video_chunks):
+      chunk_filename = os.path.basename(chunk_path)
+      gcs_destination = str(pathlib.Path(
+          media_file.gcs_folder,
+          ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR,
+          chunk_filename,
+      ))
+      logging.info(
+          'VIDEO_UPLOAD - Uploading chunk %d/%d: %s',
+          i + 1, size, chunk_filename,
+      )
+      StorageService.upload_gcs_file(
+          file_path=chunk_path,
+          bucket_name=gcs_bucket_name,
+          destination_file_name=gcs_destination,
+      )
+      # Add delay between uploads (except after the last one)
+      if i < size - 1:
+        logging.info(
+            'VIDEO_UPLOAD - Waiting %ds before next chunk to avoid rate limiting...',
+            chunk_upload_delay,
+        )
+        time.sleep(chunk_upload_delay)
+  else:
+    # Single chunk - upload normally
+    StorageService.upload_gcs_dir(
+        source_directory=output_dir,
+        bucket_name=gcs_bucket_name,
+        target_dir=media_file.gcs_folder,
+    )
     extract_video(media_file, gcs_bucket_name)
 
 
@@ -106,28 +137,35 @@ def _check_finalise_extract_video(
     with open(finalise_file_path, 'w', encoding='utf8'):
       pass
 
-    StorageService.upload_gcs_file(
-        file_path=finalise_file_path,
-        bucket_name=gcs_bucket_name,
-        destination_file_name=(
-            str(pathlib.Path(gcs_folder, finalise_file_path))
-            if total_count > 1 else str(
-                pathlib.Path(
-                    gcs_folder,
-                    ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR,
-                    finalise_file_path,
-                )
-            )
-        ),
-    )
+    try:
+      StorageService.upload_gcs_file(
+          file_path=finalise_file_path,
+          bucket_name=gcs_bucket_name,
+          destination_file_name=(
+              str(pathlib.Path(gcs_folder, finalise_file_path))
+              if total_count > 1 else str(
+                  pathlib.Path(
+                      gcs_folder,
+                      ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR,
+                      finalise_file_path,
+                  )
+              )
+          ),
+      )
+    except api_exceptions.PreconditionFailed:
+      logging.info(
+          'VIDEO_FINALISE - File already exists (uploaded by another instance), '
+          'skipping: %s', finalise_file_path
+      )
 
 
 def _get_video_chunks(
     output_dir: str,
     video_file_path: str,
     size_limit: int = ConfigService.CONFIG_MAX_VIDEO_CHUNK_SIZE,
+    duration_limit: float = ConfigService.CONFIG_MAX_VIDEO_CHUNK_DURATION,
 ) -> Sequence[str]:
-  """Cuts the input video into smaller chunks by size."""
+  """Cuts the input video into smaller chunks by size or duration."""
   _, file_ext = os.path.splitext(video_file_path)
   output_folder = str(
       pathlib.Path(output_dir, ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR)
@@ -140,7 +178,15 @@ def _get_video_chunks(
   file_count = 0
   result = []
 
-  if file_size > size_limit:
+  # Chunk if file is too large OR duration is too long (to prevent API timeout)
+  needs_chunking = file_size > size_limit or duration > duration_limit
+  chunk_duration = min(duration_limit, duration) if needs_chunking else duration
+  logging.info(
+      'VIDEO_CHUNKING - file_size=%d, duration=%.1fs, needs_chunking=%s, chunk_duration=%.1fs',
+      file_size, duration, needs_chunking, chunk_duration
+  )
+
+  if needs_chunking:
     while current_duration < duration:
       file_count += 1
       output_file_path = str(
@@ -151,6 +197,7 @@ def _get_video_chunks(
               f'{file_ext}',
           )
       )
+      # Use duration-based chunking with -t flag
       Utils.execute_subprocess_commands(
           cmds=[
               'ffmpeg',
@@ -158,14 +205,14 @@ def _get_video_chunks(
               str(current_duration),
               '-i',
               video_file_path,
-              '-fs',
-              str(size_limit),
+              '-t',
+              str(chunk_duration),
               '-c',
               'copy',
               output_file_path,
           ],
           description=(
-              f'Cut input video into {size_limit/1e9}GB chunks. '
+              f'Cut input video into {chunk_duration/60:.1f}min chunks. '
               f'Chunk #{file_count}.'
           ),
       )

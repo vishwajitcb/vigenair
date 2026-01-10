@@ -293,27 +293,41 @@ def _transcribe_gemini(
     ):
       text = response.candidates[0].content.parts[0].text
       logging.info('TRANSCRIPTION - Gemini response: %s', text)
-      result = (
-          re.search(ConfigService.TRANSCRIBE_AUDIO_PATTERN, text, re.DOTALL)
+
+      # Try flexible pattern matching first (handles missing CSV or VTT blocks)
+      lang_match = re.search(
+          ConfigService.TRANSCRIBE_AUDIO_LANGUAGE_PATTERN, text
       )
-      if not result:
-        logging.error(
-            'TRANSCRIPTION - Gemini response did not match expected format. '
-            'Pattern: %s, Response: %s',
-            ConfigService.TRANSCRIBE_AUDIO_PATTERN,
-            text[:500] if len(text) > 500 else text,
-        )
-      else:
-        video_language = result.group(1).strip()
-        language_probability = result.group(2).strip()
-        csv_content = result.group(3)
-        subtitles_content = result.group(4)
-        logging.info(
-            'TRANSCRIPTION - Parsed: language=%s, confidence=%s',
-            video_language,
-            language_probability,
-        )
-        if csv_content.strip():
+      conf_match = re.search(
+          ConfigService.TRANSCRIBE_AUDIO_CONFIDENCE_PATTERN, text
+      )
+      csv_match = re.search(
+          ConfigService.TRANSCRIBE_AUDIO_CSV_PATTERN, text, re.DOTALL
+      )
+      vtt_match = re.search(
+          ConfigService.TRANSCRIBE_AUDIO_VTT_PATTERN, text, re.DOTALL
+      )
+
+      if lang_match:
+        video_language = lang_match.group(1).strip()
+      if conf_match:
+        language_probability = conf_match.group(1).strip()
+      if vtt_match:
+        subtitles_content = vtt_match.group(1)
+
+      logging.info(
+          'TRANSCRIPTION - Parsed: language=%s, confidence=%s, '
+          'has_csv=%s, has_vtt=%s',
+          video_language,
+          language_probability,
+          csv_match is not None,
+          vtt_match is not None,
+      )
+
+      # Process CSV if available
+      csv_content = csv_match.group(1) if csv_match else None
+      if csv_content and csv_content.strip():
+        try:
           transcription_dataframe = (
               pd.read_csv(io.StringIO(csv_content), usecols=[
                   0, 1, 2
@@ -332,8 +346,12 @@ def _transcribe_gemini(
                   duration_s=lambda df: df['end_s'] - df['start_s'],
               )
           )
-        else:
-          logging.warning('TRANSCRIPTION - CSV content is empty')
+        except Exception as csv_error:
+          logging.warning(
+              'TRANSCRIPTION - Failed to parse CSV: %s', csv_error
+          )
+      else:
+        logging.warning('TRANSCRIPTION - CSV content is empty or not found')
     else:
       logging.warning(
           'Could not transcribe audio! No response from Gemini. '

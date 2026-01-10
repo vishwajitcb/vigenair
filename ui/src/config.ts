@@ -26,7 +26,9 @@ export const CONFIG = {
         bucket: 'chai-shots-465914-vigenair',
         endpointBase: 'https://storage.googleapis.com/storage/v1',
         uploadEndpointBase: 'https://storage.googleapis.com/upload/storage/v1',
-        authenticatedEndpointBase: 'https://storage.mtls.cloud.google.com',
+        // Use standard public GCS URL for browser-accessible video playback
+        // mTLS endpoint requires client certificates that browsers don't have
+        authenticatedEndpointBase: 'https://storage.googleapis.com',
         browsingEndpointBase: 'https://console.cloud.google.com/storage/browser',
         files: {
             subtitles: 'input.vtt',

@@ -28,8 +28,10 @@ from typing import Sequence, Tuple
 
 import audio as AudioService
 import config as ConfigService
+import pandas as pd
 import storage as StorageService
 import utils as Utils
+from google.api_core import exceptions as api_exceptions
 
 VIDEO_LANGUAGE_KEY = 'video_language'
 LANGUAGE_PROBABILITY_KEY = 'language_probability'
@@ -223,26 +225,47 @@ def _analyse_audio(
         ): 'split_audio',
     }
 
+    # Initialize with defaults in case of failures
+    language = ConfigService.DEFAULT_VIDEO_LANGUAGE
+    probability = 0.0
+
     for future in concurrent.futures.as_completed(futures_dict):
       source = futures_dict[future]
       match source:
         case 'transcribe_audio':
-          transcription_dataframe, language, probability = future.result()
-          logging.info(
-              'THREADING - transcribe_audio finished for chunk#%s!',
-              file_id,
-          )
-          logging.info(
-              'TRANSCRIPTION - Transcription dataframe for chunk#%s: %r',
-              file_id,
-              transcription_dataframe.to_json(orient='records'),
-          )
+          try:
+            transcription_dataframe, language, probability = future.result()
+            logging.info(
+                'THREADING - transcribe_audio finished for chunk#%s!',
+                file_id,
+            )
+            logging.info(
+                'TRANSCRIPTION - Transcription dataframe for chunk#%s: %r',
+                file_id,
+                transcription_dataframe.to_json(orient='records'),
+            )
+          except Exception as e:
+            logging.error(
+                'THREADING - transcribe_audio FAILED for chunk#%s: %s',
+                file_id,
+                str(e),
+            )
+            transcription_dataframe = pd.DataFrame()
         case 'split_audio':
-          vocals_file_path, music_file_path = future.result()
-          logging.info(
-              'THREADING - split_audio finished for chunk#%s!',
-              file_id,
-          )
+          try:
+            vocals_file_path, music_file_path = future.result()
+            logging.info(
+                'THREADING - split_audio finished for chunk#%s!',
+                file_id,
+            )
+          except Exception as e:
+            logging.error(
+                'THREADING - split_audio FAILED for chunk#%s: %s. '
+                'Audio will not be split into vocals/music.',
+                file_id,
+                str(e),
+            )
+            # Continue without split audio - transcription can still proceed
 
   return (
       vocals_file_path,
@@ -337,17 +360,23 @@ def _check_finalise_extract_audio(
     with open(finalise_file_path, 'w', encoding='utf8'):
       pass
 
-    StorageService.upload_gcs_file(
-        file_path=finalise_file_path,
-        bucket_name=gcs_bucket_name,
-        destination_file_name=(
-            str(pathlib.Path(gcs_folder, finalise_file_path))
-            if total_count > 1 else str(
-                pathlib.Path(
-                    gcs_folder,
-                    ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR,
-                    finalise_file_path,
-                )
-            )
-        ),
-    )
+    try:
+      StorageService.upload_gcs_file(
+          file_path=finalise_file_path,
+          bucket_name=gcs_bucket_name,
+          destination_file_name=(
+              str(pathlib.Path(gcs_folder, finalise_file_path))
+              if total_count > 1 else str(
+                  pathlib.Path(
+                      gcs_folder,
+                      ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR,
+                      finalise_file_path,
+                  )
+              )
+          ),
+      )
+    except api_exceptions.PreconditionFailed:
+      logging.info(
+          'AUDIO_FINALISE - File already exists (uploaded by another instance), '
+          'skipping: %s', finalise_file_path
+      )

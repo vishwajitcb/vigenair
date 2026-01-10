@@ -75,7 +75,7 @@ import { SmartFramingDialog } from './framing-dialog/framing-dialog.component';
 import { SegmentsListComponent } from './segments-list/segments-list.component';
 import { VideoComboComponent } from './video-combo/video-combo.component';
 
-type ProcessStatus = 'hourglass_top' | 'pending' | 'check_circle';
+type ProcessStatus = 'hourglass_top' | 'pending' | 'check_circle' | 'warning';
 
 export type FramingDialogData = {
   weightsPersonFaceIndex: number;
@@ -394,8 +394,15 @@ export class AppComponent {
   }
 
   getPreviousRenders() {
+    console.log('getPreviousRenders: Fetching renders for folder:', this.folder);
     this.apiCallsService.getRendersFromGcs(this.folder).subscribe({
       next: result => {
+        console.log('getPreviousRenders: Received result:', result);
+        if (!result || result.length === 0) {
+          console.log('getPreviousRenders: No renders found for folder:', this.folder);
+          this.previousRenders = [];
+          return;
+        }
         this.previousRenders = result.map((render: string) => {
           const hasName = render.includes(CONFIG.videoFolderNameSeparator);
           const displayName =
@@ -414,8 +421,13 @@ export class AppComponent {
             ')';
           return { displayName, value: render };
         });
+        console.log('getPreviousRenders: Mapped renders:', this.previousRenders);
       },
-      error: err => this.failHandler(err),
+      error: err => {
+        console.error('getPreviousRenders: Error fetching renders:', err);
+        this.previousRenders = [];
+        this.failHandler(err);
+      },
     });
   }
 
@@ -781,20 +793,14 @@ export class AppComponent {
           this.getVideoAnalysis();
         },
         error: err => {
-          this.loading = false;
-          this.transcriptStatus = 'hourglass_top';
-          console.error('Failed to load subtitles:', err);
-          alert(
-            'Failed to load video subtitles. This may happen if:\n' +
-            '- The video is still being processed\n' +
-            '- You selected a previously rendered video that was re-uploaded\n' +
-            '- The subtitle file does not exist\n\n' +
-            'Please try selecting the original uploaded video instead, ' +
-            'or re-upload and process the video.'
-          );
-          this.videoMagicPanel.close();
-          this.videoCombosPanel.close();
-          this.videoUploadPanel.open();
+          // Subtitles are optional - continue the workflow without them
+          console.warn('Subtitles not available (this is optional):', err);
+          this.transcriptStatus = 'warning';
+          this.transcript = '';
+          this.subtitlesTrack = '';
+          // Continue to video analysis even without subtitles
+          console.log('Continuing to video analysis without subtitles...');
+          this.getVideoAnalysis();
         },
       });
   }

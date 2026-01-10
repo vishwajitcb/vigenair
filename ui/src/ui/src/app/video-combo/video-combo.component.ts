@@ -20,8 +20,11 @@ import {
   Component,
   ElementRef,
   Input,
+  OnDestroy,
   ViewChild,
 } from '@angular/core';
+import { Subject } from 'rxjs';
+import { takeUntil } from 'rxjs/operators';
 import { FormsModule } from '@angular/forms';
 import { MatButtonModule } from '@angular/material/button';
 import {
@@ -76,7 +79,7 @@ interface TranscriptionSegment {
   templateUrl: './video-combo.component.html',
   styleUrl: './video-combo.component.css',
 })
-export class VideoComboComponent implements AfterViewInit {
+export class VideoComboComponent implements AfterViewInit, OnDestroy {
   @Input({ required: true }) combo!: RenderedVariant | GenerateVariantsResponse;
   @Input({ required: true }) gcsFolder!: string;
   @Input() showApprovalStatus = false;
@@ -97,23 +100,47 @@ export class VideoComboComponent implements AfterViewInit {
   hasTranscription = false;
   aspectRatios: FormatType[] = ['16:9', '9:16', '1:1', '3:4', '4:3'];
 
+  /** Subject to handle subscription cleanup on component destruction */
+  private destroy$ = new Subject<void>();
+
   constructor(
     private snackBar: MatSnackBar,
     private apiCallsService: ApiCallsService
   ) {}
 
+  ngOnDestroy(): void {
+    // Clean up all subscriptions to prevent memory leaks and NS_BINDING_ABORTED errors
+    this.destroy$.next();
+    this.destroy$.complete();
+    // Pause video to prevent any pending network requests
+    if (this.videoElem?.nativeElement) {
+      this.videoElem.nativeElement.pause();
+      this.videoElem.nativeElement.src = '';
+    }
+  }
+
   loadVideo() {
     if (this.displayMode === 'combo') {
+      const videoEl = this.videoElem?.nativeElement;
+      if (!videoEl) {
+        return;
+      }
+
+      // Pause current video to prevent NS_BINDING_ABORTED on rapid source changes
+      videoEl.pause();
+
       // Check if the selected format exists in variants
       if (this.combo.variants && this.combo.variants[this.selectedFormat]) {
-        this.videoElem.nativeElement.src =
-          this.combo.variants[this.selectedFormat]!.entity;
+        const videoUrl = this.combo.variants[this.selectedFormat]!.entity;
+        videoEl.src = videoUrl;
+        // Call load() to properly reset the video element state
+        videoEl.load();
         this.images = this.combo.images
           ? this.combo.images[this.selectedFormat] || []
           : [];
       } else {
         console.warn(`Selected format ${this.selectedFormat} not available in variants`);
-        this.videoElem.nativeElement.src = '';
+        videoEl.src = '';
         this.images = [];
       }
     }
@@ -156,6 +183,7 @@ export class VideoComboComponent implements AfterViewInit {
   getTextAssetsLanguage() {
     this.apiCallsService
       .getVideoLanguage(this.gcsFolder)
+      .pipe(takeUntil(this.destroy$))
       .subscribe((videoLanguage: string) => {
         this.textAssetsLanguage = videoLanguage;
       });
@@ -180,25 +208,27 @@ export class VideoComboComponent implements AfterViewInit {
 
     console.log('Loading transcription from:', transcriptionUrl);
 
-    this.apiCallsService.getFromGcs(transcriptionUrl).subscribe({
-      next: (data: string) => {
-        try {
-          const transcriptionData = JSON.parse(data);
-          console.log('Transcription loaded successfully:', transcriptionData);
-          this.transcriptionText = this.formatTranscription(transcriptionData);
-          this.hasTranscription = true;
-        } catch (e) {
-          console.log('No transcription found or error parsing:', e);
+    this.apiCallsService.getFromGcs(transcriptionUrl)
+      .pipe(takeUntil(this.destroy$))
+      .subscribe({
+        next: (data: string) => {
+          try {
+            const transcriptionData = JSON.parse(data);
+            console.log('Transcription loaded successfully:', transcriptionData);
+            this.transcriptionText = this.formatTranscription(transcriptionData);
+            this.hasTranscription = true;
+          } catch (e) {
+            console.log('No transcription found or error parsing:', e);
+            this.hasTranscription = false;
+          }
+          this.transcriptionLoading = false;
+        },
+        error: (err) => {
+          console.log('Error loading transcription:', err);
           this.hasTranscription = false;
+          this.transcriptionLoading = false;
         }
-        this.transcriptionLoading = false;
-      },
-      error: (err) => {
-        console.log('Error loading transcription:', err);
-        this.hasTranscription = false;
-        this.transcriptionLoading = false;
-      }
-    });
+      });
   }
 
   formatTranscription(transcriptionData: TranscriptionSegment[]): string {
@@ -272,6 +302,7 @@ export class VideoComboComponent implements AfterViewInit {
 
     this.apiCallsService
       .updateTranscription(this.gcsFolder, this.transcriptionText)
+      .pipe(takeUntil(this.destroy$))
       .subscribe({
         next: (success: boolean) => {
           this.transcriptionLoading = false;
@@ -304,6 +335,7 @@ export class VideoComboComponent implements AfterViewInit {
           textAsset,
           this.textAssetsLanguage
         )
+        .pipe(takeUntil(this.destroy$))
         .subscribe({
           next: (generatedTextAsset: VariantTextAsset) => {
             this.comboLoading = false;
@@ -349,6 +381,7 @@ export class VideoComboComponent implements AfterViewInit {
         ),
         this.textAssetsLanguage
       )
+      .pipe(takeUntil(this.destroy$))
       .subscribe({
         next: (generatedTextAssets: VariantTextAsset[]) => {
           this.loading = false;

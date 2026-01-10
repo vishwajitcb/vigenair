@@ -67,8 +67,10 @@ limitations under the License.
     [style.margin-right]="showApprovalStatus ? 'auto' : ''"
     #videoElem
     controls
+    preload="metadata"
   >
-    <source src="" />
+    <source src="" type="video/mp4" />
+    Your browser does not support the video tag.
   </video>
 </div>
 
