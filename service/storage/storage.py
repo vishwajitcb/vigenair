@@ -20,9 +20,13 @@ This module provides methods for interacting with Google Cloud Storage.
 import logging
 import os
 import pathlib
+import time
 from typing import Optional, Sequence, Union
 
+import requests
 import utils as Utils
+from google.auth import default as google_auth_default
+from google.auth.transport.requests import AuthorizedSession
 from google.cloud import storage
 from google.cloud.storage import transfer_manager
 
@@ -197,25 +201,62 @@ def filter_files(
     A list of file contents matching the given suffix, or an empty list if no
     files match.
   """
-  storage_client = storage.Client()
-  blobs = storage_client.list_blobs(bucket_name, prefix=prefix)
-  result = []
+  max_retries = 5
+  last_exception = None
+  fresh_session = None
 
-  for blob in blobs:
-    if blob.name.endswith(suffix):
-      logging.info('FILTER - Found matching file "%s".', blob.name)
-      if download:
-        file_path, file_ext = os.path.splitext(blob.name)
-        file_path = pathlib.Path(file_path)
-        file_name = file_path.name
-        destination_file_name = str(
-            pathlib.Path(download_dir, f'{file_name}{file_ext}')
+  for attempt in range(max_retries):
+    try:
+      # Create a fresh HTTP session to avoid stale connection pool issues
+      # This bypasses urllib3's shared connection pool that can have stale connections
+      credentials, project = google_auth_default()
+      fresh_session = AuthorizedSession(credentials)
+      # Set shorter timeouts (connect=10s, read=30s) so failures surface faster
+      # instead of waiting for SDK's default 120s timeout
+      fresh_session.timeout = (10, 30)
+      storage_client = storage.Client(credentials=credentials, _http=fresh_session)
+
+      blobs = storage_client.list_blobs(bucket_name, prefix=prefix, timeout=30)
+      result = []
+
+      for blob in blobs:
+        if blob.name.endswith(suffix):
+          logging.info('FILTER - Found matching file "%s".', blob.name)
+          if download:
+            file_path, file_ext = os.path.splitext(blob.name)
+            file_path = pathlib.Path(file_path)
+            file_name = file_path.name
+            destination_file_name = str(
+                pathlib.Path(download_dir, f'{file_name}{file_ext}')
+            )
+            blob.download_to_filename(destination_file_name)
+            result.append(destination_file_name)
+          else:
+            result.append(blob.download_as_bytes() if fetch_content else blob.name)
+
+      return result
+    except Exception as e:
+      last_exception = e
+      if attempt < max_retries - 1:
+        wait_time = (2 ** attempt) + 1  # 2, 3, 5, 9, 17 seconds
+        logging.warning(
+            'STORAGE - filter_files failed (attempt %d/%d), retrying in %ds: %s',
+            attempt + 1, max_retries, wait_time, str(e)
         )
-        blob.download_to_filename(destination_file_name)
-        result.append(destination_file_name)
+        time.sleep(wait_time)
       else:
-        result.append(blob.download_as_bytes() if fetch_content else blob.name)
-  return result
+        logging.error(
+            'STORAGE - filter_files failed after %d attempts: %s',
+            max_retries, str(e)
+        )
+        raise last_exception
+    finally:
+      # Always close the session to free resources
+      if fresh_session:
+        try:
+          fresh_session.close()
+        except Exception:
+          pass
 
 
 def delete_gcs_file(

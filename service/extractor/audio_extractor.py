@@ -75,11 +75,21 @@ def _process_video_with_audio(
   )
   size = len(audio_chunks)
   logging.info('EXTRACTOR - processing audio with %d chunks...', size)
-  StorageService.upload_gcs_dir(
-      source_directory=output_dir,
-      bucket_name=gcs_bucket_name,
-      target_dir=media_file.gcs_folder,
-  )
+
+  # Upload only audio files to avoid race condition with video chunking
+  # (video chunks may exist in same directory but not yet renamed)
+  for chunk_path in audio_chunks:
+    chunk_filename = os.path.basename(chunk_path)
+    gcs_destination = str(pathlib.Path(
+        media_file.gcs_folder,
+        ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR,
+        chunk_filename,
+    ))
+    StorageService.upload_gcs_file(
+        file_path=chunk_path,
+        bucket_name=gcs_bucket_name,
+        destination_file_name=gcs_destination,
+    )
   if size == 1:
     extract_audio(
         Utils.TriggerFile(
@@ -343,6 +353,16 @@ def _get_audio_chunks(
         result,
         ConfigService.INPUT_EXTRACTION_AUDIO_FILENAME_SUFFIX,
     )
+    # Update result list with new file paths after renaming
+    # rename_chunks changes: 1_aaa.wav -> 1-{total}_aaa.wav
+    total = len(result)
+    result = [
+        path.replace(
+            f'{ConfigService.INPUT_EXTRACTION_AUDIO_FILENAME_SUFFIX}.',
+            f'-{total}{ConfigService.INPUT_EXTRACTION_AUDIO_FILENAME_SUFFIX}.'
+        )
+        for path in result
+    ]
 
   return result
 
