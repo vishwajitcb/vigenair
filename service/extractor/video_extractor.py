@@ -106,11 +106,20 @@ def extract_video(
       'THREADING - analyse_video finished for chunk#%s!',
       video_id,
   )
+  # Parse total_count from video_id (e.g., "1-4" -> 4, or just "1" -> 1 for legacy)
+  if video_id == ConfigService.INPUT_FILENAME:
+    total_count = 1
+  elif '-' in video_id:
+    total_count = int(video_id.split('-')[1])
+  else:
+    # Legacy single chunk without dash - assume it's the only chunk
+    total_count = 1
+    logging.warning(
+        'VIDEO_EXTRACT - video_id "%s" missing chunk count suffix, assuming single chunk',
+        video_id,
+    )
   _check_finalise_extract_video(
-      total_count=(
-          1 if video_id == ConfigService.INPUT_FILENAME else
-          int(video_id.split('-')[1])
-      ),
+      total_count=total_count,
       gcs_bucket_name=gcs_bucket_name,
       gcs_folder=media_file.gcs_folder,
   )
@@ -232,5 +241,15 @@ def _get_video_chunks(
     Utils.rename_chunks(
         result, ConfigService.INPUT_EXTRACTION_VIDEO_FILENAME_SUFFIX
     )
+    # Update result list with new file paths after renaming
+    # rename_chunks changes: 1_vvv.mp4 -> 1-{total}_vvv.mp4
+    total = len(result)
+    result = [
+        path.replace(
+            f'{ConfigService.INPUT_EXTRACTION_VIDEO_FILENAME_SUFFIX}.',
+            f'-{total}{ConfigService.INPUT_EXTRACTION_VIDEO_FILENAME_SUFFIX}.'
+        )
+        for path in result
+    ]
 
   return result

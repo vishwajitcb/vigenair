@@ -183,11 +183,20 @@ def extract_audio(media_file: Utils.TriggerFile, gcs_bucket_name: str):
       bucket_name=gcs_bucket_name,
       target_dir=media_file.gcs_root_folder,
   )
+  # Parse total_count from audio_id (e.g., "1-4" -> 4, or just "1" -> 1 for legacy)
+  if audio_id == ConfigService.INPUT_FILENAME:
+    total_count = 1
+  elif '-' in audio_id:
+    total_count = int(audio_id.split('-')[1])
+  else:
+    # Legacy single chunk without dash - assume it's the only chunk
+    total_count = 1
+    logging.warning(
+        'AUDIO_EXTRACT - audio_id "%s" missing chunk count suffix, assuming single chunk',
+        audio_id,
+    )
   _check_finalise_extract_audio(
-      total_count=(
-          1 if audio_id == ConfigService.INPUT_FILENAME else
-          int(audio_id.split('-')[1])
-      ),
+      total_count=total_count,
       gcs_bucket_name=gcs_bucket_name,
       gcs_folder=media_file.gcs_folder,
   )

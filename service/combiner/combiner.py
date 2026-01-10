@@ -458,7 +458,17 @@ class Combiner:
         target_dir=self.render_file.gcs_folder,
     )
 
-    self.check_finalise_render(variants_count=int(variant_id.split('-')[1]))
+    # Parse variants_count from variant_id (e.g., "1-4" -> 4)
+    if '-' in variant_id:
+      try:
+        variants_count = int(variant_id.split('-')[1])
+      except (IndexError, ValueError):
+        logging.warning('COMBINER - Invalid variant_id format: %s, assuming 1', variant_id)
+        variants_count = 1
+    else:
+      variants_count = 1
+      logging.warning('COMBINER - variant_id "%s" missing count suffix, assuming 1', variant_id)
+    self.check_finalise_render(variants_count=variants_count)
     gc.collect()
     logging.info(
         'COMBINER - Rendering variant %s completed successfully!',
