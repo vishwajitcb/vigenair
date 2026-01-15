@@ -12,13 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Vigenair module.
-
-This module is the main module for Vigenair's server-side components.
-
-This file is the target of a "Cloud Storage" Trigger (Finalize/Create) Cloud
-Function, with `gcs_file_uploaded` as the main entry point.
 """
+##############################################################################
+# DEPRECATED - GCP CLOUD FUNCTIONS ENTRY POINT (LEGACY)
+##############################################################################
+#
+# This file is ONLY used for Google Cloud Platform Cloud Functions deployment.
+# It is NOT used in the Docker Compose / EC2 deployment.
+#
+# For Docker Compose deployment, see: api/main.py (FastAPI application)
+#
+# DO NOT MODIFY THIS FILE unless you are maintaining the GCP Cloud Functions
+# deployment.
+#
+##############################################################################
+"""
+
+# Original docstring preserved below:
+# Vigenair module.
+#
+# This module is the main module for Vigenair's server-side components.
+#
+# This file is the target of a "Cloud Storage" Trigger (Finalize/Create) Cloud
+# Function, with `gcs_file_uploaded` as the main entry point.
 
 import logging
 import os

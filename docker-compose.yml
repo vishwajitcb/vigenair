@@ -1,0 +1,89 @@
+# ViGenAiR Docker Compose Configuration
+# Deploy on Amazon EC2 with Docker Compose
+
+version: '3.8'
+
+services:
+  # Backend API Service
+  backend:
+    build:
+      context: ./service
+      dockerfile: Dockerfile
+    container_name: vigenair-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # Google AI Studio API Key
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+
+      # AWS Credentials for S3
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+
+      # S3 Configuration
+      - S3_BUCKET=${S3_BUCKET}
+
+      # Model Configuration
+      - CONFIG_TEXT_MODEL=${CONFIG_TEXT_MODEL:-gemini-2.0-flash}
+      - CONFIG_VISION_MODEL=${CONFIG_VISION_MODEL:-gemini-2.0-flash}
+      - CONFIG_TRANSCRIPTION_MODEL_WHISPER=${CONFIG_TRANSCRIPTION_MODEL_WHISPER:-small}
+
+      # Backend Configuration
+      - CONFIG_BACKEND_VERSION=${CONFIG_BACKEND_VERSION:-v1}
+      - CONFIG_MAX_VIDEO_CHUNK_SIZE=${CONFIG_MAX_VIDEO_CHUNK_SIZE:-500000000}
+      - CONFIG_MAX_AUDIO_CHUNK_SIZE=${CONFIG_MAX_AUDIO_CHUNK_SIZE:-300}
+
+      # CORS (adjust for production)
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+    volumes:
+      # Temp storage for video processing
+      - vigenair_temp:/tmp/vigenair
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+
+  # Frontend UI Service
+  frontend:
+    build:
+      context: ./ui/src
+      dockerfile: ui/Dockerfile
+    container_name: vigenair-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+    environment:
+      - API_BASE_URL=${API_BASE_URL:-http://backend:8000}
+
+  # Redis for job queue (optional, for background tasks)
+  redis:
+    image: redis:7-alpine
+    container_name: vigenair-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  vigenair_temp:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  default:
+    name: vigenair-network

@@ -14,14 +14,16 @@
  * limitations under the License.
  */
 
-/// <reference types="google-apps-script" />
+/**
+ * API Service for ViGenAiR - REST API Implementation
+ * Replaces Google Apps Script calls with standard HTTP calls to FastAPI backend
+ */
 
 import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { Injectable, NgZone } from '@angular/core';
-import { catchError, map, Observable, of, retry, switchMap, timer } from 'rxjs';
-import { CONFIG } from '../../../../config';
+import { catchError, map, Observable, of, retry, switchMap, timer, throwError } from 'rxjs';
+import { environment } from '../../environments/environment';
 
-import { StringUtil } from '../../../../string-util';
 import {
   ApiCalls,
   GeneratePreviewsResponse,
@@ -35,6 +37,11 @@ import {
   VariantTextAsset,
 } from './api-calls.service.interface';
 
+// Configuration
+const API_BASE_URL = environment.apiBaseUrl || '/api/v1';
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 2000;
+
 @Injectable({
   providedIn: 'root',
 })
@@ -44,35 +51,28 @@ export class ApiCallsService implements ApiCalls {
     private httpClient: HttpClient
   ) {}
 
+  /**
+   * Load a previous run by folder name
+   */
   loadPreviousRun(folder: string): string[] {
+    // Return folder and presigned URL for the video
     return [
       folder,
-      `${CONFIG.cloudStorage.authenticatedEndpointBase}/${CONFIG.cloudStorage.bucket}/${encodeURIComponent(folder)}/input.mp4`,
+      `${API_BASE_URL}/files/download/${folder}/input.mp4`,
     ];
   }
 
+  /**
+   * Get user auth token - not needed for REST API, returns empty observable
+   */
   getUserAuthToken(): Observable<string> {
-    return new Observable<string>(subscriber => {
-      google.script.run
-        .withSuccessHandler((userAuthToken: string) => {
-          this.ngZone.run(() => {
-            subscriber.next(userAuthToken);
-            subscriber.complete();
-          });
-        })
-        .withFailureHandler((error: Error) => {
-          console.error(
-            'Could not retrieve the user auth token! Error: ',
-            error
-          );
-          subscriber.error(error);
-        })
-        .getUserAuthToken();
-    }).pipe(
-      retry({ count: CONFIG.maxRetriesAppsScript, delay: CONFIG.retryDelay })
-    );
+    // No auth token needed for local REST API
+    return of('');
   }
 
+  /**
+   * Upload a video file
+   */
   uploadVideo(
     file: File,
     analyseAudio: boolean,
@@ -80,408 +80,377 @@ export class ApiCallsService implements ApiCalls {
     filename?: string,
     contentType?: string
   ): Observable<string[]> {
-    // Detect file extension and set appropriate filename and content type
-    const fileExtension = file.name.split('.').pop()?.toLowerCase() || 'mp4';
-    const actualFilename = filename || `input.${fileExtension}`;
-    const actualContentType = contentType || file.type || 'video/mp4';
+    const formData = new FormData();
+    formData.append('video', file);
+    formData.append('analyse_audio', String(analyseAudio));
+    formData.append('user_id', encodedUserId);
 
-    const videoFolderTranscriptionSuffix =
-      CONFIG.defaultTranscriptionService.charAt(0);
-    // eslint-disable-next-line no-useless-escape
-    const sanitisedFileName = StringUtil.gcsSanitise(file.name);
-    const folder = `${sanitisedFileName}${CONFIG.videoFolderNameSeparator}${analyseAudio ? videoFolderTranscriptionSuffix : CONFIG.videoFolderNoAudioSuffix}${CONFIG.videoFolderNameSeparator}${Date.now()}${CONFIG.videoFolderNameSeparator}${encodedUserId}`;
-    const fullName = encodeURIComponent(`${folder}/${actualFilename}`);
-    const url = `${CONFIG.cloudStorage.uploadEndpointBase}/b/${CONFIG.cloudStorage.bucket}/o?uploadType=media&name=${fullName}`;
-
-    return this.getUserAuthToken().pipe(
-      switchMap(userAuthToken =>
-        this.httpClient
-          .post(url, file, {
-            headers: new HttpHeaders({
-              'Authorization': `Bearer ${userAuthToken}`,
-              'Content-Type': actualContentType,
-            }),
-          })
-          .pipe(
-            switchMap(response => {
-              console.log('Upload complete!', response);
-              // Backend converts .mov files to .mp4, so use .mp4 in the video path
-              const finalFilename = fileExtension === 'mov' ? 'input.mp4' : actualFilename;
-              const videoFilePath = `${CONFIG.cloudStorage.authenticatedEndpointBase}/${CONFIG.cloudStorage.bucket}/${encodeURIComponent(folder)}/${finalFilename}`;
-
-              // For .mov files, emit initial response but also start polling for converted file
-              if (fileExtension === 'mov') {
-                // Emit the folder and a temporary path first
-                const result: string[] = [folder, videoFilePath, 'converting'];
-                return of(result);
-              }
-
-              return of([folder, videoFilePath]);
-            }),
-            catchError(error => {
-              console.error('Upload failed with error: ', error);
-              throw error;
-            })
-          )
+    return this.httpClient
+      .post<{ folder: string; status: string; message: string }>(
+        `${API_BASE_URL}/videos/upload`,
+        formData
       )
-    );
-  }
-
-  waitForConvertedVideo(folder: string): Observable<string> {
-    const mp4Path = `${folder}/input.mp4`;
-    const videoUrl = `${CONFIG.cloudStorage.authenticatedEndpointBase}/${CONFIG.cloudStorage.bucket}/${encodeURIComponent(folder)}/input.mp4`;
-
-    console.log('Waiting for converted MP4 file...');
-
-    // Poll for the MP4 file with HEAD request to check existence
-    return this.getUserAuthToken().pipe(
-      switchMap(userAuthToken =>
-        this.httpClient.head(
-          `${CONFIG.cloudStorage.endpointBase}/b/${CONFIG.cloudStorage.bucket}/o/${encodeURIComponent(mp4Path)}?alt=media`,
-          {
-            headers: new HttpHeaders({
-              Authorization: `Bearer ${userAuthToken}`,
-            }),
-          }
-        ).pipe(
-          map(() => {
-            console.log('Converted MP4 file is ready!');
-            return videoUrl;
-          })
-        )
-      ),
-      retry({
-        count: 30, // Try for up to 30 times (about 60 seconds with 2s delay)
-        delay: (error, retryCount) => {
-          if (error.status && error.status === 404 && retryCount < 30) {
-            console.log(`Conversion in progress, retrying (${retryCount}/30)...`);
-            return timer(2000); // Wait 2 seconds between retries
-          }
-          throw error;
-        },
-      })
-    );
-  }
-
-  deleteGcsFolder(folder: string): void {
-    google.script.run.deleteGcsFolder(folder);
-  }
-
-  getFromGcs(url: string, retryDelay = 0, maxRetries = 0): Observable<string> {
-    const gcsUrl = `${CONFIG.cloudStorage.endpointBase}/b/${CONFIG.cloudStorage.bucket}/o/${encodeURIComponent(url)}?alt=media`;
-
-    return this.getUserAuthToken().pipe(
-      switchMap(userAuthToken =>
-        this.httpClient.get(gcsUrl, {
-          responseType: 'text',
-          headers: new HttpHeaders({
-            Authorization: `Bearer ${userAuthToken}`,
-          }),
+      .pipe(
+        map(response => {
+          console.log('Upload complete!', response);
+          const videoFilePath = `${API_BASE_URL}/files/download/${response.folder}/input.mp4`;
+          return [response.folder, videoFilePath];
+        }),
+        catchError(error => {
+          console.error('Upload failed with error: ', error);
+          return throwError(() => error);
         })
-      ),
-      retry({
-        count: maxRetries,
-        delay: (error, retryCount) => {
-          if (error.status && error.status === 404 && retryCount < maxRetries) {
-            console.log(`Expected output not available yet, retrying (${retryCount}/${maxRetries})...`);
-            return timer(retryDelay);
-          }
-          throw error;
-        },
-      })
-    );
+      );
   }
 
+  /**
+   * Wait for converted video (for .mov to .mp4 conversion)
+   */
+  waitForConvertedVideo(folder: string): Observable<string> {
+    const videoUrl = `${API_BASE_URL}/files/download/${folder}/input.mp4`;
+
+    console.log('Checking for converted MP4 file...');
+
+    return this.httpClient
+      .head(`${API_BASE_URL}/files/download/${folder}/input.mp4`, {
+        observe: 'response',
+      })
+      .pipe(
+        map(() => {
+          console.log('Converted MP4 file is ready!');
+          return videoUrl;
+        }),
+        retry({
+          count: 30,
+          delay: (error, retryCount) => {
+            if (error.status && error.status === 404 && retryCount < 30) {
+              console.log(`Conversion in progress, retrying (${retryCount}/30)...`);
+              return timer(2000);
+            }
+            throw error;
+          },
+        })
+      );
+  }
+
+  /**
+   * Delete a video folder
+   */
+  deleteGcsFolder(folder: string): void {
+    this.httpClient
+      .delete(`${API_BASE_URL}/videos/${folder}`)
+      .subscribe({
+        next: () => console.log(`Deleted folder: ${folder}`),
+        error: (error) => console.error('Delete failed:', error),
+      });
+  }
+
+  /**
+   * Get file content from storage
+   */
+  getFromGcs(url: string, retryDelay = 0, maxRetries = 0): Observable<string> {
+    return this.httpClient
+      .get(`${API_BASE_URL}/files/download/${url}`, {
+        responseType: 'text',
+      })
+      .pipe(
+        retry({
+          count: maxRetries,
+          delay: (error, retryCount) => {
+            if (error.status && error.status === 404 && retryCount < maxRetries) {
+              console.log(`Expected output not available yet, retrying (${retryCount}/${maxRetries})...`);
+              return timer(retryDelay);
+            }
+            throw error;
+          },
+        })
+      );
+  }
+
+  /**
+   * Generate AI-powered variant suggestions
+   */
   generateVariants(
     gcsFolder: string,
     settings: GenerationSettings
   ): Observable<GenerateVariantsResponse[]> {
     console.log('API Service: Starting generateVariants call');
     console.log('Settings:', settings);
-    return new Observable<GenerateVariantsResponse[]>(subscriber => {
-      const startTime = Date.now();
-      google.script.run
-        .withSuccessHandler((variants: GenerateVariantsResponse[]) => {
-          const elapsed = Date.now() - startTime;
-          console.log(`API Service: Received success response after ${elapsed}ms`);
-          console.log('Variants received:', variants);
-          console.log('Number of variants:', variants?.length);
-          this.ngZone.run(() => {
-            subscriber.next(variants);
-            subscriber.complete();
-          });
+
+    return this.httpClient
+      .post<{ variants: GenerateVariantsResponse[] }>(
+        `${API_BASE_URL}/videos/${gcsFolder}/variants/generate`,
+        {
+          prompt: settings.prompt || '',
+          eval_prompt: settings.evalPrompt || '',
+          target_duration: settings.duration,
+          demand_gen_assets: settings.demandGenAssets,
+          shorten_video: settings.shortenVideo,
+        }
+      )
+      .pipe(
+        map(response => {
+          console.log('Variants received:', response.variants);
+          return response.variants || [];
+        }),
+        retry({ count: MAX_RETRIES, delay: RETRY_DELAY }),
+        catchError(error => {
+          console.error('Error generating variants:', error);
+          return throwError(() => error);
         })
-        .withFailureHandler((error: Error) => {
-          const elapsed = Date.now() - startTime;
-          console.error(`API Service: Received error after ${elapsed}ms`);
-          console.error(
-            'Encountered an unexpected error while generating variants! Error: ',
-            error
-          );
-          subscriber.error(error);
-        })
-        .generateVariants(gcsFolder, settings);
-      console.log('API Service: google.script.run call initiated');
-    }).pipe(
-      retry({ count: CONFIG.maxRetriesAppsScript, delay: CONFIG.retryDelay })
-    );
+      );
   }
 
+  /**
+   * Generate preview crops for different aspect ratios
+   */
   generatePreviews(
     gcsFolder: string,
     analysis: any,
     segments: any,
     settings: PreviewSettings
   ): Observable<GeneratePreviewsResponse> {
-    return new Observable<GeneratePreviewsResponse>(subscriber => {
-      google.script.run
-        .withSuccessHandler((previews: GeneratePreviewsResponse) => {
-          this.ngZone.run(() => {
-            subscriber.next(previews);
-            subscriber.complete();
-          });
+    return this.httpClient
+      .post<GeneratePreviewsResponse>(
+        `${API_BASE_URL}/videos/${gcsFolder}/previews/generate`,
+        {
+          analysis,
+          segments,
+          settings,
+        }
+      )
+      .pipe(
+        retry({ count: MAX_RETRIES, delay: RETRY_DELAY }),
+        catchError(error => {
+          console.error('Error generating previews:', error);
+          return throwError(() => error);
         })
-        .withFailureHandler((error: Error) => {
-          console.error(
-            'Encountered an unexpected error while generating format previews! Error: ',
-            error
-          );
-          subscriber.error(error);
-        })
-        .generatePreviews(analysis, segments, settings);
-    }).pipe(
-      retry({ count: CONFIG.maxRetriesAppsScript, delay: CONFIG.retryDelay })
-    );
+      );
   }
 
+  /**
+   * Get list of previous video processing runs
+   */
   getRunsFromGcs(): Observable<PreviousRunsResponse> {
-    return new Observable<PreviousRunsResponse>(subscriber => {
-      google.script.run
-        .withSuccessHandler((response: PreviousRunsResponse) => {
-          this.ngZone.run(() => {
-            subscriber.next(response);
-            subscriber.complete();
-          });
+    return this.httpClient
+      .get<{ videos: any[]; encoded_user_id?: string }>(`${API_BASE_URL}/videos`)
+      .pipe(
+        map(response => {
+          // Transform to expected format - runs is array of folder names
+          const runs = response.videos.map(v => v.folder);
+          return {
+            encodedUserId: response.encoded_user_id || '',
+            runs,
+          } as PreviousRunsResponse;
+        }),
+        retry({ count: MAX_RETRIES, delay: RETRY_DELAY }),
+        catchError(error => {
+          console.error('Error getting runs:', error);
+          return throwError(() => error);
         })
-        .withFailureHandler((error: Error) => {
-          console.error(
-            'Could not retrieve previous runs from GCS! Error: ',
-            error
-          );
-          subscriber.error(error);
-        })
-        .getRunsFromGcs();
-    }).pipe(
-      retry({ count: CONFIG.maxRetriesAppsScript, delay: CONFIG.retryDelay })
-    );
+      );
   }
 
+  /**
+   * Get rendered variants for a video
+   */
   getRendersFromGcs(gcsFolder: string): Observable<string[]> {
-    return new Observable<string[]>(subscriber => {
-      google.script.run
-        .withSuccessHandler((response: string[]) => {
-          this.ngZone.run(() => {
-            subscriber.next(response);
-            subscriber.complete();
-          });
+    return this.httpClient
+      .get<{ folder: string; combos: any }>(`${API_BASE_URL}/videos/${gcsFolder}/renders`)
+      .pipe(
+        map(response => {
+          // Return render file paths
+          if (response.combos && response.combos.variants) {
+            return response.combos.variants.map((v: any) => v.path || '');
+          }
+          return [];
+        }),
+        retry({ count: MAX_RETRIES, delay: RETRY_DELAY }),
+        catchError(error => {
+          console.error('Error getting renders:', error);
+          return throwError(() => error);
         })
-        .withFailureHandler((error: Error) => {
-          console.error(
-            'Could not retrieve previous renders from GCS! Error: ',
-            error
-          );
-          subscriber.error(error);
-        })
-        .getRendersFromGcs(gcsFolder);
-    }).pipe(
-      retry({ count: CONFIG.maxRetriesAppsScript, delay: CONFIG.retryDelay })
-    );
+      );
   }
 
+  /**
+   * Submit render request for variants
+   */
   renderVariants(
     gcsFolder: string,
     renderQueue: RenderQueue
   ): Observable<string> {
-    return new Observable<string>(subscriber => {
-      google.script.run
-        .withSuccessHandler((response: string) => {
-          this.ngZone.run(() => {
-            subscriber.next(response);
-            subscriber.complete();
-          });
+    return this.httpClient
+      .post<{ folder: string; status: string; message: string }>(
+        `${API_BASE_URL}/videos/${gcsFolder}/render`,
+        {
+          queue: renderQueue.queue,
+          queue_name: renderQueue.queueName,
+          preview_analyses: renderQueue.previewAnalyses,
+          source_dimensions: renderQueue.sourceDimensions,
+        }
+      )
+      .pipe(
+        map(response => response.message),
+        catchError(error => {
+          console.error('Error rendering variants:', error);
+          return throwError(() => error);
         })
-        .withFailureHandler((error: Error) => {
-          console.error(
-            'Encountered an unexpected error while rendering variants! Error: ',
-            error
-          );
-          subscriber.error(error);
-        })
-        .renderVariants(gcsFolder, renderQueue);
-    });
+      );
   }
 
+  /**
+   * Get folder path for browsing
+   */
   getGcsFolderPath(folder: string): Observable<string> {
-    return of(
-      `${CONFIG.cloudStorage.browsingEndpointBase}/${CONFIG.cloudStorage.bucket}/${encodeURIComponent(folder)}`
-    );
+    // Return API file listing URL
+    return of(`${API_BASE_URL}/files/list?prefix=${encodeURIComponent(folder)}`);
   }
 
+  /**
+   * Get web app URL
+   */
   getWebAppUrl(): Observable<string> {
-    return new Observable<string>(subscriber => {
-      google.script.run
-        .withSuccessHandler((response: string) => {
-          this.ngZone.run(() => {
-            subscriber.next(response);
-            subscriber.complete();
-          });
-        })
-        .withFailureHandler((error: Error) => {
-          console.error('Could not retrieve the Web App URL! Error: ', error);
-          subscriber.error(error);
-        })
-        .getWebAppUrl();
-    }).pipe(
-      retry({ count: CONFIG.maxRetriesAppsScript, delay: CONFIG.retryDelay })
-    );
+    // Return current origin
+    return of(window.location.origin);
   }
 
+  /**
+   * Regenerate a single text asset
+   */
   regenerateTextAsset(
     variantVideoPath: string,
     textAsset: VariantTextAsset,
     textAssetLanguage: string
   ): Observable<VariantTextAsset> {
-    return new Observable<VariantTextAsset>(subscriber => {
-      google.script.run
-        .withSuccessHandler((textAsset: VariantTextAsset) => {
-          this.ngZone.run(() => {
-            textAsset.approved = true;
-            textAsset.editable = false;
-            subscriber.next(textAsset);
-            subscriber.complete();
-          });
+    return this.httpClient
+      .post<VariantTextAsset>(
+        `${API_BASE_URL}/videos/text-assets/regenerate`,
+        {
+          variant_video_path: variantVideoPath,
+          text_asset: textAsset,
+          language: textAssetLanguage,
+        }
+      )
+      .pipe(
+        map(response => {
+          response.approved = true;
+          response.editable = false;
+          return response;
+        }),
+        retry({ count: MAX_RETRIES, delay: RETRY_DELAY }),
+        catchError(error => {
+          console.error('Error regenerating text asset:', error);
+          return throwError(() => error);
         })
-        .withFailureHandler((error: Error) => {
-          console.error('Could not regenerate text asset! Error: ', error);
-          subscriber.error(error);
-        })
-        .regenerateTextAsset(variantVideoPath, textAsset, textAssetLanguage);
-    }).pipe(
-      retry({ count: CONFIG.maxRetriesAppsScript, delay: CONFIG.retryDelay })
-    );
+      );
   }
 
+  /**
+   * Store approval status for rendered variants
+   */
   storeApprovalStatus(
     folder: string,
     combos: RenderedVariant[]
   ): Observable<boolean> {
-    return new Observable<boolean>(subscriber => {
-      google.script.run
-        .withSuccessHandler((response: boolean) => {
-          this.ngZone.run(() => {
-            subscriber.next(response);
-            subscriber.complete();
-          });
+    return this.httpClient
+      .post<{ success: boolean }>(
+        `${API_BASE_URL}/videos/${folder}/approval`,
+        { combos }
+      )
+      .pipe(
+        map(response => response.success),
+        catchError(error => {
+          console.error('Error storing approval status:', error);
+          return throwError(() => error);
         })
-        .withFailureHandler((error: Error) => {
-          console.error('Error while storing approval status! Error: ', error);
-          subscriber.error(error);
-        })
-        .storeApprovalStatus(folder, combos);
-    });
+      );
   }
 
+  /**
+   * Get detected video language
+   */
   getVideoLanguage(gcsFolder: string): Observable<string> {
-    return new Observable<string>(subscriber => {
-      google.script.run
-        .withSuccessHandler((videoLanguage: string) => {
-          this.ngZone.run(() => {
-            subscriber.next(videoLanguage);
-            subscriber.complete();
-          });
-        })
-        .withFailureHandler((error: Error) => {
-          console.error(
-            'Could not retrieve the video language! Error: ',
-            error
-          );
-          subscriber.error(error);
-        })
-        .getVideoLanguage(gcsFolder);
-    }).pipe(
-      retry({ count: CONFIG.maxRetriesAppsScript, delay: CONFIG.retryDelay })
+    return this.getFromGcs(`${gcsFolder}/language.txt`, RETRY_DELAY, MAX_RETRIES).pipe(
+      map(content => content.trim()),
+      catchError(() => of('English')) // Default to English
     );
   }
 
+  /**
+   * Generate text assets for a variant
+   */
   generateTextAssets(
     variantVideoPath: string,
     textAssetsLanguage: string
   ): Observable<VariantTextAsset[]> {
-    return new Observable<VariantTextAsset[]>(subscriber => {
-      google.script.run
-        .withSuccessHandler((textAssets: VariantTextAsset[]) => {
-          this.ngZone.run(() => {
-            textAssets.forEach(textAsset => {
-              textAsset.approved = true;
-              textAsset.editable = false;
-            });
-            subscriber.next(textAssets);
-            subscriber.complete();
+    return this.httpClient
+      .post<{ assets: VariantTextAsset[] }>(
+        `${API_BASE_URL}/videos/text-assets/generate`,
+        {
+          variant_video_path: variantVideoPath,
+          language: textAssetsLanguage,
+        }
+      )
+      .pipe(
+        map(response => {
+          const assets = response.assets || [];
+          assets.forEach(asset => {
+            asset.approved = true;
+            asset.editable = false;
           });
+          return assets;
+        }),
+        retry({ count: MAX_RETRIES, delay: RETRY_DELAY }),
+        catchError(error => {
+          console.error('Error generating text assets:', error);
+          return throwError(() => error);
         })
-        .withFailureHandler((error: Error) => {
-          console.error('Could not generate text assets! Error: ', error);
-          subscriber.error(error);
-        })
-        .generateTextAssets(variantVideoPath, textAssetsLanguage);
-    }).pipe(
-      retry({ count: CONFIG.maxRetriesAppsScript, delay: CONFIG.retryDelay })
-    );
+      );
   }
 
+  /**
+   * Split a segment at specified markers
+   */
   splitSegment(
     gcsFolder: string,
     segmentMarkers: SegmentMarker[]
   ): Observable<string> {
-    return new Observable<string>(subscriber => {
-      google.script.run
-        .withSuccessHandler((response: string) => {
-          this.ngZone.run(() => {
-            subscriber.next(response);
-            subscriber.complete();
-          });
+    return this.httpClient
+      .post<{ status: string; message: string }>(
+        `${API_BASE_URL}/videos/${gcsFolder}/segments/split`,
+        {
+          segment_id: segmentMarkers[0]?.av_segment_id || '',
+          split_times: segmentMarkers.map(m => m.marker_cut_time_s),
+        }
+      )
+      .pipe(
+        map(response => response.message),
+        catchError(error => {
+          console.error('Error splitting segment:', error);
+          return throwError(() => error);
         })
-        .withFailureHandler((error: Error) => {
-          console.error(
-            'Encountered an unexpected error while splitting a segment! Error: ',
-            error
-          );
-          subscriber.error(error);
-        })
-        .splitSegment(gcsFolder, segmentMarkers);
-    });
+      );
   }
 
+  /**
+   * Update transcription for a video
+   */
   updateTranscription(
     gcsFolder: string,
     transcriptionText: string
   ): Observable<boolean> {
-    return new Observable<boolean>(subscriber => {
-      google.script.run
-        .withSuccessHandler((response: boolean) => {
-          this.ngZone.run(() => {
-            subscriber.next(response);
-            subscriber.complete();
-          });
+    return this.httpClient
+      .put<{ success: boolean }>(
+        `${API_BASE_URL}/videos/${gcsFolder}/transcription`,
+        { transcription: transcriptionText }
+      )
+      .pipe(
+        map(response => response.success),
+        catchError(error => {
+          console.error('Error updating transcription:', error);
+          return throwError(() => error);
         })
-        .withFailureHandler((error: Error) => {
-          console.error(
-            'Encountered an unexpected error while updating transcription! Error: ',
-            error
-          );
-          subscriber.error(error);
-        })
-        .updateTranscription(gcsFolder, transcriptionText);
-    });
+      );
   }
 }

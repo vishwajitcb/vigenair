@@ -29,15 +29,15 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 from urllib import parse
 
 import config as ConfigService
+import google.generativeai as genai
 import pandas as pd
 import storage as StorageService
 import utils as Utils
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part
 
 
 @enum.unique
@@ -210,17 +210,15 @@ class Combiner:
     """Initialiser.
 
     Args:
-      gcs_bucket_name: The GCS bucket to read from and store files in.
+      gcs_bucket_name: The S3 bucket to read from and store files in.
       render_file: Path to the input rendering file.
     """
     self.gcs_bucket_name = gcs_bucket_name
     self.render_file = render_file
-    vertexai.init(
-        project=ConfigService.GCP_PROJECT_ID,
-        location=ConfigService.GCP_LOCATION,
-    )
-    self.text_model = GenerativeModel(ConfigService.CONFIG_TEXT_MODEL)
-    self.vision_model = GenerativeModel(ConfigService.CONFIG_VISION_MODEL)
+    # Initialize Google AI Studio SDK
+    genai.configure(api_key=ConfigService.GOOGLE_API_KEY)
+    self.text_model = genai.GenerativeModel(ConfigService.CONFIG_TEXT_MODEL)
+    self.vision_model = genai.GenerativeModel(ConfigService.CONFIG_VISION_MODEL)
 
   def check_finalise_render(self, variants_count: int):
     """Checks whether all variants have been rendered to trigger `finalise`."""
@@ -771,7 +769,7 @@ def _render_video_variant(
     speech_track_path: Optional[str],
     music_track_path: Optional[str],
     video_variant: VideoVariant,
-    vision_model: GenerativeModel,
+    vision_model,
     video_language: str,
 ) -> Dict[str, Any]:
   """Renders a video variant in all formats."""
@@ -1008,10 +1006,7 @@ def _render_video_variant(
   if video_variant.render_settings.generate_text_assets:
     text_assets = _generate_text_assets(
         vision_model=vision_model,
-        gcs_video_path=(
-            f'gs://{gcs_bucket_name}/{gcs_folder_path}/'
-            f'{base_combo_name}'
-        ),
+        local_video_path=base_combo_path,
         video_language=video_language,
         video_variant=video_variant,
     )
@@ -1077,7 +1072,7 @@ def _get_variant_ffmpeg_commands(
 
 
 def _render_format(
-    vision_model: GenerativeModel,
+    vision_model,
     input_video_path: str,
     output_path: str,
     gcs_bucket_name: str,
@@ -1224,8 +1219,8 @@ def _render_format(
 
 
 def _generate_text_assets(
-    vision_model: GenerativeModel,
-    gcs_video_path: str,
+    vision_model,
+    local_video_path: str,
     video_language: str,
     video_variant: VideoVariant,
 ) -> Optional[Sequence[Dict[str, str]]]:
@@ -1234,12 +1229,18 @@ def _generate_text_assets(
       video_language=video_language
   )
   assets = None
+  video_file = None
   try:
+    # Upload video to Gemini Files API
+    video_file = genai.upload_file(local_video_path, mime_type='video/mp4')
+    # Wait for file to be ready
+    while video_file.state.name == 'PROCESSING':
+      time.sleep(2)
+      video_file = genai.get_file(video_file.name)
+    if video_file.state.name == 'FAILED':
+      raise ValueError(f'Video processing failed: {video_file.state.name}')
     response = vision_model.generate_content(
-        [
-            Part.from_uri(gcs_video_path, mime_type='video/mp4'),
-            prompt,
-        ],
+        [video_file, prompt],
         generation_config=ConfigService.GENERATE_ASSETS_CONFIG,
         safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
     )
@@ -1293,6 +1294,14 @@ def _generate_text_assets(
         'Encountered error during generation of text assets for variant %d! '
         'Continuing...', video_variant.variant_id
     )
+  finally:
+    # Clean up uploaded file from Gemini to prevent quota exhaustion
+    if video_file:
+      try:
+        genai.delete_file(video_file.name)
+        logging.info('ASSETS - Cleaned up Gemini file: %s', video_file.name)
+      except Exception as cleanup_error:
+        logging.warning('ASSETS - Failed to clean up Gemini file: %s', cleanup_error)
   return assets
 
 
@@ -1344,7 +1353,7 @@ def _generate_video_script(
 
 
 def _generate_image_assets(
-    vision_model: GenerativeModel,
+    vision_model,
     video_file_path: str,
     gcs_bucket_name: str,
     gcs_folder_path: str,
@@ -1429,7 +1438,7 @@ def _extract_video_thumbnails(
 
 
 def _identify_and_extract_key_frames(
-    vision_model: GenerativeModel,
+    vision_model,
     video_file_path: str,
     image_assets_path: str,
     gcs_bucket_name: str,
@@ -1440,17 +1449,18 @@ def _identify_and_extract_key_frames(
 ):
   """Identifies key frames via Gemini and extracts them."""
   results = []
+  video_file = None
   try:
-    gcs_video_file_path = video_file_path.replace(f'{output_path}/', '')
+    # Upload video to Gemini Files API (video_file_path is local)
+    video_file = genai.upload_file(video_file_path, mime_type='video/mp4')
+    # Wait for file to be ready
+    while video_file.state.name == 'PROCESSING':
+      time.sleep(2)
+      video_file = genai.get_file(video_file.name)
+    if video_file.state.name == 'FAILED':
+      raise ValueError(f'Video processing failed: {video_file.state.name}')
     response = vision_model.generate_content(
-        [
-            Part.from_uri(
-                f'gs://{gcs_bucket_name}/{gcs_folder_path}/'
-                f'{gcs_video_file_path}',
-                mime_type='video/mp4',
-            ),
-            ConfigService.KEY_FRAMES_PROMPT,
-        ],
+        [video_file, ConfigService.KEY_FRAMES_PROMPT],
         generation_config=ConfigService.KEY_FRAMES_CONFIG,
         safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
     )
@@ -1464,6 +1474,14 @@ def _identify_and_extract_key_frames(
       logging.warning('ASSETS - Could not identify key frames!')
   except Exception:  # pylint: disable=broad-exception-caught
     logging.exception('Encountered error while identifying key frames!')
+  finally:
+    # Clean up uploaded file from Gemini to prevent quota exhaustion
+    if video_file:
+      try:
+        genai.delete_file(video_file.name)
+        logging.info('KEY_FRAMES - Cleaned up Gemini file: %s', video_file.name)
+      except Exception as cleanup_error:
+        logging.warning('KEY_FRAMES - Failed to clean up Gemini file: %s', cleanup_error)
 
   if results:
     for index, key_frame_timestamp in enumerate(results):

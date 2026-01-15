@@ -27,6 +27,7 @@ import pathlib
 import re
 import shutil
 import tempfile
+import time
 from typing import Sequence, Tuple
 from urllib import parse
 
@@ -34,11 +35,10 @@ import audio as AudioService
 import config as ConfigService
 import extractor.audio_extractor as AudioExtractor
 import extractor.video_extractor as VideoExtractor
+import google.generativeai as genai
 import pandas as pd
 import storage as StorageService
 import utils as Utils
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part
 import video as VideoService
 
 
@@ -75,17 +75,27 @@ class Extractor:
     """Initialiser.
 
     Args:
-      gcs_bucket_name: The GCS bucket to read from and store files in.
+      gcs_bucket_name: The S3 bucket to read from and store files in.
       media_file: Path to the input media file, which is in a specific folder on
-        GCS. See Utils.VideoMetadata for more information.
+        S3. See Utils.VideoMetadata for more information.
     """
     self.gcs_bucket_name = gcs_bucket_name
     self.media_file = media_file
-    vertexai.init(
-        project=ConfigService.GCP_PROJECT_ID,
-        location=ConfigService.GCP_LOCATION,
+
+    # Validate and initialize Google AI Studio SDK
+    api_key = ConfigService.GOOGLE_API_KEY
+    if not api_key:
+      raise ValueError(
+          "GOOGLE_API_KEY environment variable is not set. "
+          "Please configure it before running the extractor."
+      )
+
+    genai.configure(api_key=api_key)
+    self.vision_model = genai.GenerativeModel(ConfigService.CONFIG_VISION_MODEL)
+    logging.info(
+        'EXTRACTOR - Initialized with model: %s',
+        ConfigService.CONFIG_VISION_MODEL
     )
-    self.vision_model = GenerativeModel(ConfigService.CONFIG_VISION_MODEL)
 
   def initial_extract(self):
     """Extracts all the available data from the input video."""
@@ -173,23 +183,24 @@ class Extractor:
         os.rename(temp_mp4_path, input_video_file_path)
         logging.info('EXTRACTOR - Restored converted mp4 for processing')
 
-    with concurrent.futures.ProcessPoolExecutor() as process_executor:
-      concurrent.futures.wait([
-          process_executor.submit(
-              AudioExtractor.process_audio,
-              output_dir=tmp_dir,
-              input_audio_file_path=input_audio_file_path,
-              gcs_bucket_name=self.gcs_bucket_name,
-              media_file=self.media_file,
-          ),
-          process_executor.submit(
-              VideoExtractor.process_video,
-              output_dir=tmp_dir,
-              input_video_file_path=input_video_file_path,
-              media_file=self.media_file,
-              gcs_bucket_name=self.gcs_bucket_name,
-          )
-      ])
+    # Run audio and video processing sequentially
+    # (ProcessPoolExecutor removed - fork-unsafe with boto3 and added complexity
+    # for only ~1-2 min time savings)
+    logging.info('EXTRACTOR - Starting audio processing...')
+    AudioExtractor.process_audio(
+        output_dir=tmp_dir,
+        input_audio_file_path=input_audio_file_path,
+        gcs_bucket_name=self.gcs_bucket_name,
+        media_file=self.media_file,
+    )
+    logging.info('EXTRACTOR - Audio processing complete. Starting video processing...')
+    VideoExtractor.process_video(
+        output_dir=tmp_dir,
+        input_video_file_path=input_video_file_path,
+        media_file=self.media_file,
+        gcs_bucket_name=self.gcs_bucket_name,
+    )
+    logging.info('EXTRACTOR - Video processing complete.')
 
   def extract_audio(self):
     """Extracts audio information from the input video."""
@@ -260,7 +271,8 @@ class Extractor:
           'TRANSCRIPTION - %s written successfully!',
           ConfigService.OUTPUT_SUBTITLES_FILE,
       )
-    else:
+    elif is_chunk:
+      # Only remove the chunks subdirectory, not the main output_dir
       shutil.rmtree(output_subdir)
 
     language_probability_dict = {}
@@ -431,12 +443,17 @@ class Extractor:
         bucket_name=self.gcs_bucket_name,
     )
 
+    # Get video duration to clamp segment times
+    video_duration = Utils.get_media_duration(input_video_file_path)
+    logging.info('EXTRACTOR - Video duration: %.2f seconds', video_duration)
+
     annotation_results = self.extract_video_finalise(tmp_dir)
     transcription_dataframe = self.extract_audio_finalise(tmp_dir)
 
     optimised_av_segments = _create_optimised_segments(
         annotation_results,
         transcription_dataframe,
+        video_duration=video_duration,
     )
     logging.info(
         'SEGMENTS - Optimised segments: %r',
@@ -477,7 +494,10 @@ class Extractor:
     )
 
     data_file_path = str(pathlib.Path(tmp_dir, ConfigService.OUTPUT_DATA_FILE))
-    optimised_av_segments.to_json(data_file_path, orient='records')
+    # Output segments as array directly (expected by frontend)
+    segments_array = json.loads(optimised_av_segments.to_json(orient='records'))
+    with open(data_file_path, 'w', encoding='utf-8') as f:
+      json.dump(segments_array, f, indent=2)
 
     StorageService.upload_gcs_dir(
         source_directory=tmp_dir,
@@ -503,8 +523,9 @@ class Extractor:
     """
     cuts_path = str(pathlib.Path(tmp_dir, ConfigService.OUTPUT_AV_SEGMENTS_DIR))
     os.makedirs(cuts_path)
-    gcs_cuts_folder_path = (
-        f'gs://{self.gcs_bucket_name}/{self.media_file.gcs_root_folder}/'
+    # S3 path for segment cuts (compatible with backward alias)
+    s3_cuts_folder_path = (
+        f'{self.media_file.gcs_root_folder}/'
         f'{ConfigService.OUTPUT_AV_SEGMENTS_DIR}'
     )
     _, video_ext = os.path.splitext(video_file_path)
@@ -522,8 +543,8 @@ class Extractor:
               video_file_path=video_file_path,
               cuts_path=cuts_path,
               vision_model=self.vision_model,
-              gcs_cut_path=(
-                  f'{gcs_cuts_folder_path}/'
+              s3_cut_path=(
+                  f'{s3_cuts_folder_path}/'
                   f"{row['av_segment_id'].replace('.0', '')}{video_ext}"
               ),
               bucket_name=self.gcs_bucket_name,
@@ -533,12 +554,12 @@ class Extractor:
 
       for response in concurrent.futures.as_completed(futures_dict):
         index = futures_dict[response]
-        description, keyword = response.result()
+        description, keyword = response.result(timeout=300)  # 5 min per segment
         descriptions[index] = description
         keywords[index] = keyword
+        # Build S3 URL for the segment resources
         resources_base_path = (
-            f'{ConfigService.GCS_BASE_URL}/'
-            f'{self.gcs_bucket_name}/'
+            f'{ConfigService.S3_BASE_URL}/'
             f'{parse.quote(self.media_file.gcs_root_folder)}/'
             f'{ConfigService.OUTPUT_AV_SEGMENTS_DIR}/'
             f"{optimised_av_segments.loc[index, 'av_segment_id'].replace('.0', '')}"
@@ -566,7 +587,7 @@ class Extractor:
     """Enhances A/V segment descriptions and keywords to achieve more coherence.
 
     Args:
-      video_file_path: Path to the input video file.
+      video_file_path: Path to the input video file (local path).
       optimised_av_segments: The A/V segments data to be enhanced.
 
     Returns:
@@ -582,14 +603,27 @@ class Extractor:
     ])
     rows = []
     try:
+      # Download video from S3 if it's an S3 path, otherwise use local path
+      local_video_path = video_file_path
+      if not os.path.exists(video_file_path):
+        # It's an S3 key, download it
+        tmp_dir = tempfile.mkdtemp()
+        local_video_path = StorageService.download_file(
+            file_path=Utils.TriggerFile(video_file_path),
+            output_dir=tmp_dir,
+            bucket_name=self.gcs_bucket_name,
+        )
+
+      # Upload to Gemini Files API and wait for it to be ready
+      video_file = genai.upload_file(local_video_path, mime_type='video/mp4')
+      while video_file.state.name == 'PROCESSING':
+        time.sleep(2)
+        video_file = genai.get_file(video_file.name)
+      if video_file.state.name == 'FAILED':
+        raise ValueError(f'Video processing failed: {video_file.state.name}')
+
       response = self.vision_model.generate_content(
-          [
-              Part.from_uri(
-                  f'gs://{self.gcs_bucket_name}/{video_file_path}',
-                  mime_type='video/mp4'
-              ),
-              prompt,
-          ],
+          [video_file, prompt],
           generation_config=ConfigService.ENHANCE_SEGMENT_ANNOTATIONS_CONFIG,
           safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
       )
@@ -799,8 +833,8 @@ def _cut_and_annotate_av_segment(
     row: pd.Series,
     video_file_path: str,
     cuts_path: str,
-    vision_model: GenerativeModel,
-    gcs_cut_path: str,
+    vision_model,
+    s3_cut_path: str,
     bucket_name: str,
 ) -> Tuple[str, str]:
   """Cuts a single A/V segment with ffmpeg and annotates it with Gemini.
@@ -810,8 +844,8 @@ def _cut_and_annotate_av_segment(
     video_file_path: Path to the input video file.
     cuts_path: The local directory to store the A/V segment cuts.
     vision_model: The Gemini model to generate the A/V segment descriptions.
-    gcs_cut_path: The path to store the A/V segment cut in GCS.
-    bucket_name: The GCS bucket name to store the A/V segment cut.
+    s3_cut_path: The path to store the A/V segment cut in S3.
+    bucket_name: The S3 bucket name to store the A/V segment cut.
 
   Returns:
     A tuple of the A/V segment description and keywords.
@@ -850,11 +884,14 @@ def _cut_and_annotate_av_segment(
       description=f'cut segment {av_segment_id} with ffmpeg',
   )
   os.chmod(full_cut_path, 777)
-  gcs_cut_dest_file = gcs_cut_path.replace(f'gs://{bucket_name}/', '')
+  # Remove any gs:// or s3:// prefix for S3 destination
+  s3_cut_dest_file = s3_cut_path
+  for prefix in [f'gs://{bucket_name}/', f's3://{bucket_name}/']:
+    s3_cut_dest_file = s3_cut_dest_file.replace(prefix, '')
   StorageService.upload_gcs_file(
       file_path=full_cut_path,
       bucket_name=bucket_name,
-      destination_file_name=gcs_cut_dest_file,
+      destination_file_name=s3_cut_dest_file,
   )
   Utils.execute_subprocess_commands(
       cmds=[
@@ -872,22 +909,27 @@ def _cut_and_annotate_av_segment(
       description=f'screenshot mid-segment {av_segment_id} with ffmpeg',
   )
   os.chmod(full_screenshot_path, 777)
-  gcs_cut_dest_file_prefix, _ = os.path.splitext(gcs_cut_dest_file)
+  s3_cut_dest_file_prefix, _ = os.path.splitext(s3_cut_dest_file)
   StorageService.upload_gcs_file(
       file_path=full_screenshot_path,
       bucket_name=bucket_name,
       destination_file_name=(
-          f'{gcs_cut_dest_file_prefix}{ConfigService.SEGMENT_SCREENSHOT_EXT}'
+          f'{s3_cut_dest_file_prefix}{ConfigService.SEGMENT_SCREENSHOT_EXT}'
       ),
   )
   description = ''
   keywords = ''
   try:
+    # Upload to Gemini Files API for analysis (file is local)
+    video_file = genai.upload_file(full_cut_path, mime_type='video/mp4')
+    # Wait for file to be ready
+    while video_file.state.name == 'PROCESSING':
+      time.sleep(2)
+      video_file = genai.get_file(video_file.name)
+    if video_file.state.name == 'FAILED':
+      raise ValueError(f'Video processing failed: {video_file.state.name}')
     response = vision_model.generate_content(
-        [
-            Part.from_uri(gcs_cut_path, mime_type='video/mp4'),
-            ConfigService.SEGMENT_ANNOTATIONS_PROMPT,
-        ],
+        [video_file, ConfigService.SEGMENT_ANNOTATIONS_PROMPT],
         generation_config=ConfigService.SEGMENT_ANNOTATIONS_CONFIG,
         safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
     )
@@ -944,6 +986,7 @@ def _cut_and_annotate_av_segment(
 def _create_optimised_segments(
     annotation_results,
     transcription_dataframe: pd.DataFrame,
+    video_duration: float = None,
 ) -> pd.DataFrame:
   """Creates coherent Audio/Video segments by combining all annotations.
 
@@ -951,6 +994,7 @@ def _create_optimised_segments(
     annotation_results: The results of the video analysis with the VertexAI
       Video Intelligence API.
     transcription_dataframe: The video transcription data.
+    video_duration: Video duration in seconds to clamp segment times.
 
   Returns:
     A DataFrame containing all the segments with their annotations.
@@ -958,6 +1002,7 @@ def _create_optimised_segments(
   shots_dataframe = VideoService.get_visual_shots_data(
       annotation_results,
       transcription_dataframe,
+      video_duration=video_duration,
   )
   optimised_av_segments = _create_optimised_av_segments(
       shots_dataframe,

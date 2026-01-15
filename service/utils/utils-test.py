@@ -51,14 +51,6 @@ class UtilsTest(unittest.TestCase):
   def test_transcription_service_from_value(self):
     """Tests the from_value method of TranscriptionService."""
     self.assertEqual(
-        utils.TranscriptionService.from_value('w'),
-        utils.TranscriptionService.WHISPER,
-    )
-    self.assertEqual(
-        utils.TranscriptionService.from_value('whisper'),
-        utils.TranscriptionService.WHISPER,
-    )
-    self.assertEqual(
         utils.TranscriptionService.from_value('g'),
         utils.TranscriptionService.GEMINI,
     )
@@ -70,9 +62,10 @@ class UtilsTest(unittest.TestCase):
         utils.TranscriptionService.from_value('n'),
         utils.TranscriptionService.NONE,
     )
+    # Unknown values default to GEMINI (Whisper was removed)
     self.assertEqual(
         utils.TranscriptionService.from_value('unknown'),
-        utils.TranscriptionService.NONE,
+        utils.TranscriptionService.GEMINI,
     )
 
   def test_video_extension_has_value(self):
@@ -95,13 +88,13 @@ class UtilsTest(unittest.TestCase):
     self.assertEqual(video_metadata_4.video_timestamp, 1234567890)
     self.assertEqual(video_metadata_4.encoded_user_id, 'user123')
 
-    # Test with 3 components (defaults to WHISPER)
+    # Test with 3 components (defaults to GEMINI)
     metadata_str_3 = 'another_video--9876543210--user456'
     video_metadata_3 = utils.VideoMetadata(metadata_str_3)
     self.assertEqual(video_metadata_3.video_file_name, 'another_video')
     self.assertEqual(
         video_metadata_3.transcription_service,
-        utils.TranscriptionService.WHISPER,
+        utils.TranscriptionService.GEMINI,
     )
     self.assertEqual(video_metadata_3.video_timestamp, 9876543210)
     self.assertEqual(video_metadata_3.encoded_user_id, 'user456')

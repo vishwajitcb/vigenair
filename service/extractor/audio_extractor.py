@@ -198,24 +198,27 @@ def _analyse_audio(
     audio_file_path: str,
     transcription_service: Utils.TranscriptionService,
     gcs_folder: str,
-    gcs_bucket_name=str,
+    gcs_bucket_name: str,
 ) -> Tuple[str, str, str, str, float]:
-  """Runs audio analysis in parallel."""
+  """Runs audio analysis in parallel.
+
+  Uses ThreadPoolExecutor to run transcription and audio splitting concurrently,
+  as both are I/O-bound operations (API calls and file processing).
+  """
   vocals_file_path = None
   music_file_path = None
   transcription_dataframe = None
 
-  with concurrent.futures.ProcessPoolExecutor() as process_executor:
+  with concurrent.futures.ThreadPoolExecutor() as thread_executor:
     futures_dict = {
-        process_executor.submit(
+        thread_executor.submit(
             AudioService.transcribe_audio,
             output_dir=output_dir,
             audio_file_path=audio_file_path,
-            transcription_service=transcription_service,
             gcs_folder=gcs_folder,
             gcs_bucket_name=gcs_bucket_name,
         ): 'transcribe_audio',
-        process_executor.submit(
+        thread_executor.submit(
             AudioService.split_audio,
             output_dir=output_dir,
             audio_file_path=audio_file_path,
@@ -227,7 +230,7 @@ def _analyse_audio(
       source = futures_dict[future]
       match source:
         case 'transcribe_audio':
-          transcription_dataframe, language, probability = future.result()
+          transcription_dataframe, language, probability = future.result(timeout=1800)
           logging.info(
               'THREADING - transcribe_audio finished for chunk#%s!',
               file_id,
@@ -238,7 +241,7 @@ def _analyse_audio(
               transcription_dataframe.to_json(orient='records'),
           )
         case 'split_audio':
-          vocals_file_path, music_file_path = future.result()
+          vocals_file_path, music_file_path = future.result(timeout=3600)
           logging.info(
               'THREADING - split_audio finished for chunk#%s!',
               file_id,
@@ -288,7 +291,7 @@ def _get_audio_chunks(
               str(current_duration),
               '-i',
               audio_file_path,
-              '-to',
+              '-t',
               str(duration_limit),
               '-c',
               'copy',

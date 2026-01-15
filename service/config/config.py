@@ -15,27 +15,30 @@
 """Vigenair config.
 
 This module contains all configuration constants and runtime variables used by
-Vigenair.
+Vigenair. Updated to use Google AI Studio SDK instead of Vertex AI.
 """
 
 import os
 
 import torch
-from vertexai import generative_models
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
+# Google AI Studio API Key (replaces GCP project-based auth)
+GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY', '')
+
+# AWS/S3 Configuration (replaces GCS)
+S3_BUCKET = os.environ.get('S3_BUCKET', '')
+AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+
+# Legacy GCP variables (kept for backward compatibility during migration)
 GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID', 'my-gcp-project')
 GCP_LOCATION = os.environ.get('GCP_LOCATION', 'us-central1')
-CONFIG_TEXT_MODEL = os.environ.get('CONFIG_TEXT_MODEL', 'gemini-2.5-flash')
-CONFIG_VISION_MODEL = os.environ.get('CONFIG_VISION_MODEL', 'gemini-2.5-flash')
-CONFIG_TRANSCRIPTION_MODEL_WHISPER_GCS_BUCKET = os.environ.get(
-    'CONFIG_TRANSCRIPTION_MODEL_WHISPER_GCS_BUCKET',
-    'vigenair-faster-whisper'
-)
-CONFIG_TRANSCRIPTION_MODEL_WHISPER = os.environ.get(
-    'CONFIG_TRANSCRIPTION_MODEL_WHISPER', 'small'
-)
+
+# Model Configuration
+CONFIG_TEXT_MODEL = os.environ.get('CONFIG_TEXT_MODEL', 'gemini-3-flash-preview')
+CONFIG_VISION_MODEL = os.environ.get('CONFIG_VISION_MODEL', 'gemini-3-flash-preview')
 CONFIG_TRANSCRIPTION_MODEL_GEMINI = os.environ.get(
-    'CONFIG_TRANSCRIPTION_MODEL_GEMINI', 'gemini-2.5-flash'
+    'CONFIG_TRANSCRIPTION_MODEL_GEMINI', 'gemini-3-flash-preview'
 )
 CONFIG_ANNOTATIONS_CONFIDENCE_THRESHOLD = float(
     os.environ.get('CONFIG_ANNOTATIONS_CONFIDENCE_THRESHOLD', '0.7')
@@ -65,19 +68,12 @@ USER_AGENT_ID = f'cloud-solutions/mas-vigenair-backend-{CONFIG_BACKEND_VERSION}'
 # https://en.wikipedia.org/wiki/Fade_(audio_engineering)#:~:text=Appropriate%20fade%2Din%20time,10ms.%5B14%5D
 CONFIG_DEFAULT_FADE_OUT_BUFFER = 0.1
 
+# Safety configuration for Google AI Studio (updated from Vertex AI)
 CONFIG_DEFAULT_SAFETY_CONFIG = {
-    generative_models.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: (
-        generative_models.HarmBlockThreshold.BLOCK_ONLY_HIGH
-    ),
-    generative_models.HarmCategory.HARM_CATEGORY_HARASSMENT: (
-        generative_models.HarmBlockThreshold.BLOCK_ONLY_HIGH
-    ),
-    generative_models.HarmCategory.HARM_CATEGORY_HATE_SPEECH: (
-        generative_models.HarmBlockThreshold.BLOCK_ONLY_HIGH
-    ),
-    generative_models.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: (
-        generative_models.HarmBlockThreshold.BLOCK_ONLY_HIGH
-    ),
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
 }
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -103,7 +99,7 @@ OUTPUT_SUBTITLES_FILE = f'{INPUT_FILENAME}.{OUTPUT_SUBTITLES_TYPE}'
 OUTPUT_LANGUAGE_FILE = 'language.txt'
 OUTPUT_LANGUAGE_INFO_FILE = 'language.json'
 OUTPUT_SPEECH_FILE = 'vocals.wav'
-OUTPUT_MUSIC_FILE = 'accompaniment.wav'
+OUTPUT_MUSIC_FILE = 'no_vocals.wav'  # demucs output (was 'accompaniment.wav' for spleeter)
 OUTPUT_ANALYSIS_FILE = 'analysis.json'
 OUTPUT_TRANSCRIPT_FILE = 'transcript.json'
 OUTPUT_DATA_FILE = 'data.json'
@@ -113,7 +109,9 @@ OUTPUT_AV_SEGMENTS_DIR = 'av_segments_cuts'
 OUTPUT_ANALYSIS_CHUNKS_DIR = 'analysis_chunks'
 OUTPUT_COMBINATION_ASSETS_DIR = 'assets'
 
-GCS_BASE_URL = 'https://storage.mtls.cloud.google.com'
+# S3 Base URL (replaces GCS_BASE_URL)
+S3_BASE_URL = f'https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com' if S3_BUCKET else ''
+GCS_BASE_URL = S3_BASE_URL  # Backward compatibility alias
 
 SEGMENT_SCREENSHOT_EXT = '.jpg'
 SEGMENT_ANNOTATIONS_PATTERN = '(.*Description:\n?)?(.*)\n*Keywords:\n?(.*)'
@@ -132,9 +130,6 @@ SEGMENT_ANNOTATIONS_CONFIG = {
     'max_output_tokens': 2048,
     'temperature': 0.2,
     'top_p': 1,
-    'thinking_config': {
-        'thinking_budget': 0,
-    },
 }
 
 # pylint: disable=line-too-long
@@ -174,9 +169,6 @@ GENERATE_ASSETS_CONFIG = {
     'max_output_tokens': 2048,
     'temperature': 0.2,
     'top_p': 1,
-    'thinking_config': {
-        'thinking_budget': 0,
-    },
 }
 
 DEFAULT_VIDEO_LANGUAGE = 'English'
@@ -205,19 +197,32 @@ TRANSCRIBE_AUDIO_CONFIG = {
     'max_output_tokens': 8192,
     'temperature': 0.2,
     'top_p': 1,
-    'thinking_config': {
-        'thinking_budget': 0,
-    },
 }
-TRANSCRIBE_AUDIO_PATTERN = '.*Language: ?(.*)\n*.*Confidence: ?(.*)\n*```csv\n(.*)```\n*```vtt\n(.*)```'
+TRANSCRIBE_AUDIO_PATTERN = r'Language:\s*(.+?)\n.*?Confidence:\s*(.+?)\n.*?```csv\s*\n(.*?)```.*?```vtt\s*\n(.*?)```'
+
+# JSON-based transcription prompt for structured output
+TRANSCRIBE_AUDIO_PROMPT_JSON = """Transcribe the provided audio file accurately.
+
+Return a JSON object with:
+- "language": The detected language (e.g., "English", "Telugu", "Hindi")
+- "confidence": A confidence score between 0 and 1
+- "segments": An array of transcription segments, each with:
+  - "start": Start timestamp in format "MM:SS.mmm" (e.g., "00:05.230")
+  - "end": End timestamp in format "MM:SS.mmm"
+  - "text": The transcribed text for this segment
+
+Important:
+- Each segment should be a complete sentence or meaningful phrase
+- Detect pauses - if there's silence between utterances, reflect it in timestamps
+- Timestamps must not overlap
+- All timestamps must be within the audio duration
+- Different speakers should be in separate segments
+"""
 
 ENHANCE_SEGMENT_ANNOTATIONS_CONFIG = {
     'max_output_tokens': 8192,
     'temperature': 1,
     'top_p': 1,
-    'thinking_config': {
-        'thinking_budget': 0,
-    },
 }
 ENHANCE_SEGMENT_ANNOTATIONS_PATTERN = 'Scene: (\d+)\nOld Description: (.*)\nNew Description: (.*)\nKeywords: (.*)'
 ENHANCE_SEGMENT_ANNOTATIONS_PROMPT = """Assume the role of an expert video ad script writer specializing in creating compelling and coherent narratives that maximize viewer engagement.
@@ -242,9 +247,6 @@ KEY_FRAMES_CONFIG = {
     'max_output_tokens': 8192,
     'temperature': 0.2,
     'top_p': 1,
-    'thinking_config': {
-        'thinking_budget': 0,
-    },
 }
 KEY_FRAMES_PATTERN = '\[(.*)\].*'
 KEY_FRAMES_PROMPT = """You are an expert in analyzing video ad content for marketing purposes.
@@ -267,3 +269,40 @@ Provide precise timestamps in the format [minutes:seconds]. Once you've identifi
 Output a list of timestamps along with a brief explanation of why each frame is significant.
 Do not output any other text before or after the timestamps list.
 """
+
+# Video Analysis Prompt (replaces Video Intelligence API)
+VIDEO_ANALYSIS_PROMPT = """Analyze this video and provide detailed JSON output with the following structure:
+
+{
+  "shots": [
+    {"start_seconds": 0.0, "end_seconds": 2.5},
+    {"start_seconds": 2.5, "end_seconds": 5.0}
+  ],
+  "labels": [
+    {"description": "outdoor", "segments": [{"start": 0, "end": 10}], "confidence": 0.95}
+  ],
+  "objects": [
+    {"description": "person", "start": 0, "end": 5, "confidence": 0.9}
+  ],
+  "text": [
+    {"text": "Brand Name", "start": 1, "end": 3, "confidence": 0.85}
+  ],
+  "logos": [
+    {"description": "Nike", "start": 0, "end": 2}
+  ]
+}
+
+Analyze the entire video carefully. Identify:
+1. Scene/shot changes (every time the camera angle or scene changes significantly)
+2. Objects visible in the video
+3. Any text that appears on screen
+4. Logos or brand marks
+5. General labels/categories for each scene
+
+Return ONLY valid JSON, no other text.
+"""
+
+VIDEO_ANALYSIS_CONFIG = {
+    'max_output_tokens': 8192,
+    'temperature': 0.1,
+}

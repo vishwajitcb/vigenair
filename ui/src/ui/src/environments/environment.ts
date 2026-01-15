@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-import { ApiCallsService } from '../app/api-calls/api-calls.service';
-
 export const environment = {
   production: true,
-  providers: [{ provide: ApiCallsService }],
+  // API Base URL - proxied through nginx in production
+  apiBaseUrl: '/api/v1',
+  // ApiCallsService uses @Injectable({ providedIn: 'root' }) so no explicit provider needed
+  providers: [],
 };

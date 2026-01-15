@@ -30,7 +30,6 @@ import config as ConfigService
 class TranscriptionService(enum.Enum):
   """Enum of supported transcription services."""
 
-  WHISPER = ['w', 'whisper']
   GEMINI = ['g', 'gemini']
   NONE = ['n']
 
@@ -39,7 +38,8 @@ class TranscriptionService(enum.Enum):
     for item in TranscriptionService:
       if service.lower() in item.value:
         return item
-    return TranscriptionService.NONE
+    # Default to GEMINI (Whisper was removed)
+    return TranscriptionService.GEMINI
 
 
 class RenderFormatType(enum.Enum):
@@ -113,7 +113,7 @@ class VideoMetadata:
           video_timestamp,
           encoded_user_id,
       ) = components
-      self.transcription_service = TranscriptionService.WHISPER
+      self.transcription_service = TranscriptionService.GEMINI
     else:
       raise ValueError(
           f'Invalid metadata format: expected 3 or 4 components, '
@@ -273,9 +273,18 @@ def execute_subprocess_commands(
 
 
 def timestring_to_seconds(timestring: str) -> float:
-  """Converts a timestring in the format mm:ss.SSS to seconds."""
-  minutes, seconds = map(float, timestring.split(':'))
-  return minutes*60 + seconds
+  """Converts a timestring to seconds. Handles mm:ss.SSS or HH:MM:SS.mmm formats."""
+  parts = timestring.split(':')
+  if len(parts) == 2:
+    # mm:ss.SSS format
+    minutes, seconds = map(float, parts)
+    return minutes * 60 + seconds
+  elif len(parts) == 3:
+    # HH:MM:SS.mmm format
+    hours, minutes, seconds = map(float, parts)
+    return hours * 3600 + minutes * 60 + seconds
+  else:
+    raise ValueError(f'Invalid timestring format: {timestring}')
 
 
 def rename_chunks(result: Sequence[str], file_suffix: str):
@@ -306,3 +315,20 @@ def get_media_duration(input_file_path: str) -> float:
       description=f'get duration of [{input_file_path}] with ffprobe',
   )
   return float(output)
+
+
+def sanitise_filename(input_str: str) -> str:
+  """Sanitizes a filename for S3/GCS storage.
+
+  Args:
+    input_str: The input filename to sanitize.
+
+  Returns:
+    Sanitized filename safe for cloud storage.
+  """
+  import re
+  # Remove characters not allowed in GCS/S3 object names
+  sanitized = re.sub(r'[#/\[\]*?:"<>|]', '', input_str)
+  # Replace consecutive hyphens with single hyphen to avoid metadata parsing issues
+  sanitized = re.sub(r'--+', '-', sanitized)
+  return sanitized

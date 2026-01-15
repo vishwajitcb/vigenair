@@ -15,6 +15,7 @@
 """Vigenair audio service.
 
 This module contains functions to extract, split and transcribe audio files.
+Uses Gemini for transcription.
 """
 
 import datetime
@@ -24,29 +25,29 @@ import os
 import pathlib
 import re
 import shutil
+import time
 from typing import Optional, Sequence, Tuple
 
 import config as ConfigService
-from faster_whisper import WhisperModel
-from iso639 import languages
+import google.generativeai as genai
 import pandas as pd
-import storage as StorageService
 import utils as Utils
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part
-import whisper
 
 
 def combine_audio_files(output_path: str, audio_files: Sequence[str]):
   """Combines audio analysis files into a single file."""
-  ffmpeg_cmds = ['ffmpeg']
+  # Write to temp file first since output might be same as one of the inputs
+  # (ffmpeg cannot edit files in-place)
+  temp_output = output_path + '.tmp.wav'
+
+  ffmpeg_cmds = ['ffmpeg', '-y']
   for audio_file in audio_files:
     ffmpeg_cmds.extend(['-i', audio_file])
 
   ffmpeg_cmds += ['-filter_complex'] + [
       ''.join([f'[{index}:0]' for index, _ in enumerate(audio_files)])
       + f'concat=n={len(audio_files)}:v=0:a=1[outa]'
-  ] + ['-map', '[outa]', output_path]
+  ] + ['-map', '[outa]', temp_output]
 
   Utils.execute_subprocess_commands(
       cmds=ffmpeg_cmds,
@@ -54,6 +55,9 @@ def combine_audio_files(output_path: str, audio_files: Sequence[str]):
           f'Merge {len(audio_files)} audio files and output to {output_path}.'
       ),
   )
+
+  # Move temp file to final output path
+  shutil.move(temp_output, output_path)
   os.chmod(output_path, 777)
 
 
@@ -189,24 +193,33 @@ def split_audio(
 ) -> Tuple[str, str]:
   """Splits the audio into vocals and music tracks and returns their paths.
 
+  Uses demucs for audio separation (replaces spleeter).
+  Demucs outputs to: output_dir/htdemucs/track_name/vocals.wav and no_vocals.wav
+
   Args:
     output_dir: directory where the split audio tracks will be saved.
     audio_file_path: path to the audio file that will be split.
+    prefix: optional prefix for output filenames.
 
   Returns:
     A tuple with the path to the vocals and music tracks.
   """
+  # Run demucs with two-stems mode (vocals + no_vocals)
   Utils.execute_subprocess_commands(
       cmds=[
-          'spleeter',
-          'separate',
-          '-o',
-          output_dir,
+          'python', '-m', 'demucs',
+          '--two-stems=vocals',
+          '-d', 'cpu',
+          '-o', output_dir,
           audio_file_path,
       ],
-      description='split voice-over and background music with spleeter',
+      description='split voice-over and background music with demucs',
   )
-  base_path, _ = os.path.splitext(audio_file_path)
+
+  # Demucs creates: output_dir/htdemucs/track_name/vocals.wav and no_vocals.wav
+  audio_filename = os.path.splitext(os.path.basename(audio_file_path))[0]
+  demucs_output_dir = pathlib.Path(output_dir, 'htdemucs', audio_filename)
+
   vocals_file_path = str(
       pathlib.Path(output_dir, f'{prefix}{ConfigService.OUTPUT_SPEECH_FILE}')
   )
@@ -214,15 +227,18 @@ def split_audio(
       pathlib.Path(output_dir, f'{prefix}{ConfigService.OUTPUT_MUSIC_FILE}')
   )
 
+  # Move files from demucs output structure to expected locations
   shutil.move(
-      f'{base_path}/{ConfigService.OUTPUT_SPEECH_FILE}',
+      str(demucs_output_dir / 'vocals.wav'),
       vocals_file_path if prefix else output_dir
   )
   shutil.move(
-      f'{base_path}/{ConfigService.OUTPUT_MUSIC_FILE}',
+      str(demucs_output_dir / 'no_vocals.wav'),
       music_file_path if prefix else output_dir
   )
-  os.rmdir(base_path)
+
+  # Clean up demucs directory structure
+  shutil.rmtree(pathlib.Path(output_dir, 'htdemucs'), ignore_errors=True)
 
   return vocals_file_path, music_file_path
 
@@ -230,93 +246,120 @@ def split_audio(
 def transcribe_audio(
     output_dir: str,
     audio_file_path: str,
-    transcription_service: Utils.TranscriptionService,
     gcs_folder: str,
     gcs_bucket_name: str,
 ) -> Tuple[pd.DataFrame, str, float]:
-  """Transcribes an audio file and returns the transcription.
+  """Transcribes an audio file using Gemini and returns the transcription.
 
   Args:
     output_dir: Directory where the transcription will be saved.
     audio_file_path: Path to the audio file that will be transcribed.
-    transcription_service: The service to use for transcription.
-    gcs_folder: The GCS folder to use.
-    gcs_bucket_name: The GCS bucket to use.
+    gcs_folder: The S3 folder (kept for backward compatibility).
+    gcs_bucket_name: The S3 bucket (kept for backward compatibility).
 
   Returns:
-    A pandas dataframe with the transcription data.
+    A tuple of (transcription dataframe, detected language, confidence).
   """
-  match transcription_service:
-    case Utils.TranscriptionService.GEMINI:
-      return _transcribe_gemini(
-          output_dir, audio_file_path, gcs_folder, gcs_bucket_name
-      )
-    case Utils.TranscriptionService.WHISPER | _:
-      return _transcribe_whisper(output_dir, audio_file_path)
+  import json
+  import typing_extensions as typing
 
-
-def _transcribe_gemini(
-    output_dir: str,
-    audio_file_path: str,
-    gcs_folder: str,
-    gcs_bucket_name: str,
-) -> Tuple[pd.DataFrame, str, float]:
-  """Transcribes audio using Gemini."""
   transcription_dataframe = pd.DataFrame()
   video_language = ConfigService.DEFAULT_VIDEO_LANGUAGE
   language_probability = 0.0
-  subtitles_content = None
+  subtitles_content = ''
+  audio_file = None
 
-  vertexai.init(
-      project=ConfigService.GCP_PROJECT_ID,
-      location=ConfigService.GCP_LOCATION,
+  # Define structured output schema
+  class TranscriptionSegment(typing.TypedDict):
+    start: str
+    end: str
+    text: str
+
+  class TranscriptionResponse(typing.TypedDict):
+    language: str
+    confidence: float
+    segments: list[TranscriptionSegment]
+
+  # Initialize Google AI Studio SDK
+  genai.configure(api_key=ConfigService.GOOGLE_API_KEY)
+  transcription_model = genai.GenerativeModel(
+      ConfigService.CONFIG_TRANSCRIPTION_MODEL_GEMINI
   )
-  transcription_model = (
-      GenerativeModel(ConfigService.CONFIG_TRANSCRIPTION_MODEL_GEMINI)
-  )
-  audio_file_gcs_uri = f'gs://{gcs_bucket_name}/{gcs_folder}' + (
-      f'/{ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR}'
-      if ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR in audio_file_path else ''
-  ) + audio_file_path.replace(output_dir, '')
+
   try:
+    # Upload audio file to Gemini Files API
+    audio_file = genai.upload_file(audio_file_path, mime_type='audio/wav')
+    # Wait for file to be ready
+    while audio_file.state.name == 'PROCESSING':
+      time.sleep(2)
+      audio_file = genai.get_file(audio_file.name)
+    if audio_file.state.name == 'FAILED':
+      raise ValueError(f'Audio processing failed: {audio_file.state.name}')
+
+    # Use structured output with JSON schema
     response = transcription_model.generate_content(
-        [
-            Part.from_uri(audio_file_gcs_uri, mime_type='audio/wav'),
-            ConfigService.TRANSCRIBE_AUDIO_PROMPT,
-        ],
-        generation_config=ConfigService.TRANSCRIBE_AUDIO_CONFIG,
+        [audio_file, ConfigService.TRANSCRIBE_AUDIO_PROMPT_JSON],
+        generation_config={
+            'response_mime_type': 'application/json',
+            'response_schema': TranscriptionResponse,
+            'temperature': 0.2,
+        },
         safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
     )
-    if (
-        response.candidates and response.candidates[0].content.parts
-        and response.candidates[0].content.parts[0].text
-    ):
+
+    if response.candidates and response.candidates[0].content.parts:
       text = response.candidates[0].content.parts[0].text
-      result = (
-          re.search(ConfigService.TRANSCRIBE_AUDIO_PATTERN, text, re.DOTALL)
-      )
-      logging.info('TRANSCRIPTION - %s', text)
-      video_language = result.group(1)
-      language_probability = result.group(2)
-      transcription_dataframe = (
-          pd.read_csv(io.StringIO(result.group(3)), usecols=[
-              0, 1, 2
-          ]).dropna(axis=1, how='all').rename(
-              columns={
-                  'Start': 'start_s',
-                  'End': 'end_s',
-                  'Transcription': 'transcript',
-              }
-          ).assign(
-              audio_segment_id=lambda df: range(1,
-                                                len(df) + 1),
-              start_s=lambda df: df['start_s'].
-              apply(Utils.timestring_to_seconds),
-              end_s=lambda df: df['end_s'].apply(Utils.timestring_to_seconds),
-              duration_s=lambda df: df['end_s'] - df['start_s'],
-          )
-      )
-      subtitles_content = result.group(4)
+      logging.info('TRANSCRIPTION - Raw JSON: %s', text[:1000])
+
+      data = json.loads(text)
+      video_language = data.get('language', ConfigService.DEFAULT_VIDEO_LANGUAGE)
+      language_probability = float(data.get('confidence', 0.0))
+      segments = data.get('segments', [])
+
+      if segments:
+        # Build dataframe from segments
+        # Handle missing 'end' timestamps by using next segment's start or estimating
+        rows = []
+        for i, seg in enumerate(segments):
+          start_s = Utils.timestring_to_seconds(seg['start'])
+          # Use 'end' if provided, otherwise use next segment's start or add 3 seconds
+          if 'end' in seg:
+            end_s = Utils.timestring_to_seconds(seg['end'])
+          elif i + 1 < len(segments):
+            end_s = Utils.timestring_to_seconds(segments[i + 1]['start'])
+          else:
+            # Last segment - estimate based on text length (avg 3 chars/sec)
+            end_s = start_s + max(3.0, len(seg.get('text', '')) / 10.0)
+          rows.append({
+              'audio_segment_id': i + 1,
+              'start_s': start_s,
+              'end_s': end_s,
+              'transcript': seg['text'],
+          })
+        transcription_dataframe = pd.DataFrame(rows)
+        transcription_dataframe['duration_s'] = (
+            transcription_dataframe['end_s'] - transcription_dataframe['start_s']
+        )
+
+        # Generate VTT content
+        subtitles_content = 'WEBVTT\n\n'
+        for i, seg in enumerate(segments):
+          start_time = seg['start']
+          if 'end' in seg:
+            end_time = seg['end']
+          elif i + 1 < len(segments):
+            end_time = segments[i + 1]['start']
+          else:
+            # Estimate end for last segment
+            start_s = Utils.timestring_to_seconds(seg['start'])
+            end_s = start_s + max(3.0, len(seg.get('text', '')) / 10.0)
+            mins, secs = divmod(end_s, 60)
+            end_time = f"{int(mins):02d}:{secs:06.3f}"
+          subtitles_content += f"{start_time} --> {end_time}\n{seg['text']}\n\n"
+
+        logging.info('TRANSCRIPTION - Parsed %d segments', len(segments))
+      else:
+        logging.warning('TRANSCRIPTION - No segments in response')
     else:
       logging.warning(
           'Could not transcribe audio! Returning empty transcription...'
@@ -328,93 +371,26 @@ def _transcribe_gemini(
         'Encountered error during transcription! '
         'Returning empty transcription...'
     )
+  finally:
+    # Clean up uploaded file from Gemini to prevent quota exhaustion
+    if audio_file:
+      try:
+        genai.delete_file(audio_file.name)
+        logging.info('TRANSCRIPTION - Cleaned up Gemini file: %s', audio_file.name)
+      except Exception as cleanup_error:
+        logging.warning(
+            'TRANSCRIPTION - Failed to clean up Gemini file: %s',
+            cleanup_error
+        )
 
   subtitles_output_path = audio_file_path.replace(
       '.wav', f'.{ConfigService.OUTPUT_SUBTITLES_TYPE}'
   )
   with open(subtitles_output_path, 'w', encoding='utf8') as f:
-    if subtitles_content:
-      f.write(subtitles_content)
-    else:
-      pass
+    f.write(subtitles_content)
 
   logging.info(
       'TRANSCRIPTION - transcript for %s written successfully!',
       audio_file_path,
   )
   return transcription_dataframe, video_language, float(language_probability)
-
-
-def _transcribe_whisper(
-    output_dir: str,
-    audio_file_path: str,
-) -> Tuple[pd.DataFrame, str, float]:
-  """Transcribes audio using Whisper."""
-  model_download_dir_base = (
-      f'/tmp/{ConfigService.CONFIG_TRANSCRIPTION_MODEL_WHISPER_GCS_BUCKET}'
-  )
-  model_download_dir = str(
-      pathlib.Path(
-          model_download_dir_base,
-          ConfigService.CONFIG_TRANSCRIPTION_MODEL_WHISPER,
-      )
-  )
-  os.makedirs(model_download_dir, exist_ok=True)
-  count_files = StorageService.download_gcs_dir(
-      bucket_name=ConfigService.CONFIG_TRANSCRIPTION_MODEL_WHISPER_GCS_BUCKET,
-      dir_path=ConfigService.CONFIG_TRANSCRIPTION_MODEL_WHISPER,
-      output_dir=model_download_dir,
-  )
-  model = WhisperModel(
-      model_download_dir
-      if count_files else ConfigService.CONFIG_TRANSCRIPTION_MODEL_WHISPER,
-      device=ConfigService.DEVICE,
-      compute_type='int8',
-  )
-  segments, info = model.transcribe(
-      audio_file_path,
-      beam_size=5,
-      word_timestamps=True,
-  )
-
-  video_language = languages.get(alpha2=info.language).name
-  language_probability = info.language_probability
-
-  results = list(segments)
-  results_dict = []
-  for result in results:
-    result_dict = result._asdict()
-    words_dict = [word._asdict() for word in result_dict['words']]
-    result_dict['words'] = words_dict
-    results_dict.append(result_dict)
-
-  writer = whisper.utils.get_writer(
-      ConfigService.OUTPUT_SUBTITLES_TYPE,
-      f'{output_dir}/',
-  )
-  writer({'segments': results_dict}, audio_file_path, {'highlight_words': True})
-  logging.info(
-      'TRANSCRIPTION - transcript for %s written successfully!',
-      audio_file_path,
-  )
-
-  transcription_data = []
-  for index, segment in enumerate(results):
-    transcription_data.append((
-        index + 1,
-        segment.start,
-        segment.end,
-        segment.end - segment.start,
-        segment.text,
-    ))
-  transcription_dataframe = pd.DataFrame(
-      transcription_data,
-      columns=[
-          'audio_segment_id',
-          'start_s',
-          'end_s',
-          'duration_s',
-          'transcript',
-      ],
-  )
-  return transcription_dataframe, video_language, language_probability

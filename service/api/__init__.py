@@ -12,32 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Web Framework
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-python-multipart==0.0.6
-pydantic==2.5.3
-
-# AWS S3
-boto3==1.34.25
-botocore==1.34.25
-
-# Google AI Studio (replaces Vertex AI)
-google-generativeai==0.8.3
-
-# Audio/Video Processing
-ffmpeg==1.4
-ffprobe==0.5
-
-# Audio Separation (demucs)
-torch==2.0.1
-torchaudio==2.0.2
-demucs==4.0.1
-
-# Data Processing
-numpy==1.26.4
-pandas==1.5.3
-
-# Utilities
-protobuf==3.20.2
-Werkzeug==2.3.8
+"""ViGenAiR API module."""

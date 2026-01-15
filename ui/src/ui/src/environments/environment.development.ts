@@ -20,6 +20,8 @@ import { ApiCallsService } from '../app/api-calls/api-calls.service';
 
 export const environment = {
   production: false,
+  // API Base URL - direct to backend in development
+  apiBaseUrl: 'http://localhost:8000/api/v1',
   providers: [
     { provide: ApiCallsService, useExisting: MockApiCallsService },
     provideRouter([]),
