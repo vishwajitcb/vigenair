@@ -26,8 +26,8 @@ services:
       - S3_BUCKET=${S3_BUCKET}
 
       # Model Configuration
-      - CONFIG_TEXT_MODEL=${CONFIG_TEXT_MODEL:-gemini-2.0-flash}
-      - CONFIG_VISION_MODEL=${CONFIG_VISION_MODEL:-gemini-2.0-flash}
+      - CONFIG_TEXT_MODEL=${CONFIG_TEXT_MODEL:-gemini-3-flash-preview}
+      - CONFIG_VISION_MODEL=${CONFIG_VISION_MODEL:-gemini-3-flash-preview}
       - CONFIG_TRANSCRIPTION_MODEL_WHISPER=${CONFIG_TRANSCRIPTION_MODEL_WHISPER:-small}
 
       # Backend Configuration
