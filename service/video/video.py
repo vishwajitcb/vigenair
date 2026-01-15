@@ -488,14 +488,19 @@ def _run_gemini_video_analysis(
         raise ValueError(f'Video processing failed: {video_file.state.name}')
 
     logging.info('VIDEO_ANALYSIS - Video uploaded, running analysis...')
+    logging.info('VIDEO_ANALYSIS - Using model: %s', ConfigService.CONFIG_VISION_MODEL)
 
     # Create model and analyze
     model = genai.GenerativeModel(ConfigService.CONFIG_VISION_MODEL)
 
-    response = model.generate_content(
-        [video_file, ConfigService.VIDEO_ANALYSIS_PROMPT],
-        generation_config=ConfigService.VIDEO_ANALYSIS_CONFIG,
-    )
+    try:
+        response = model.generate_content(
+            [video_file, ConfigService.VIDEO_ANALYSIS_PROMPT],
+            generation_config=ConfigService.VIDEO_ANALYSIS_CONFIG,
+        )
+    except Exception as e:
+        logging.error('VIDEO_ANALYSIS - Gemini API call failed: %s', str(e))
+        raise
 
     # Cleanup uploaded Gemini file
     try:
@@ -506,12 +511,38 @@ def _run_gemini_video_analysis(
 
     # Check for empty response (e.g., content moderation)
     if not response.candidates:
+        logging.error('VIDEO_ANALYSIS - Gemini returned no candidates!')
+        logging.error('VIDEO_ANALYSIS - Response object: %s', response)
         raise ValueError(
             'Gemini returned empty response - video may have been blocked by '
             'content moderation or safety filters'
         )
 
-    return response.text
+    # Log response details for debugging
+    candidate = response.candidates[0]
+    finish_reason = getattr(candidate, 'finish_reason', 'unknown')
+    logging.info('VIDEO_ANALYSIS - Response candidate finish_reason: %s', finish_reason)
+
+    # Warn if response was truncated due to token limit
+    if 'MAX_TOKENS' in str(finish_reason):
+        logging.warning('VIDEO_ANALYSIS - Response was TRUNCATED due to MAX_TOKENS limit!')
+
+    # Check if response text is empty
+    response_text = response.text
+    if not response_text or not response_text.strip():
+        logging.error('VIDEO_ANALYSIS - Gemini returned empty text!')
+        logging.error('VIDEO_ANALYSIS - Candidate content: %s',
+                     getattr(candidate, 'content', 'no content'))
+        logging.error('VIDEO_ANALYSIS - Safety ratings: %s',
+                     getattr(candidate, 'safety_ratings', 'no safety ratings'))
+        raise ValueError('Gemini returned empty text response')
+
+    # Log response length and preview
+    logging.info('VIDEO_ANALYSIS - Response text length: %d chars', len(response_text))
+    preview = response_text[:500] if len(response_text) > 500 else response_text
+    logging.info('VIDEO_ANALYSIS - Response preview: %s', preview.replace('\n', ' '))
+
+    return response_text
 
 
 def analyse_video(
@@ -597,16 +628,35 @@ def _parse_gemini_response(response_text: str, input_uri: str) -> VideoAnnotatio
     result = VideoAnnotationResults()
     result.input_uri = input_uri
 
+    logging.info('VIDEO_ANALYSIS - Parsing Gemini response (%d chars)', len(response_text))
+
     # Extract JSON from response (handle markdown code blocks)
     text = response_text.strip()
+
+    # Try to extract JSON from complete markdown code block first
     json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
     if json_match:
         text = json_match.group(1)
+        logging.info('VIDEO_ANALYSIS - Extracted JSON from markdown code block')
+    else:
+        # Handle truncated responses where closing ``` is missing (e.g., MAX_TOKENS)
+        json_start_match = re.search(r'```(?:json)?\s*', text)
+        if json_start_match:
+            text = text[json_start_match.end():]
+            logging.warning('VIDEO_ANALYSIS - Response appears truncated (no closing ```), extracting partial JSON')
 
     try:
         data = json.loads(text)
+        logging.info('VIDEO_ANALYSIS - Successfully parsed JSON response')
+        logging.info('VIDEO_ANALYSIS - JSON keys: %s', list(data.keys()))
+        logging.info('VIDEO_ANALYSIS - Shots in response: %d', len(data.get('shots', [])))
+        logging.info('VIDEO_ANALYSIS - Labels in response: %d', len(data.get('labels', [])))
+        logging.info('VIDEO_ANALYSIS - Objects in response: %d', len(data.get('objects', [])))
     except json.JSONDecodeError as e:
-        logging.warning('Failed to parse Gemini response as JSON: %s', e)
+        logging.error('VIDEO_ANALYSIS - Failed to parse Gemini response as JSON: %s', e)
+        logging.error('VIDEO_ANALYSIS - Raw response text (first 1000 chars): %s',
+                     response_text[:1000] if len(response_text) > 1000 else response_text)
+        logging.error('VIDEO_ANALYSIS - FALLBACK: Creating single default shot (0-30s)')
         # Return empty results with minimal shot data
         result.shot_annotations.append(ShotAnnotation(
             start_time_offset=TimeOffset(seconds=0),

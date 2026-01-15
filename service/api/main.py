@@ -21,6 +21,27 @@ import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+
+class PollEndpointFilter(logging.Filter):
+    """Filter to suppress frequent polling endpoint access logs."""
+
+    # Endpoints to filter (these are polled frequently)
+    FILTERED_PATHS = [
+        '/api/v1/jobs',
+        '/health',
+        '/api/v1/health',
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return False to suppress the log record, True to keep it."""
+        message = record.getMessage()
+        # Check if this is an access log for a filtered path
+        for path in self.FILTERED_PATHS:
+            # Match patterns like: GET /api/v1/jobs HTTP or GET /api/v1/jobs/...
+            if f'GET {path}' in message or f'GET {path}/' in message:
+                return False
+        return True
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -90,6 +111,12 @@ async def api_health_check():
 async def startup_event():
     """Initialize services on startup."""
     logger.info("ViGenAiR API starting up...")
+
+    # Apply filter to suppress polling endpoint access logs
+    # This reduces log noise from frequent health checks and job status polling
+    uvicorn_access = logging.getLogger("uvicorn.access")
+    uvicorn_access.addFilter(PollEndpointFilter())
+    logger.info("Applied filter to suppress polling endpoint access logs")
 
     # Verify required environment variables - FAIL if missing
     required_vars = ["S3_BUCKET", "GOOGLE_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]

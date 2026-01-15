@@ -303,6 +303,6 @@ Return ONLY valid JSON, no other text.
 """
 
 VIDEO_ANALYSIS_CONFIG = {
-    'max_output_tokens': 8192,
+    'max_output_tokens': 32768,  # Increased for longer videos with many shots
     'temperature': 0.1,
 }

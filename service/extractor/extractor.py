@@ -20,6 +20,7 @@ input video file and create coherent audio/video segments.
 
 import concurrent.futures
 import dataclasses
+import gc
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ import re
 import shutil
 import tempfile
 import time
+import traceback
 from typing import Sequence, Tuple
 from urllib import parse
 
@@ -95,6 +97,108 @@ def gemini_generate_with_retry(
 
   logging.error(f'All {max_retries} Gemini attempts failed. Last error: {last_error}')
   return None
+
+
+def gemini_upload_file_with_retry(
+    file_path: str,
+    mime_type: str = 'video/mp4',
+    max_retries: int = 3,
+    retry_delay: float = 2.0,
+    wait_for_processing: bool = True,
+):
+  """Upload file to Gemini Files API with retry logic and proper error handling.
+
+  Args:
+    file_path: Path to the local file to upload.
+    mime_type: MIME type of the file.
+    max_retries: Maximum number of retry attempts.
+    retry_delay: Base delay between retries (uses exponential backoff).
+    wait_for_processing: Whether to wait for file processing to complete.
+
+  Returns:
+    The Gemini file object, or None if all retries failed.
+  """
+  last_error = None
+
+  for attempt in range(max_retries):
+    video_file = None
+    try:
+      logging.info(
+          f'GEMINI_UPLOAD - Attempt {attempt + 1}/{max_retries} for {file_path}'
+      )
+
+      # Force garbage collection before upload to free memory
+      gc.collect()
+
+      # Upload the file
+      video_file = genai.upload_file(file_path, mime_type=mime_type)
+      logging.info(
+          f'GEMINI_UPLOAD - File uploaded successfully: {video_file.name}'
+      )
+
+      if wait_for_processing:
+        # Wait for file to be ready with timeout
+        max_wait_time = 120  # 2 minutes max wait
+        wait_start = time.time()
+        while video_file.state.name == 'PROCESSING':
+          if time.time() - wait_start > max_wait_time:
+            raise TimeoutError(
+                f'File processing timed out after {max_wait_time}s'
+            )
+          time.sleep(2)
+          video_file = genai.get_file(video_file.name)
+
+        if video_file.state.name == 'FAILED':
+          raise ValueError(f'Video processing failed: {video_file.state.name}')
+
+      logging.info(
+          f'GEMINI_UPLOAD - File ready: {video_file.name}, state: {video_file.state.name}'
+      )
+      return video_file
+
+    except Exception as e:
+      last_error = str(e)
+      error_type = type(e).__name__
+      logging.warning(
+          f'GEMINI_UPLOAD - Attempt {attempt + 1} failed ({error_type}): {last_error}'
+      )
+      logging.warning(f'GEMINI_UPLOAD - Traceback: {traceback.format_exc()}')
+
+      # Try to clean up the uploaded file if it exists
+      if video_file is not None:
+        try:
+          genai.delete_file(video_file.name)
+          logging.info(f'GEMINI_UPLOAD - Cleaned up failed upload: {video_file.name}')
+        except Exception:
+          pass  # Ignore cleanup errors
+
+      # Wait before retry (exponential backoff)
+      if attempt < max_retries - 1:
+        sleep_time = retry_delay * (2 ** attempt)
+        logging.info(f'GEMINI_UPLOAD - Waiting {sleep_time}s before retry...')
+        time.sleep(sleep_time)
+        # Force garbage collection between retries
+        gc.collect()
+
+  logging.error(
+      f'GEMINI_UPLOAD - All {max_retries} attempts failed for {file_path}. '
+      f'Last error: {last_error}'
+  )
+  return None
+
+
+def log_memory_usage(context: str = ''):
+  """Log current memory usage for debugging."""
+  try:
+    import resource
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    # maxrss is in kilobytes on Linux, bytes on macOS
+    max_rss_mb = usage.ru_maxrss / 1024  # Convert to MB (Linux)
+    if os.uname().sysname == 'Darwin':
+      max_rss_mb = usage.ru_maxrss / (1024 * 1024)  # macOS uses bytes
+    logging.info(f'MEMORY - {context}: Max RSS = {max_rss_mb:.1f} MB')
+  except Exception as e:
+    logging.debug(f'MEMORY - Could not get memory usage: {e}')
 
 
 @dataclasses.dataclass(init=False)
@@ -576,6 +680,9 @@ class Extractor:
     Returns:
       The enriched A/V segments data as a DataFrame.
     """
+    # Log memory at start of segment processing
+    log_memory_usage('Start of cut_and_annotate_av_segments')
+
     cuts_path = str(pathlib.Path(tmp_dir, ConfigService.OUTPUT_AV_SEGMENTS_DIR))
     os.makedirs(cuts_path)
     # S3 path for segment cuts (compatible with backward alias)
@@ -590,10 +697,17 @@ class Extractor:
     cut_paths = [None] * size
     screenshot_paths = [None] * size
 
-    with concurrent.futures.ThreadPoolExecutor() as thread_executor:
+    # Limit concurrency to prevent memory exhaustion and API rate limiting
+    # Using max_workers=3 to reduce load on Gemini API and memory usage
+    max_workers = min(3, size)
+    logging.info(
+        f'SEGMENTS - Processing {size} segments with {max_workers} workers'
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as thread_executor:
       futures_dict = {
           thread_executor.submit(
-              _cut_and_annotate_av_segment,
+              _cut_and_annotate_av_segment_with_retry,
               row=row,
               video_file_path=video_file_path,
               cuts_path=cuts_path,
@@ -607,11 +721,20 @@ class Extractor:
           for index, row in optimised_av_segments.iterrows()
       }
 
+      completed_count = 0
       for response in concurrent.futures.as_completed(futures_dict):
         index = futures_dict[response]
-        description, keyword = response.result(timeout=300)  # 5 min per segment
-        descriptions[index] = description
-        keywords[index] = keyword
+        try:
+          description, keyword = response.result(timeout=600)  # 10 min per segment
+          descriptions[index] = description
+          keywords[index] = keyword
+        except Exception as e:
+          logging.error(
+              f'SEGMENTS - Failed to process segment {index} after all retries: {e}'
+          )
+          descriptions[index] = ''
+          keywords[index] = ''
+
         # Build S3 URL for the segment resources
         resources_base_path = (
             f'{ConfigService.S3_BASE_URL}/'
@@ -624,6 +747,12 @@ class Extractor:
             f'{resources_base_path}{ConfigService.SEGMENT_SCREENSHOT_EXT}'
         )
 
+        completed_count += 1
+        if completed_count % 5 == 0 or completed_count == size:
+          log_memory_usage(f'After {completed_count}/{size} segments')
+          # Force garbage collection periodically
+          gc.collect()
+
     optimised_av_segments = optimised_av_segments.assign(
         **{
             'description': descriptions,
@@ -632,6 +761,8 @@ class Extractor:
             'segment_screenshot_uri': screenshot_paths,
         }
     )
+
+    log_memory_usage('End of cut_and_annotate_av_segments')
     return optimised_av_segments
 
   def enhance_av_segments(
@@ -669,13 +800,18 @@ class Extractor:
             bucket_name=self.gcs_bucket_name,
         )
 
-      # Upload to Gemini Files API and wait for it to be ready
-      video_file = genai.upload_file(local_video_path, mime_type='video/mp4')
-      while video_file.state.name == 'PROCESSING':
-        time.sleep(2)
-        video_file = genai.get_file(video_file.name)
-      if video_file.state.name == 'FAILED':
-        raise ValueError(f'Video processing failed: {video_file.state.name}')
+      # Upload to Gemini Files API with retry logic
+      video_file = gemini_upload_file_with_retry(
+          file_path=local_video_path,
+          mime_type='video/mp4',
+          max_retries=3,
+          wait_for_processing=True,
+      )
+      if video_file is None:
+        logging.warning(
+            'ANNOTATION - Could not upload video for enhancement, skipping'
+        )
+        return optimised_av_segments
 
       response = gemini_generate_with_retry(
           model=self.vision_model,
@@ -882,6 +1018,72 @@ def _finalise_split(
   return av_segments.sort_values(by='start_s').reset_index(drop=True)
 
 
+def _cut_and_annotate_av_segment_with_retry(
+    row: pd.Series,
+    video_file_path: str,
+    cuts_path: str,
+    vision_model,
+    s3_cut_path: str,
+    bucket_name: str,
+    max_retries: int = 2,
+) -> Tuple[str, str]:
+  """Wrapper that retries the entire segment cut and annotate process.
+
+  Args:
+    row: The A/V segment data as a row in a DataFrame.
+    video_file_path: Path to the input video file.
+    cuts_path: The local directory to store the A/V segment cuts.
+    vision_model: The Gemini model to generate the A/V segment descriptions.
+    s3_cut_path: The path to store the A/V segment cut in S3.
+    bucket_name: The S3 bucket name to store the A/V segment cut.
+    max_retries: Maximum number of retry attempts for the entire process.
+
+  Returns:
+    A tuple of the A/V segment description and keywords.
+  """
+  av_segment_id = row['av_segment_id']
+  last_error = None
+
+  for attempt in range(max_retries):
+    try:
+      logging.info(
+          f'SEGMENT_RETRY - Attempt {attempt + 1}/{max_retries} for segment {av_segment_id}'
+      )
+      result = _cut_and_annotate_av_segment(
+          row=row,
+          video_file_path=video_file_path,
+          cuts_path=cuts_path,
+          vision_model=vision_model,
+          s3_cut_path=s3_cut_path,
+          bucket_name=bucket_name,
+      )
+      logging.info(
+          f'SEGMENT_RETRY - Segment {av_segment_id} completed successfully'
+      )
+      return result
+    except Exception as e:
+      last_error = str(e)
+      logging.warning(
+          f'SEGMENT_RETRY - Attempt {attempt + 1} failed for segment {av_segment_id}: {last_error}'
+      )
+      logging.warning(f'SEGMENT_RETRY - Traceback: {traceback.format_exc()}')
+
+      if attempt < max_retries - 1:
+        # Wait before retry with exponential backoff
+        sleep_time = 2 * (2 ** attempt)
+        logging.info(f'SEGMENT_RETRY - Waiting {sleep_time}s before retry...')
+        time.sleep(sleep_time)
+        # Force garbage collection between retries
+        gc.collect()
+
+  logging.error(
+      f'SEGMENT_RETRY - All {max_retries} attempts failed for segment {av_segment_id}. '
+      f'Last error: {last_error}'
+  )
+  # Return empty values instead of raising to allow other segments to continue
+  return '', ''
+
+
 def _cut_and_annotate_av_segment(
     row: pd.Series,
     video_file_path: str,
@@ -972,15 +1174,21 @@ def _cut_and_annotate_av_segment(
   )
   description = ''
   keywords = ''
+  video_file = None
   try:
-    # Upload to Gemini Files API for analysis (file is local)
-    video_file = genai.upload_file(full_cut_path, mime_type='video/mp4')
-    # Wait for file to be ready
-    while video_file.state.name == 'PROCESSING':
-      time.sleep(2)
-      video_file = genai.get_file(video_file.name)
-    if video_file.state.name == 'FAILED':
-      raise ValueError(f'Video processing failed: {video_file.state.name}')
+    # Upload to Gemini Files API for analysis with retry logic
+    video_file = gemini_upload_file_with_retry(
+        file_path=full_cut_path,
+        mime_type='video/mp4',
+        max_retries=3,
+        wait_for_processing=True,
+    )
+    if video_file is None:
+      logging.warning(
+          f'ANNOTATION - Could not upload segment {av_segment_id} to Gemini, skipping annotation'
+      )
+      return description, keywords
+
     response = gemini_generate_with_retry(
         model=vision_model,
         content=[video_file, ConfigService.SEGMENT_ANNOTATIONS_PROMPT],
