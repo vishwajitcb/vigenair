@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
@@ -163,35 +164,66 @@ Notes:
 Create {num_variants} distinct variants. Output ONLY valid JSON.
 """
 
-        # Call Gemini
+        # Call Gemini with retry logic
         model = genai.GenerativeModel(ConfigService.CONFIG_TEXT_MODEL)
-        response = model.generate_content(
-            generation_prompt,
-            generation_config={
-                "max_output_tokens": 8192,
-                "temperature": 0.7,
-            },
-        )
 
-        # Parse response
-        response_text = response.text.strip()
-        logger.info(f"Gemini raw response: {response_text[:500]}")
+        max_retries = 3
+        retry_delay = 2  # seconds
+        variants = []
+        last_error = None
 
-        # Handle markdown code blocks
-        if response_text.startswith("```"):
-            lines = response_text.split("\n")
-            # Remove first line (```json) and last line (```)
-            response_text = "\n".join(lines[1:-1])
-            logger.info(f"After removing markdown: {response_text[:500]}")
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Gemini API call attempt {attempt + 1}/{max_retries}")
 
-        try:
-            result = json.loads(response_text)
-            variants = result.get("variants", [])
-            logger.info(f"Parsed {len(variants)} variants")
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse Gemini response as JSON: {e}")
-            logger.warning(f"Response text was: {response_text[:1000]}")
-            variants = []
+                response = model.generate_content(
+                    generation_prompt,
+                    generation_config={
+                        "max_output_tokens": 8192,
+                        "temperature": 0.7,
+                    },
+                )
+
+                # Parse response
+                response_text = response.text.strip()
+                logger.info(f"Gemini raw response: {response_text[:500]}")
+
+                # Handle markdown code blocks
+                if response_text.startswith("```"):
+                    lines = response_text.split("\n")
+                    # Remove first line (```json) and last line (```)
+                    response_text = "\n".join(lines[1:-1])
+                    logger.info(f"After removing markdown: {response_text[:500]}")
+
+                # Try to parse JSON
+                result = json.loads(response_text)
+                variants = result.get("variants", [])
+                logger.info(f"Parsed {len(variants)} variants")
+
+                # Check if we got enough variants (at least 1)
+                if len(variants) >= 1:
+                    break
+                else:
+                    logger.warning(f"Got 0 variants, retrying...")
+                    last_error = "No variants returned"
+
+            except json.JSONDecodeError as e:
+                last_error = f"JSON parse error: {e}"
+                logger.warning(f"Attempt {attempt + 1} failed - {last_error}")
+                logger.warning(f"Response text was: {response_text[:1000] if 'response_text' in dir() else 'N/A'}")
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Attempt {attempt + 1} failed - Gemini API error: {last_error}")
+
+            # Wait before retry (exponential backoff)
+            if attempt < max_retries - 1:
+                sleep_time = retry_delay * (2 ** attempt)
+                logger.info(f"Waiting {sleep_time}s before retry...")
+                time.sleep(sleep_time)
+
+        if not variants:
+            logger.error(f"All {max_retries} attempts failed. Last error: {last_error}")
+            # Return empty list rather than failing - let frontend handle it
 
         return GenerateVariantsResponse(variants=variants)
 

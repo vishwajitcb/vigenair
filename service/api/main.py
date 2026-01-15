@@ -24,8 +24,9 @@ from fastapi.middleware.cors import CORSMiddleware
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from api.routes import upload, status, segments, render, files
+from api.routes import upload, status, segments, render, files, jobs
 from api.models.responses import HealthResponse
+from db.mongodb import init_db, close_db
 
 # Configure logging
 logging.basicConfig(
@@ -54,6 +55,7 @@ app.add_middleware(
 )
 
 # Include routers
+app.include_router(jobs.router, prefix="/api/v1/jobs", tags=["jobs"])
 app.include_router(upload.router, prefix="/api/v1/videos", tags=["videos"])
 app.include_router(status.router, prefix="/api/v1/videos", tags=["status"])
 app.include_router(segments.router, prefix="/api/v1/videos", tags=["segments"])
@@ -100,6 +102,15 @@ async def startup_event():
 
     logger.info("All required environment variables are set")
 
+    # Initialize MongoDB
+    try:
+        await init_db()
+        logger.info("MongoDB connection established")
+    except Exception as e:
+        error_msg = f"FATAL: Failed to connect to MongoDB: {e}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+
     # Initialize Google AI and verify connectivity
     google_api_key = os.environ.get("GOOGLE_API_KEY")
     try:
@@ -137,3 +148,5 @@ async def startup_event():
 async def shutdown_event():
     """Cleanup on shutdown."""
     logger.info("ViGenAiR API shutting down...")
+    await close_db()
+    logger.info("MongoDB connection closed")

@@ -38,6 +38,10 @@ demucs==4.0.1
 numpy==1.26.4
 pandas==1.5.3
 
+# MongoDB
+motor==3.3.2
+pymongo==4.6.1
+
 # Utilities
 protobuf==3.20.2
 Werkzeug==2.3.8

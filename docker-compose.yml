@@ -37,6 +37,13 @@ services:
 
       # CORS (adjust for production)
       - CORS_ORIGINS=${CORS_ORIGINS:-*}
+
+      # MongoDB
+      - MONGODB_URI=${MONGODB_URI:-mongodb://mongodb:27017}
+      - MONGODB_DB=${MONGODB_DB:-vigenair}
+    depends_on:
+      mongodb:
+        condition: service_healthy
     volumes:
       # Temp storage for video processing
       - vigenair_temp:/tmp/vigenair
@@ -47,20 +54,34 @@ services:
         reservations:
           memory: 4G
 
-  # Frontend UI Service
+  # Frontend UI Service (New Plain HTML/JS)
   frontend:
     build:
-      context: ./ui/src
-      dockerfile: ui/Dockerfile
+      context: ./frontend
+      dockerfile: Dockerfile
     container_name: vigenair-frontend
     restart: unless-stopped
     ports:
       - "80:80"
-      - "443:443"
     depends_on:
       - backend
+
+  # MongoDB for job tracking and state persistence
+  mongodb:
+    image: mongo:7
+    container_name: vigenair-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
     environment:
-      - API_BASE_URL=${API_BASE_URL:-http://backend:8000}
+      - MONGO_INITDB_DATABASE=vigenair
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # Redis for job queue (optional, for background tasks)
   redis:
@@ -80,6 +101,8 @@ services:
 
 volumes:
   vigenair_temp:
+    driver: local
+  mongodb_data:
     driver: local
   redis_data:
     driver: local

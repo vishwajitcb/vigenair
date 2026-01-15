@@ -25,6 +25,13 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Uploa
 import storage as StorageService
 import utils as Utils
 from api.models.responses import UploadResponse, VideoInfo, VideoListResponse
+from db.job_service import (
+    create_job_sync,
+    update_job_status_sync,
+    update_job_segments_sync,
+    update_job_error_sync
+)
+from db.models import JobStatus, JobStage
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -39,9 +46,13 @@ def _process_video_background(folder: str, local_video_path: str, s3_key: str):
         s3_key: The S3 key where the video is stored.
     """
     import extractor as ExtractorService
+    import json
 
     try:
         logger.info(f"Starting extraction for folder: {folder}")
+
+        # Update job status - extracting audio
+        update_job_status_sync(folder, stage=JobStage.EXTRACTING_AUDIO, progress=10)
 
         # Create trigger file object
         trigger_file = Utils.TriggerFile(s3_key)
@@ -52,19 +63,68 @@ def _process_video_background(folder: str, local_video_path: str, s3_key: str):
             gcs_bucket_name=bucket, media_file=trigger_file
         )
 
+        # Update status - transcribing
+        update_job_status_sync(folder, stage=JobStage.TRANSCRIBING, progress=30)
+
         extractor_instance.initial_extract()
 
         logger.info(f"Initial extraction completed for: {folder}")
+
+        # Update status - analyzing video
+        update_job_status_sync(folder, stage=JobStage.ANALYZING, progress=60)
 
         # Finalise extraction - combines analysis and creates data.json
         extractor_instance.finalise_extraction()
 
         logger.info(f"Extraction fully completed for: {folder}")
 
+        # Update status - creating segments
+        update_job_status_sync(folder, stage=JobStage.CREATING_SEGMENTS, progress=80)
+
+        # Load segments from data.json and update MongoDB
+        try:
+            data_content = StorageService.download_file(f"{folder}/data.json", fetch_contents=True)
+            if data_content:
+                data = json.loads(data_content)
+                segments = data if isinstance(data, list) else data.get("segments", [])
+
+                # Convert segments to MongoDB format
+                mongo_segments = []
+                for i, seg in enumerate(segments):
+                    mongo_segments.append({
+                        "id": str(seg.get("id", i)),
+                        "startTime": seg.get("start_s", seg.get("startTime", 0)),
+                        "endTime": seg.get("end_s", seg.get("endTime", 0)),
+                        "duration": seg.get("duration_s", seg.get("duration", 0)),
+                        "description": seg.get("description", ""),
+                        "keywords": seg.get("keywords", []),
+                        "transcript": seg.get("transcript", "")
+                    })
+
+                # Get thumbnail key (first segment's thumbnail)
+                thumbnail_key = f"{folder}/av_segments_cuts/0.jpg"
+
+                # Update job with segments
+                update_job_segments_sync(folder, mongo_segments, thumbnail_key)
+
+                logger.info(f"Updated MongoDB with {len(mongo_segments)} segments for: {folder}")
+        except Exception as seg_error:
+            logger.warning(f"Failed to update segments in MongoDB: {seg_error}")
+            # Still mark as complete since S3 files exist
+            update_job_status_sync(
+                folder,
+                status=JobStatus.SEGMENTS_READY,
+                stage=JobStage.DONE,
+                progress=100
+            )
+
     except Exception as e:
         logger.exception(f"Error processing video {folder}: {e}")
 
-        # Write error file
+        # Update MongoDB with error
+        update_job_error_sync(folder, str(e))
+
+        # Write error file to S3
         error_key = f"{folder}/error.txt"
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
             f.write(str(e))
@@ -132,6 +192,18 @@ async def upload_video(
         StorageService.upload_file(tmp_path, s3_key)
 
         logger.info(f"Video uploaded to S3: {s3_key}")
+
+        # Create job in MongoDB
+        try:
+            create_job_sync(
+                folder=folder,
+                name=sanitized_name,
+                user_id=user_id,
+                input_video_key=s3_key
+            )
+            logger.info(f"Created MongoDB job: {folder}")
+        except Exception as db_error:
+            logger.warning(f"Failed to create MongoDB job (continuing anyway): {db_error}")
 
         # Start background processing
         background_tasks.add_task(

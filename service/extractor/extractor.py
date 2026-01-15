@@ -42,6 +42,61 @@ import utils as Utils
 import video as VideoService
 
 
+def gemini_generate_with_retry(
+    model,
+    content,
+    generation_config,
+    safety_settings,
+    max_retries: int = 3,
+    retry_delay: float = 2.0,
+):
+  """Call Gemini generate_content with retry logic.
+
+  Args:
+    model: The Gemini model instance.
+    content: The content to send (can be list with files and prompts).
+    generation_config: Generation config dict.
+    safety_settings: Safety settings for the model.
+    max_retries: Maximum number of retry attempts.
+    retry_delay: Base delay between retries (uses exponential backoff).
+
+  Returns:
+    The Gemini response object, or None if all retries failed.
+  """
+  last_error = None
+
+  for attempt in range(max_retries):
+    try:
+      logging.info(f'Gemini API call attempt {attempt + 1}/{max_retries}')
+      response = model.generate_content(
+          content,
+          generation_config=generation_config,
+          safety_settings=safety_settings,
+      )
+      # Check if we got a valid response
+      if (
+          response.candidates
+          and response.candidates[0].content.parts
+          and response.candidates[0].content.parts[0].text
+      ):
+        return response
+      else:
+        last_error = 'Empty or invalid response from Gemini'
+        logging.warning(f'Attempt {attempt + 1} - {last_error}')
+    except Exception as e:
+      last_error = str(e)
+      logging.warning(f'Attempt {attempt + 1} failed - Gemini API error: {last_error}')
+
+    # Wait before retry (exponential backoff)
+    if attempt < max_retries - 1:
+      sleep_time = retry_delay * (2 ** attempt)
+      logging.info(f'Waiting {sleep_time}s before retry...')
+      time.sleep(sleep_time)
+
+  logging.error(f'All {max_retries} Gemini attempts failed. Last error: {last_error}')
+  return None
+
+
 @dataclasses.dataclass(init=False)
 class AvSegmentSplitMarker:
   """Represents all information required to split a segment at a specified marker.
@@ -622,15 +677,13 @@ class Extractor:
       if video_file.state.name == 'FAILED':
         raise ValueError(f'Video processing failed: {video_file.state.name}')
 
-      response = self.vision_model.generate_content(
-          [video_file, prompt],
+      response = gemini_generate_with_retry(
+          model=self.vision_model,
+          content=[video_file, prompt],
           generation_config=ConfigService.ENHANCE_SEGMENT_ANNOTATIONS_CONFIG,
           safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
       )
-      if (
-          response.candidates and response.candidates[0].content.parts
-          and response.candidates[0].content.parts[0].text
-      ):
+      if response:
         text = response.candidates[0].content.parts[0].text
         results = list(filter(None, text.strip().split('\n\n')))
         for result in results:
@@ -644,7 +697,7 @@ class Extractor:
             break
           rows.append([entry.strip() for entry in result[0]])
       else:
-        logging.warning('ANNOTATION - Could not enhance segments!')
+        logging.warning('ANNOTATION - Could not enhance segments after retries!')
     # Execution should continue regardless of the underlying exception
     # pylint: disable=broad-exception-caught
     except Exception:
@@ -928,15 +981,13 @@ def _cut_and_annotate_av_segment(
       video_file = genai.get_file(video_file.name)
     if video_file.state.name == 'FAILED':
       raise ValueError(f'Video processing failed: {video_file.state.name}')
-    response = vision_model.generate_content(
-        [video_file, ConfigService.SEGMENT_ANNOTATIONS_PROMPT],
+    response = gemini_generate_with_retry(
+        model=vision_model,
+        content=[video_file, ConfigService.SEGMENT_ANNOTATIONS_PROMPT],
         generation_config=ConfigService.SEGMENT_ANNOTATIONS_CONFIG,
         safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
     )
-    if (
-        response.candidates and response.candidates[0].content.parts
-        and response.candidates[0].content.parts[0].text
-    ):
+    if response:
       text = response.candidates[0].content.parts[0].text
       logging.info(
           'ANNOTATION - Annotating segment %s: %s', av_segment_id, text
@@ -971,7 +1022,7 @@ def _cut_and_annotate_av_segment(
           )
     else:
       logging.warning(
-          'ANNOTATION - Could not annotate segment %s!', av_segment_id
+          'ANNOTATION - Could not annotate segment %s after retries!', av_segment_id
       )
   # Execution should continue regardless of the underlying exception
   # pylint: disable=broad-exception-caught
