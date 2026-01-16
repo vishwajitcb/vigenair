@@ -156,25 +156,63 @@ For each variant, output in this JSON format (no comments allowed):
   ]
 }}
 
-Notes:
+CRITICAL RULES:
 - "segments" should contain 1-indexed segment numbers
+- "estimated_duration" MUST be the actual SUM of the selected segment durations - ADD THEM UP!
+- The total duration of selected segments MUST be close to the target duration (~{target_duration:.1f}s)
+- Do NOT select segments that would make the total exceed {target_duration * 1.5:.1f} seconds
 - "score" should be a quality score from 1-100 based on narrative coherence
 - Keep title and description very short to avoid truncation
 
 Create {num_variants} distinct variants. Output ONLY valid JSON.
 """
 
+        # Helper function to calculate actual duration of a variant
+        def calculate_variant_duration(variant_segments: list) -> float:
+            """Calculate actual total duration from segment indices."""
+            total = 0.0
+            for seg_num in variant_segments:
+                # segment numbers are 1-indexed
+                seg_idx = seg_num - 1
+                if 0 <= seg_idx < len(segments):
+                    total += segments[seg_idx].get("duration_s", 0)
+            return total
+
+        # Helper function to validate and filter variants
+        def validate_variants(variants_list: list, max_duration: float) -> list:
+            """Filter variants that exceed the maximum allowed duration."""
+            valid = []
+            for v in variants_list:
+                seg_ids = v.get("segments", [])
+                actual_duration = calculate_variant_duration(seg_ids)
+                # Update the estimated_duration with actual calculated value
+                v["actual_duration"] = actual_duration
+                v["estimated_duration"] = actual_duration  # Correct the estimate
+
+                if actual_duration <= max_duration:
+                    valid.append(v)
+                    logger.info(
+                        f"VARIANT_VALID: '{v.get('title')}' - segments {seg_ids} = {actual_duration:.1f}s (<= {max_duration:.1f}s)"
+                    )
+                else:
+                    logger.warning(
+                        f"VARIANT_REJECTED: '{v.get('title')}' - segments {seg_ids} = {actual_duration:.1f}s (exceeds {max_duration:.1f}s)"
+                    )
+            return valid
+
         # Call Gemini with retry logic
         model = genai.GenerativeModel(ConfigService.CONFIG_TEXT_MODEL)
 
         max_retries = 3
         retry_delay = 2  # seconds
-        variants = []
+        validated_variants = []
         last_error = None
+        # Allow 50% overage for flexibility, but not more
+        max_allowed_duration = target_duration * 1.5
 
         for attempt in range(max_retries):
             try:
-                logger.info(f"Gemini API call attempt {attempt + 1}/{max_retries}")
+                logger.info(f"Gemini API call attempt {attempt + 1}/{max_retries} (target: {target_duration:.1f}s, max: {max_allowed_duration:.1f}s)")
 
                 response = model.generate_content(
                     generation_prompt,
@@ -197,15 +235,19 @@ Create {num_variants} distinct variants. Output ONLY valid JSON.
 
                 # Try to parse JSON
                 result = json.loads(response_text)
-                variants = result.get("variants", [])
-                logger.info(f"Parsed {len(variants)} variants")
+                raw_variants = result.get("variants", [])
+                logger.info(f"Parsed {len(raw_variants)} variants from Gemini")
 
-                # Check if we got enough variants (at least 1)
-                if len(variants) >= 1:
+                # Validate variants against duration constraint
+                validated_variants = validate_variants(raw_variants, max_allowed_duration)
+                logger.info(f"After validation: {len(validated_variants)} valid variants (of {len(raw_variants)})")
+
+                # Check if we got enough valid variants (at least 1)
+                if len(validated_variants) >= 1:
                     break
                 else:
-                    logger.warning(f"Got 0 variants, retrying...")
-                    last_error = "No variants returned"
+                    last_error = f"All {len(raw_variants)} variants exceeded max duration ({max_allowed_duration:.1f}s)"
+                    logger.warning(f"{last_error}, retrying...")
 
             except json.JSONDecodeError as e:
                 last_error = f"JSON parse error: {e}"
@@ -221,11 +263,11 @@ Create {num_variants} distinct variants. Output ONLY valid JSON.
                 logger.info(f"Waiting {sleep_time}s before retry...")
                 time.sleep(sleep_time)
 
-        if not variants:
-            logger.error(f"All {max_retries} attempts failed. Last error: {last_error}")
+        if not validated_variants:
+            logger.error(f"All {max_retries} attempts failed to produce valid variants. Last error: {last_error}")
             # Return empty list rather than failing - let frontend handle it
 
-        return GenerateVariantsResponse(variants=variants)
+        return GenerateVariantsResponse(variants=validated_variants)
 
     except HTTPException:
         raise

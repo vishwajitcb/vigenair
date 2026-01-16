@@ -698,8 +698,8 @@ class Extractor:
     screenshot_paths = [None] * size
 
     # Limit concurrency to prevent memory exhaustion and API rate limiting
-    # Using max_workers=3 to reduce load on Gemini API and memory usage
-    max_workers = min(3, size)
+    # Using max_workers=2 to reduce load on Gemini API and avoid gRPC thread-safety issues
+    max_workers = min(2, size)
     logging.info(
         f'SEGMENTS - Processing {size} segments with {max_workers} workers'
     )

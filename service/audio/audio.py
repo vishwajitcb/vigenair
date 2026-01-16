@@ -287,6 +287,15 @@ def transcribe_audio(
   )
 
   try:
+    # Get audio duration to determine expected minimum segments
+    audio_duration = Utils.get_media_duration(audio_file_path)
+    # Expect at least 1 segment per 15 seconds for audio > 30s
+    min_expected_segments = max(1, int(audio_duration / 15)) if audio_duration > 30 else 1
+    logging.info(
+        'TRANSCRIPTION - Audio duration: %.1fs, expecting at least %d segments',
+        audio_duration, min_expected_segments
+    )
+
     # Upload audio file to Gemini Files API
     audio_file = genai.upload_file(audio_file_path, mime_type='audio/wav')
     # Wait for file to be ready
@@ -296,74 +305,106 @@ def transcribe_audio(
     if audio_file.state.name == 'FAILED':
       raise ValueError(f'Audio processing failed: {audio_file.state.name}')
 
-    # Use structured output with JSON schema
-    response = transcription_model.generate_content(
-        [audio_file, ConfigService.TRANSCRIBE_AUDIO_PROMPT_JSON],
-        generation_config={
-            'response_mime_type': 'application/json',
-            'response_schema': TranscriptionResponse,
-            'temperature': 0.2,
-        },
-        safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
-    )
+    # Retry logic for insufficient segmentation
+    max_retries = 3
+    segments = []
+    video_language = ConfigService.DEFAULT_VIDEO_LANGUAGE
+    language_probability = 0.0
 
-    if response.candidates and response.candidates[0].content.parts:
-      text = response.candidates[0].content.parts[0].text
-      logging.info('TRANSCRIPTION - Raw JSON: %s', text[:1000])
+    for attempt in range(max_retries):
+      logging.info('TRANSCRIPTION - Attempt %d/%d', attempt + 1, max_retries)
 
-      data = json.loads(text)
-      video_language = data.get('language', ConfigService.DEFAULT_VIDEO_LANGUAGE)
-      language_probability = float(data.get('confidence', 0.0))
-      segments = data.get('segments', [])
-
-      if segments:
-        # Build dataframe from segments
-        # Handle missing 'end' timestamps by using next segment's start or estimating
-        rows = []
-        for i, seg in enumerate(segments):
-          start_s = Utils.timestring_to_seconds(seg['start'])
-          # Use 'end' if provided, otherwise use next segment's start or add 3 seconds
-          if 'end' in seg:
-            end_s = Utils.timestring_to_seconds(seg['end'])
-          elif i + 1 < len(segments):
-            end_s = Utils.timestring_to_seconds(segments[i + 1]['start'])
-          else:
-            # Last segment - estimate based on text length (avg 3 chars/sec)
-            end_s = start_s + max(3.0, len(seg.get('text', '')) / 10.0)
-          rows.append({
-              'audio_segment_id': i + 1,
-              'start_s': start_s,
-              'end_s': end_s,
-              'transcript': seg['text'],
-          })
-        transcription_dataframe = pd.DataFrame(rows)
-        transcription_dataframe['duration_s'] = (
-            transcription_dataframe['end_s'] - transcription_dataframe['start_s']
-        )
-
-        # Generate VTT content
-        subtitles_content = 'WEBVTT\n\n'
-        for i, seg in enumerate(segments):
-          start_time = seg['start']
-          if 'end' in seg:
-            end_time = seg['end']
-          elif i + 1 < len(segments):
-            end_time = segments[i + 1]['start']
-          else:
-            # Estimate end for last segment
-            start_s = Utils.timestring_to_seconds(seg['start'])
-            end_s = start_s + max(3.0, len(seg.get('text', '')) / 10.0)
-            mins, secs = divmod(end_s, 60)
-            end_time = f"{int(mins):02d}:{secs:06.3f}"
-          subtitles_content += f"{start_time} --> {end_time}\n{seg['text']}\n\n"
-
-        logging.info('TRANSCRIPTION - Parsed %d segments', len(segments))
-      else:
-        logging.warning('TRANSCRIPTION - No segments in response')
-    else:
-      logging.warning(
-          'Could not transcribe audio! Returning empty transcription...'
+      # Use structured output with JSON schema
+      response = transcription_model.generate_content(
+          [audio_file, ConfigService.TRANSCRIBE_AUDIO_PROMPT_JSON],
+          generation_config={
+              'response_mime_type': 'application/json',
+              'response_schema': TranscriptionResponse,
+              'temperature': 0.1,  # Lower temperature for more consistent output
+              'max_output_tokens': 8192,  # Ensure full response
+          },
+          safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
       )
+
+      if response.candidates and response.candidates[0].content.parts:
+        text = response.candidates[0].content.parts[0].text
+        logging.info('TRANSCRIPTION - Raw JSON (attempt %d): %s', attempt + 1, text[:1500])
+
+        data = json.loads(text)
+        video_language = data.get('language', ConfigService.DEFAULT_VIDEO_LANGUAGE)
+        language_probability = float(data.get('confidence', 0.0))
+        segments = data.get('segments', [])
+
+        # Check if we got enough segments
+        if len(segments) >= min_expected_segments:
+          logging.info(
+              'TRANSCRIPTION - Got %d segments (>= %d expected), accepting result',
+              len(segments), min_expected_segments
+          )
+          break
+        else:
+          logging.warning(
+              'TRANSCRIPTION - Only got %d segments (expected >= %d), retrying...',
+              len(segments), min_expected_segments
+          )
+          if attempt < max_retries - 1:
+            time.sleep(2)  # Brief delay before retry
+      else:
+        logging.warning('TRANSCRIPTION - No content in response, retrying...')
+        if attempt < max_retries - 1:
+          time.sleep(2)
+
+    # Log final result
+    if len(segments) < min_expected_segments:
+      logging.warning(
+          'TRANSCRIPTION - After %d attempts, only got %d segments (expected %d). Proceeding anyway.',
+          max_retries, len(segments), min_expected_segments
+      )
+
+    if segments:
+      # Build dataframe from segments
+      # Handle missing 'end' timestamps by using next segment's start or estimating
+      rows = []
+      for i, seg in enumerate(segments):
+        start_s = Utils.timestring_to_seconds(seg['start'])
+        # Use 'end' if provided, otherwise use next segment's start or add 3 seconds
+        if 'end' in seg:
+          end_s = Utils.timestring_to_seconds(seg['end'])
+        elif i + 1 < len(segments):
+          end_s = Utils.timestring_to_seconds(segments[i + 1]['start'])
+        else:
+          # Last segment - estimate based on text length (avg 3 chars/sec)
+          end_s = start_s + max(3.0, len(seg.get('text', '')) / 10.0)
+        rows.append({
+            'audio_segment_id': i + 1,
+            'start_s': start_s,
+            'end_s': end_s,
+            'transcript': seg['text'],
+        })
+      transcription_dataframe = pd.DataFrame(rows)
+      transcription_dataframe['duration_s'] = (
+          transcription_dataframe['end_s'] - transcription_dataframe['start_s']
+      )
+
+      # Generate VTT content
+      subtitles_content = 'WEBVTT\n\n'
+      for i, seg in enumerate(segments):
+        start_time = seg['start']
+        if 'end' in seg:
+          end_time = seg['end']
+        elif i + 1 < len(segments):
+          end_time = segments[i + 1]['start']
+        else:
+          # Estimate end for last segment
+          start_s = Utils.timestring_to_seconds(seg['start'])
+          end_s = start_s + max(3.0, len(seg.get('text', '')) / 10.0)
+          mins, secs = divmod(end_s, 60)
+          end_time = f"{int(mins):02d}:{secs:06.3f}"
+        subtitles_content += f"{start_time} --> {end_time}\n{seg['text']}\n\n"
+
+      logging.info('TRANSCRIPTION - Parsed %d segments', len(segments))
+    else:
+      logging.warning('TRANSCRIPTION - No segments in response')
   # Execution should continue regardless of the underlying exception
   # pylint: disable=broad-exception-caught
   except Exception:

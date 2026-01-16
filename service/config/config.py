@@ -201,7 +201,7 @@ TRANSCRIBE_AUDIO_CONFIG = {
 TRANSCRIBE_AUDIO_PATTERN = r'Language:\s*(.+?)\n.*?Confidence:\s*(.+?)\n.*?```csv\s*\n(.*?)```.*?```vtt\s*\n(.*?)```'
 
 # JSON-based transcription prompt for structured output
-TRANSCRIBE_AUDIO_PROMPT_JSON = """Transcribe the provided audio file accurately.
+TRANSCRIBE_AUDIO_PROMPT_JSON = """Transcribe the provided audio file with detailed segmentation.
 
 Return a JSON object with:
 - "language": The detected language (e.g., "English", "Telugu", "Hindi")
@@ -211,12 +211,31 @@ Return a JSON object with:
   - "end": End timestamp in format "MM:SS.mmm"
   - "text": The transcribed text for this segment
 
-Important:
-- Each segment should be a complete sentence or meaningful phrase
-- Detect pauses - if there's silence between utterances, reflect it in timestamps
-- Timestamps must not overlap
-- All timestamps must be within the audio duration
-- Different speakers should be in separate segments
+CRITICAL SEGMENTATION RULES:
+1. NEVER return just one segment for the entire audio - you MUST create multiple segments
+2. Each segment should be 5-15 seconds maximum, break longer speech into multiple segments
+3. Create a NEW segment for each of these:
+   - Speaker change (different person speaking)
+   - Pause or silence longer than 0.5 seconds
+   - Change in tone, emotion, or speaking style
+   - Natural sentence boundaries
+   - Scene or context change in the dialogue
+4. For a 2-minute audio, expect at least 8-15 segments minimum
+5. Timestamps must not overlap and must be sequential
+6. All timestamps must be within the audio duration
+7. Include BOTH start AND end timestamps for every segment
+
+Example output structure for a 60-second audio:
+{
+  "language": "Telugu",
+  "confidence": 0.95,
+  "segments": [
+    {"start": "00:00.000", "end": "00:08.500", "text": "First sentence..."},
+    {"start": "00:08.500", "end": "00:15.200", "text": "Second sentence..."},
+    {"start": "00:16.000", "end": "00:23.800", "text": "After a pause..."},
+    ...more segments...
+  ]
+}
 """
 
 ENHANCE_SEGMENT_ANNOTATIONS_CONFIG = {
@@ -303,6 +322,6 @@ Return ONLY valid JSON, no other text.
 """
 
 VIDEO_ANALYSIS_CONFIG = {
-    'max_output_tokens': 32768,  # Increased for longer videos with many shots
+    'max_output_tokens': 1000000,  # 1 million tokens to avoid truncation
     'temperature': 0.1,
 }

@@ -23,7 +23,11 @@ boto3==1.34.25
 botocore==1.34.25
 
 # Google AI Studio (replaces Vertex AI)
-google-generativeai==0.8.3
+google-generativeai>=0.8.4
+
+# gRPC - pin versions together to avoid native code crashes
+grpcio>=1.60.0,<2.0.0
+grpcio-status>=1.60.0,<2.0.0
 
 # Audio/Video Processing
 ffmpeg==1.4
@@ -43,5 +47,5 @@ motor==3.3.2
 pymongo==4.6.1
 
 # Utilities
-protobuf==3.20.2
+protobuf>=4.21.0,<5.0.0
 Werkzeug==2.3.8

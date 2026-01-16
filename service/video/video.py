@@ -623,6 +623,75 @@ def analyse_video(
     return result
 
 
+def _repair_truncated_json(text: str) -> Optional[Dict[str, Any]]:
+    """Attempts to repair truncated JSON by extracting complete shot objects.
+
+    When Gemini response is truncated due to token limits, this function
+    extracts all complete shot objects that were successfully returned.
+
+    Args:
+        text: The truncated JSON text.
+
+    Returns:
+        A dictionary with extracted data, or None if repair fails.
+    """
+    # Extract complete shot objects using regex
+    shot_pattern = r'\{\s*"start_seconds"\s*:\s*([\d.]+)\s*,\s*"end_seconds"\s*:\s*([\d.]+)\s*\}'
+    shot_matches = re.findall(shot_pattern, text)
+
+    if not shot_matches:
+        logging.warning('VIDEO_ANALYSIS - No complete shots found in truncated response')
+        return None
+
+    shots = []
+    for start, end in shot_matches:
+        try:
+            shots.append({
+                'start_seconds': float(start),
+                'end_seconds': float(end)
+            })
+        except ValueError:
+            continue
+
+    if not shots:
+        return None
+
+    logging.info('VIDEO_ANALYSIS - Recovered %d complete shots from truncated response', len(shots))
+
+    # Try to extract other complete objects (labels, objects, text, logos)
+    # These are less critical, so we just return empty lists if extraction fails
+    data = {
+        'shots': shots,
+        'labels': [],
+        'objects': [],
+        'text': [],
+        'logos': []
+    }
+
+    # Try to extract complete label objects
+    label_pattern = r'\{\s*"description"\s*:\s*"([^"]+)"\s*,\s*"segments"\s*:\s*\[(.*?)\]\s*,\s*"confidence"\s*:\s*([\d.]+)\s*\}'
+    label_matches = re.findall(label_pattern, text, re.DOTALL)
+    for desc, segments_str, conf in label_matches:
+        try:
+            # Parse segments within the label
+            seg_pattern = r'\{\s*"start"\s*:\s*(\d+)\s*,\s*"end"\s*:\s*(\d+)\s*\}'
+            seg_matches = re.findall(seg_pattern, segments_str)
+            segments = [{'start': int(s), 'end': int(e)} for s, e in seg_matches]
+            if segments:
+                data['labels'].append({
+                    'description': desc,
+                    'segments': segments,
+                    'confidence': float(conf)
+                })
+        except (ValueError, IndexError):
+            continue
+
+    if data['labels']:
+        logging.info('VIDEO_ANALYSIS - Recovered %d labels from truncated response', len(data['labels']))
+
+    return data
+
+
 def _parse_gemini_response(response_text: str, input_uri: str) -> VideoAnnotationResults:
     """Parses Gemini response into VideoAnnotationResults."""
     result = VideoAnnotationResults()
@@ -648,21 +717,31 @@ def _parse_gemini_response(response_text: str, input_uri: str) -> VideoAnnotatio
     try:
         data = json.loads(text)
         logging.info('VIDEO_ANALYSIS - Successfully parsed JSON response')
-        logging.info('VIDEO_ANALYSIS - JSON keys: %s', list(data.keys()))
-        logging.info('VIDEO_ANALYSIS - Shots in response: %d', len(data.get('shots', [])))
-        logging.info('VIDEO_ANALYSIS - Labels in response: %d', len(data.get('labels', [])))
-        logging.info('VIDEO_ANALYSIS - Objects in response: %d', len(data.get('objects', [])))
     except json.JSONDecodeError as e:
-        logging.error('VIDEO_ANALYSIS - Failed to parse Gemini response as JSON: %s', e)
-        logging.error('VIDEO_ANALYSIS - Raw response text (first 1000 chars): %s',
-                     response_text[:1000] if len(response_text) > 1000 else response_text)
-        logging.error('VIDEO_ANALYSIS - FALLBACK: Creating single default shot (0-30s)')
-        # Return empty results with minimal shot data
-        result.shot_annotations.append(ShotAnnotation(
-            start_time_offset=TimeOffset(seconds=0),
-            end_time_offset=TimeOffset(seconds=30)  # Default 30 second video
-        ))
-        return result
+        logging.warning('VIDEO_ANALYSIS - Initial JSON parse failed: %s', e)
+        logging.info('VIDEO_ANALYSIS - Attempting to repair truncated JSON...')
+
+        # Try to repair truncated JSON by extracting complete shots
+        data = _repair_truncated_json(text)
+
+        if data is None:
+            logging.error('VIDEO_ANALYSIS - JSON repair failed')
+            logging.error('VIDEO_ANALYSIS - Raw response text (first 1000 chars): %s',
+                         response_text[:1000] if len(response_text) > 1000 else response_text)
+            logging.error('VIDEO_ANALYSIS - FALLBACK: Creating single default shot (0-30s)')
+            # Return empty results with minimal shot data
+            result.shot_annotations.append(ShotAnnotation(
+                start_time_offset=TimeOffset(seconds=0),
+                end_time_offset=TimeOffset(seconds=30)  # Default 30 second video
+            ))
+            return result
+
+        logging.info('VIDEO_ANALYSIS - Successfully repaired truncated JSON')
+
+    logging.info('VIDEO_ANALYSIS - JSON keys: %s', list(data.keys()))
+    logging.info('VIDEO_ANALYSIS - Shots in response: %d', len(data.get('shots', [])))
+    logging.info('VIDEO_ANALYSIS - Labels in response: %d', len(data.get('labels', [])))
+    logging.info('VIDEO_ANALYSIS - Objects in response: %d', len(data.get('objects', [])))
 
     # Parse shots
     for shot in data.get('shots', []):
