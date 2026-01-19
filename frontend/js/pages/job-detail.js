@@ -84,7 +84,16 @@ async function loadJob() {
         $('#statusBadge').innerHTML = createStatusBadge(job.status);
 
         if (job.status === 'error') {
-            showError(job.error || 'An error occurred');
+            // Check if we have segments - if yes, this is a render error (can retry)
+            // If no, this is an extraction error (need to re-upload)
+            if (job.segments && job.segments.length > 0) {
+                // Render error - show main content with error notification
+                showMainContent();
+                showToast(job.error || 'Render failed. Please adjust settings and try again.', 'error');
+            } else {
+                // Extraction error - show error page (can't retry)
+                showError(job.error || 'An error occurred during video processing');
+            }
         } else if (job.status === 'processing' || job.status === 'rendering') {
             // Show progress UI for both processing and rendering
             showProcessing();
@@ -127,6 +136,7 @@ function showMainContent() {
 
     renderVideoPlayer();
     renderSegments();
+    configureAudioModeOptions();
 
     if (job.variants && job.variants.length > 0) {
         selectedVariantIndex = job.selectedVariantIndex || 0;
@@ -139,6 +149,64 @@ function showMainContent() {
         renderRenderedVideos();
         $('#rendersSection').classList.remove('hidden');
     }
+}
+
+/**
+ * Configure audio mode options based on whether audio tracks were separated
+ */
+function configureAudioModeOptions() {
+    const audioModeSelect = $('#audioMode');
+    const hasAudioSeparation = checkAudioSeparationAvailable();
+
+    if (!hasAudioSeparation) {
+        // Remove music overlay option if audio wasn't separated
+        const musicOption = Array.from(audioModeSelect.options).find(opt => opt.value === 'music');
+        if (musicOption) {
+            musicOption.disabled = true;
+            musicOption.textContent += ' (Requires voice-over analysis)';
+        }
+
+        // If music was selected, switch to continuous audio
+        if (audioModeSelect.value === 'music') {
+            audioModeSelect.value = 'continuous';
+            showToast('Audio mode changed to Continuous Audio (music overlay not available for this video)', 'info');
+        }
+    }
+
+    // If there was a render error related to audio, show a warning
+    if (job.status === 'error' && job.error && job.error.includes('Invalid file index')) {
+        const warningDiv = document.createElement('div');
+        warningDiv.className = 'mt-2 p-3 bg-yellow-50 border border-yellow-200 rounded-lg text-sm text-yellow-800';
+        warningDiv.innerHTML = `
+            <div class="flex items-start gap-2">
+                <svg class="w-5 h-5 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+                    <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
+                </svg>
+                <div>
+                    <strong>Previous render failed:</strong> Music overlay requires voice-over analysis. Please select "Continuous Audio" or "Segment Audio" instead.
+                </div>
+            </div>
+        `;
+        audioModeSelect.parentElement.appendChild(warningDiv);
+    }
+}
+
+/**
+ * Check if audio separation is available for this video
+ * Videos uploaded with --w flag won't have separated audio tracks
+ */
+function checkAudioSeparationAvailable() {
+    // Check if the folder name contains --w-- flag
+    if (folder && folder.includes('--w--')) {
+        return false;
+    }
+
+    // Could also check if job has metadata indicating separation
+    if (job && job.metadata && job.metadata.audioSeparated === false) {
+        return false;
+    }
+
+    return true; // Assume available by default
 }
 
 function renderVideoPlayer() {
@@ -357,6 +425,14 @@ async function handleStartRender() {
         const variant = job.variants[selectedVariantIndex];
         if (!variant) {
             showToast('Please select a variant first', 'warning');
+            return;
+        }
+
+        // Validate audio mode selection
+        if (audioMode === 'music' && !checkAudioSeparationAvailable()) {
+            showToast('Music overlay requires voice-over analysis. Please select a different audio mode.', 'warning');
+            // Auto-switch to continuous audio
+            $('#audioMode').value = 'continuous';
             return;
         }
 

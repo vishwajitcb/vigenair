@@ -804,6 +804,17 @@ def _render_video_variant(
       video_duration,
   )
 
+  # Log audio track availability for debugging
+  logging.info(
+      'RENDERING - Audio configuration: has_audio=%s, speech_track=%s, '
+      'music_track=%s, use_music_overlay=%s, use_continuous_audio=%s',
+      has_audio,
+      'available' if speech_track_path else 'None',
+      'available' if music_track_path else 'None',
+      video_variant.render_settings.use_music_overlay,
+      video_variant.render_settings.use_continuous_audio,
+  )
+
   ffmpeg_cmds = _get_variant_ffmpeg_commands(
       video_file_path=video_file_path,
       speech_track_path=speech_track_path,
@@ -1054,8 +1065,17 @@ def _get_variant_ffmpeg_commands(
   if has_audio:
     if continuous_audio:
       ffmpeg_filter = [continuous_audio_select_filter]
-    elif music_overlay:
+    elif music_overlay and speech_track_path and music_track_path:
+      # Only use music overlay if separated audio tracks exist
       ffmpeg_filter = [music_overlay_select_filter, '-ac', '2']
+    elif music_overlay:
+      # Fallback: music overlay requested but no separated tracks available
+      # Use continuous audio instead (all audio from original video)
+      logging.warning(
+          'RENDERING - Music overlay requested but audio tracks not separated. '
+          'Falling back to continuous audio mode.'
+      )
+      ffmpeg_filter = [continuous_audio_select_filter]
   ffmpeg_cmds.extend([
       '-filter_complex',
   ] + ffmpeg_filter + [
