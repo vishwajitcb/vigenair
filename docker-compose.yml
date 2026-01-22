@@ -65,7 +65,7 @@ services:
     container_name: vigenair-frontend
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "8080:80"
     depends_on:
       - backend
 
