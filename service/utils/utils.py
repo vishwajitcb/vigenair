@@ -287,15 +287,45 @@ def timestring_to_seconds(timestring: str) -> float:
     raise ValueError(f'Invalid timestring format: {timestring}')
 
 
-def rename_chunks(result: Sequence[str], file_suffix: str):
-  """Renames the output chunks."""
+def rename_chunks(result: Sequence[str], file_suffix: str) -> list[str]:
+  """Renames the output chunks and returns the new paths.
+
+  Args:
+    result: List of original file paths.
+    file_suffix: The suffix to use in the new filename (e.g., '_vvv', '_aaa').
+
+  Returns:
+    List of new file paths after renaming.
+  """
+  new_paths = []
   for output_file_path in result:
     file_name, file_ext = os.path.splitext(output_file_path)
     file_name = file_name.replace(file_suffix, '')
-    os.rename(
-        output_file_path,
-        f'{file_name}-{len(result)}{file_suffix}{file_ext}',
-    )
+    new_path = f'{file_name}-{len(result)}{file_suffix}{file_ext}'
+    os.rename(output_file_path, new_path)
+    new_paths.append(new_path)
+  return new_paths
+
+
+def get_video_codec(input_file_path: str) -> str:
+  """Retrieves the video codec of the input file."""
+  output = execute_subprocess_commands(
+      cmds=[
+          'ffprobe',
+          '-i',
+          input_file_path,
+          '-select_streams',
+          'v:0',
+          '-show_entries',
+          'stream=codec_name',
+          '-v',
+          'quiet',
+          '-of',
+          'default=noprint_wrappers=1:nokey=1',
+      ],
+      description=f'get video codec of [{input_file_path}] with ffprobe',
+  )
+  return output.strip()
 
 
 def get_media_duration(input_file_path: str) -> float:

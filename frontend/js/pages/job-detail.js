@@ -139,6 +139,16 @@ function showMainContent() {
     configureAudioModeOptions();
 
     if (job.variants && job.variants.length > 0) {
+        // Normalize scores for existing variants (fix old data with scores > 5)
+        job.variants = job.variants.map(v => {
+            let normalizedScore = v.score || 3;
+            if (normalizedScore > 5) {
+                normalizedScore = Math.min(5, Math.max(0, (normalizedScore / 100) * 5));
+                normalizedScore = Math.round(normalizedScore * 10) / 10;
+            }
+            return { ...v, score: normalizedScore };
+        });
+
         selectedVariantIndex = job.selectedVariantIndex || 0;
         renderVariants();
         $('#variantsSection').classList.remove('hidden');
@@ -229,14 +239,16 @@ function renderSegments() {
         <div class="segment-thumb flex-shrink-0 cursor-pointer group" data-id="${seg.id}">
             <div class="w-24 h-16 rounded-lg overflow-hidden bg-gray-200 relative">
                 ${seg.thumbnailUrl
-                    ? `<img src="${seg.thumbnailUrl}" class="w-full h-full object-cover" alt="Segment ${idx}">`
-                    : `<div class="w-full h-full bg-gradient-to-br from-primary/20 to-secondary/20"></div>`
+                    ? `<img src="${seg.thumbnailUrl}" class="w-full h-full object-cover" alt="Segment ${idx + 1}">`
+                    : `<div class="w-full h-full bg-gradient-to-br from-primary/20 to-secondary/20 flex items-center justify-center">
+                        <span class="text-gray-400 text-xs font-medium">${idx + 1}</span>
+                    </div>`
                 }
                 <div class="absolute bottom-0 left-0 right-0 bg-black/60 text-white text-xs px-1 py-0.5">
-                    ${formatDuration(seg.duration)}
+                    ${formatDuration(seg.duration || 0)}
                 </div>
             </div>
-            <p class="text-xs text-gray-500 mt-1 truncate w-24" title="${seg.description || ''}">
+            <p class="text-xs text-gray-500 mt-1 truncate w-24" title="${seg.description || `Segment ${idx + 1}`}">
                 ${seg.description || `Segment ${idx + 1}`}
             </p>
         </div>
@@ -285,16 +297,25 @@ async function handleGenerateVariants() {
         }
 
         // Convert to our variant format
-        const variants = (response.variants || []).map((v, idx) => ({
-            id: idx,
-            title: v.title || `Variant ${idx + 1}`,
-            description: v.description || '',
-            score: v.score || 3,
-            reasoning: v.reasoning || '',
-            segments: (v.scenes || v.segments || []).map(s => String(s)),
-            duration: v.estimated_duration || targetDuration,
-            userModified: false,
-        }));
+        const variants = (response.variants || []).map((v, idx) => {
+            // Normalize score to 0-5 range (handle scores out of 100)
+            let normalizedScore = v.score || 3;
+            if (normalizedScore > 5) {
+                normalizedScore = Math.min(5, Math.max(0, (normalizedScore / 100) * 5));
+            }
+            normalizedScore = Math.round(normalizedScore * 10) / 10; // Round to 1 decimal
+
+            return {
+                id: idx,
+                title: v.title || `Variant ${idx + 1}`,
+                description: v.description || '',
+                score: normalizedScore,
+                reasoning: v.reasoning || '',
+                segments: (v.scenes || v.segments || []).map(s => String(s)),
+                duration: v.estimated_duration || targetDuration,
+                userModified: false,
+            };
+        });
 
         // Save to MongoDB
         await api.updateJobVariants(folder, variants, 0, {

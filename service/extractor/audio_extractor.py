@@ -78,13 +78,26 @@ def _process_video_with_audio(
       bucket_name=gcs_bucket_name,
       target_dir=media_file.gcs_folder,
   )
+
+  # Process all audio chunks immediately (not just single-chunk audio)
   if size == 1:
+    logging.info('EXTRACTOR - analyzing single audio chunk...')
     extract_audio(
         Utils.TriggerFile(
             f"{'.'.join(media_file.full_gcs_path.split('.')[:-1])}.wav"
         ),
         gcs_bucket_name,
     )
+  else:
+    # Process each chunk
+    logging.info('EXTRACTOR - analyzing %d audio chunks...', size)
+    for i, chunk_path in enumerate(audio_chunks, start=1):
+      chunk_basename = os.path.basename(chunk_path)
+      chunk_file = Utils.TriggerFile(
+          f"{media_file.gcs_folder}/{ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR}/{chunk_basename}"
+      )
+      logging.info('EXTRACTOR - analyzing audio chunk %d/%d: %s', i, size, chunk_basename)
+      extract_audio(chunk_file, gcs_bucket_name)
 
 
 def _process_video_without_audio(
@@ -310,7 +323,7 @@ def _get_audio_chunks(
     result.append(audio_file_path)
 
   if file_count:
-    Utils.rename_chunks(
+    result = Utils.rename_chunks(
         result,
         ConfigService.INPUT_EXTRACTION_AUDIO_FILENAME_SUFFIX,
     )

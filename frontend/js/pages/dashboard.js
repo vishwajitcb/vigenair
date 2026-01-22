@@ -154,19 +154,26 @@ function renderJobs() {
 function createJobCard(job) {
     const thumbnailBg = job.thumbnailUrl
         ? `background-image: url('${job.thumbnailUrl}')`
-        : 'background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)';
+        : '';
+
+    // Check if voice-over analysis was skipped (--w-- flag in folder name)
+    const voiceOverSkipped = job.folder && job.folder.includes('--w--');
+    const indicatorColor = voiceOverSkipped ? 'bg-red-500' : 'bg-green-500';
+    const indicatorTitle = voiceOverSkipped ? 'Voice-over analysis skipped' : 'Voice-over analysis enabled';
 
     return `
         <div class="job-card bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden cursor-pointer hover:shadow-md transition-shadow"
              data-folder="${job.folder}">
             <div class="aspect-video bg-cover bg-center relative" style="${thumbnailBg}">
                 ${!job.thumbnailUrl ? `
-                    <div class="absolute inset-0 flex items-center justify-center">
-                        <svg class="w-12 h-12 text-white/50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+                    <div class="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500">
+                        <svg class="w-16 h-16 text-white/90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
                         </svg>
+                        <div class="absolute inset-0 bg-black/5"></div>
                     </div>
                 ` : ''}
+                <div class="absolute top-2 right-2 w-2 h-2 rounded-full ${indicatorColor}" title="${indicatorTitle}"></div>
             </div>
             <div class="p-4">
                 <h3 class="font-medium text-gray-900 truncate mb-1">${job.name}</h3>
@@ -174,7 +181,6 @@ function createJobCard(job) {
                     ${createStatusBadge(job.status)}
                     <span class="text-xs text-gray-400">${formatRelativeTime(job.createdAt)}</span>
                 </div>
-                ${job.error ? `<p class="text-xs text-red-500 mt-2 truncate">${job.error}</p>` : ''}
                 <div class="flex items-center justify-between mt-3 pt-3 border-t border-gray-100">
                     <div class="flex items-center gap-2 text-xs text-gray-500">
                         ${job.variantCount > 0 ? `<span>${job.variantCount} variants</span>` : ''}

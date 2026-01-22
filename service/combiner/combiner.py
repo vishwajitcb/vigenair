@@ -759,6 +759,109 @@ def _get_blanking_fill_filter(
     return filter_str
 
 
+def _render_video_variant_hevc_4k(
+    output_dir: str,
+    gcs_folder_path: str,
+    gcs_bucket_name: str,
+    video_file_path: str,
+    crop_video_file_paths: Dict,
+    has_audio: bool,
+    video_variant,
+    vision_model,
+    video_language: str,
+    shot_timestamps: list,
+) -> Dict[str, Any]:
+  """Renders a 4K HEVC video variant using segment extraction method.
+
+  For 4K HEVC videos, the complex filter approach causes ffmpeg to hang.
+  Instead, we extract each segment to a file, then concatenate them.
+  This preserves the original 4K quality without re-encoding.
+  """
+  import tempfile
+
+  logging.info('RENDERING - Using 4K HEVC segment extraction method (copy codec)')
+
+  # Create temp directory for segments
+  segments_dir = tempfile.mkdtemp(prefix='hevc_segments_')
+  segment_files = []
+
+  try:
+    # Extract each segment using codec copy (no re-encoding)
+    for idx, (start_time, end_time) in enumerate(shot_timestamps):
+      duration = end_time - start_time
+      segment_path = os.path.join(segments_dir, f'segment_{idx}.mp4')
+
+      logging.info(f'RENDERING - Extracting segment {idx}: {start_time:.2f}s to {end_time:.2f}s (duration: {duration:.2f}s)')
+
+      # Use -codec copy to preserve quality and avoid re-encoding
+      Utils.execute_subprocess_commands(
+          cmds=[
+              'ffmpeg',
+              '-ss', str(start_time),
+              '-i', video_file_path,
+              '-t', str(duration),
+              '-c', 'copy',
+              '-avoid_negative_ts', 'make_zero',
+              segment_path,
+          ],
+          description=f'extract segment {idx} from 4K HEVC video',
+      )
+      segment_files.append(segment_path)
+
+    # Create concat demuxer file
+    concat_file_path = os.path.join(segments_dir, 'concat_list.txt')
+    with open(concat_file_path, 'w') as f:
+      for seg_file in segment_files:
+        f.write(f"file '{seg_file}'\n")
+
+    # Concatenate segments using copy codec
+    _, video_ext = os.path.splitext(video_file_path)
+    combo_name = f'combo_{video_variant.variant_id}_v{video_ext}'
+    output_path = os.path.join(output_dir, combo_name)
+
+    logging.info('RENDERING - Concatenating 4K HEVC segments with copy codec')
+    Utils.execute_subprocess_commands(
+        cmds=[
+            'ffmpeg',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', concat_file_path,
+            '-c', 'copy',
+            output_path,
+        ],
+        description=f'concatenate 4K HEVC segments for variant {video_variant.variant_id}',
+    )
+
+    # Upload result to GCS
+    StorageService.upload_gcs_dir(
+        source_directory=output_dir,
+        bucket_name=gcs_bucket_name,
+        target_dir=gcs_folder_path,
+    )
+
+    # Build result in the same format as the regular render function
+    combo_url = (
+        f'{ConfigService.GCS_BASE_URL}/{gcs_bucket_name}/'
+        f'{parse.quote(gcs_folder_path)}/{combo_name}'
+    )
+
+    result = {
+        'original_format': '9:16',
+        'variants': {
+            '9:16': combo_url,
+        },
+    }
+
+    logging.info(f'RENDERING - 4K HEVC variant {video_variant.variant_id} completed successfully')
+    return result
+
+  finally:
+    # Cleanup temp files
+    import shutil
+    if os.path.exists(segments_dir):
+      shutil.rmtree(segments_dir)
+
+
 def _render_video_variant(
     output_dir: str,
     gcs_folder_path: str,
@@ -829,11 +932,30 @@ def _render_video_variant(
 
   # Get input video dimensions to determine original format BEFORE rendering
   input_width, input_height = _get_video_dimensions(video_file_path)
-  input_aspect_ratio = input_width / input_height
+  input_aspect_ratio = input_width / input_height if input_height > 0 else 16 / 9
   logging.info(
       'RENDERING - Input video dimensions: %dx%d (aspect ratio: %.3f)',
       input_width, input_height, input_aspect_ratio
   )
+
+  # Check if this is a high-resolution HEVC video that needs special handling
+  is_hevc_4k = (input_width * input_height) >= (2160 * 3840 * 0.9)  # ~4K or higher
+  video_codec = Utils.get_video_codec(video_file_path)
+  if is_hevc_4k and 'hevc' in video_codec.lower():
+    logging.info('RENDERING - Detected 4K HEVC video, using segment extraction method')
+    # Use two-pass approach for 4K HEVC: extract segments then concatenate
+    return _render_video_variant_hevc_4k(
+        output_dir=output_dir,
+        gcs_folder_path=gcs_folder_path,
+        gcs_bucket_name=gcs_bucket_name,
+        video_file_path=video_file_path,
+        crop_video_file_paths=crop_video_file_paths,
+        has_audio=has_audio,
+        video_variant=video_variant,
+        vision_model=vision_model,
+        video_language=video_language,
+        shot_timestamps=shot_timestamps,
+    )
 
   # Determine which format matches the original video
   original_format = None
@@ -1088,6 +1210,17 @@ def _get_variant_ffmpeg_commands(
         '[outa]',
     ])
 
+  # Add H.264 encoding parameters to support 4K video
+  # Use level 5.2 which supports up to 4096x2304@60fps
+  ffmpeg_cmds.extend([
+      '-c:v', 'libx264',
+      '-profile:v', 'high',
+      '-level:v', '5.2',
+      '-preset', 'fast',
+      '-crf', '23',
+      '-movflags', '+faststart',
+  ])
+
   return ffmpeg_cmds
 
 
@@ -1168,13 +1301,22 @@ def _render_format(
     )
     target_w, target_h = map(int, video_format.aspect_ratio_str.split(':'))
     input_width, input_height = _get_video_dimensions(input_video_path)
+
+    # Handle case where video dimensions couldn't be probed
+    if input_height == 0 or input_width == 0:
+        logging.warning(
+            'RENDER_FORMAT - %s: Could not get video dimensions, skipping crop',
+            format_type_str
+        )
+        return input_video_path
+
     crop_width = int(input_height * target_w / target_h)
     crop_height = input_height
 
     # Ensure crop dimensions don't exceed input dimensions
     if crop_width > input_width:
         crop_width = input_width
-        crop_height = int(input_width * target_h / target_w)
+        crop_height = int(input_width * target_h / target_w) if target_w > 0 else input_height
 
     crop_filter = (
         f'crop={crop_width}:{crop_height}:'

@@ -69,7 +69,24 @@ def combine_analysis_chunks(
   max_audio_segment_id = 0
   max_end_s = 0
 
-  for df in analysis_chunks:
+  for idx, df in enumerate(analysis_chunks):
+    # Check if dataframe is empty or missing required columns
+    if df.empty:
+      logging.warning(
+          'AUDIO - Skipping empty analysis chunk dataframe at index %d '
+          '(transcription may have failed for this chunk)',
+          idx
+      )
+      continue
+
+    if 'audio_segment_id' not in df.columns:
+      logging.error(
+          'AUDIO - Analysis chunk dataframe at index %d is missing '
+          'audio_segment_id column. Columns: %s',
+          idx, list(df.columns)
+      )
+      continue
+
     df['audio_segment_id'] += max_audio_segment_id
     df['start_s'] += max_end_s
     df['end_s'] += max_end_s
@@ -127,12 +144,20 @@ def combine_subtitle_files(
         else:
           combined_content += line
 
-      _, end = lines[-3].strip().split(' --> ')
-      last_timestamp += datetime.timedelta(
-          minutes=int(end[:2]),
-          seconds=int(end[3:5]),
-          milliseconds=int(end[6:]),
-      )
+      # Find the last timestamp line by searching backwards through the file
+      last_end_time = None
+      for line in reversed(lines):
+        if '-->' in line:
+          _, end = line.strip().split(' --> ')
+          last_end_time = end
+          break
+
+      if last_end_time:
+        last_timestamp += datetime.timedelta(
+            minutes=int(last_end_time[:2]),
+            seconds=int(last_end_time[3:5]),
+            milliseconds=int(last_end_time[6:]),
+        )
 
   with open(subtitles_output_path, 'w', encoding='utf-8') as f:
     f.write(combined_content)
@@ -321,7 +346,7 @@ def transcribe_audio(
               'response_mime_type': 'application/json',
               'response_schema': TranscriptionResponse,
               'temperature': 0.1,  # Lower temperature for more consistent output
-              'max_output_tokens': 8192,  # Ensure full response
+              'max_output_tokens': 65536,  # Max tokens for gemini-3-flash
           },
           safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
       )

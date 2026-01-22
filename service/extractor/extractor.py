@@ -342,24 +342,44 @@ class Extractor:
         os.rename(temp_mp4_path, input_video_file_path)
         logging.info('EXTRACTOR - Restored converted mp4 for processing')
 
-    # Run audio and video processing sequentially
-    # (ProcessPoolExecutor removed - fork-unsafe with boto3 and added complexity
-    # for only ~1-2 min time savings)
-    logging.info('EXTRACTOR - Starting audio processing...')
-    AudioExtractor.process_audio(
-        output_dir=tmp_dir,
-        input_audio_file_path=input_audio_file_path,
-        gcs_bucket_name=self.gcs_bucket_name,
-        media_file=self.media_file,
-    )
-    logging.info('EXTRACTOR - Audio processing complete. Starting video processing...')
-    VideoExtractor.process_video(
-        output_dir=tmp_dir,
-        input_video_file_path=input_video_file_path,
-        media_file=self.media_file,
-        gcs_bucket_name=self.gcs_bucket_name,
-    )
-    logging.info('EXTRACTOR - Video processing complete.')
+    # Run audio and video processing in parallel using ThreadPoolExecutor
+    # This is safe with boto3 (threads share memory, no fork issues)
+    # Provides ~2-4 min time savings depending on video length
+    logging.info('EXTRACTOR - Starting parallel audio and video processing...')
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        # Submit both tasks to run simultaneously
+        audio_future = executor.submit(
+            AudioExtractor.process_audio,
+            output_dir=tmp_dir,
+            input_audio_file_path=input_audio_file_path,
+            gcs_bucket_name=self.gcs_bucket_name,
+            media_file=self.media_file,
+        )
+        video_future = executor.submit(
+            VideoExtractor.process_video,
+            output_dir=tmp_dir,
+            input_video_file_path=input_video_file_path,
+            media_file=self.media_file,
+            gcs_bucket_name=self.gcs_bucket_name,
+        )
+
+        # Wait for both to complete and handle errors
+        try:
+            audio_future.result()  # No timeout - wait as long as needed
+            logging.info('EXTRACTOR - Audio processing complete.')
+        except Exception as e:
+            logging.error('EXTRACTOR - Audio processing failed: %s', str(e))
+            raise
+
+        try:
+            video_future.result()  # No timeout - wait as long as needed
+            logging.info('EXTRACTOR - Video processing complete.')
+        except Exception as e:
+            logging.error('EXTRACTOR - Video processing failed: %s', str(e))
+            raise
+
+    logging.info('EXTRACTOR - Parallel processing complete.')
 
   def extract_audio(self):
     """Extracts audio information from the input video."""
@@ -531,6 +551,17 @@ class Extractor:
         )
     ]
     size = len(annotation_results)
+
+    # Handle case where video analysis produced no results
+    if size == 0:
+      logging.error(
+          'EXTRACTOR - No video analysis results found. Video processing may have failed.'
+      )
+      raise ValueError(
+          'Video analysis failed: no analysis files found in storage. '
+          'Check video format, API quotas, and previous error logs.'
+      )
+
     result = annotation_results[0]
     if len(annotation_results) > 1:
       logging.info(

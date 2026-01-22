@@ -322,6 +322,6 @@ Return ONLY valid JSON, no other text.
 """
 
 VIDEO_ANALYSIS_CONFIG = {
-    'max_output_tokens': 1000000,  # 1 million tokens to avoid truncation
+    'max_output_tokens': 65536,  # Max output for gemini-3-flash (64K)
     'temperature': 0.1,
 }

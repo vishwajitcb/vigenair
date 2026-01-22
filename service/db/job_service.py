@@ -91,9 +91,15 @@ async def update_job_status_async(
     db = await get_database()
 
     update_data: Dict[str, Any] = {"updatedAt": datetime.utcnow()}
+    unset_data: Dict[str, Any] = {}
 
     if status is not None:
         update_data["status"] = status.value if hasattr(status, "value") else status
+        # Clear error field when transitioning to non-error status
+        # (e.g., when extraction completes after a render error)
+        status_val = status.value if hasattr(status, "value") else status
+        if status_val != JobStatus.ERROR.value:
+            unset_data["error"] = ""
     if stage is not None:
         update_data["stage"] = stage.value if hasattr(stage, "value") else stage
     if error is not None:
@@ -101,9 +107,14 @@ async def update_job_status_async(
     if progress is not None:
         update_data["progress"] = progress
 
+    # Build update operation
+    update_operation = {"$set": update_data}
+    if unset_data:
+        update_operation["$unset"] = unset_data
+
     await db.jobs.update_one(
         {"folder": folder},
-        {"$set": update_data}
+        update_operation
     )
 
     logger.info(f"Updated job status: {folder} -> {status or stage}")

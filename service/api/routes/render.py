@@ -216,11 +216,16 @@ def _render_variants_background(folder: str, render_data: dict):
                 combos_content = StorageService.download_file(combos_key, fetch_contents=True)
                 if combos_content:
                     combos_data = json.loads(combos_content.decode("utf-8"))
+                    logger.info(f"Processing combos for variant {variant_id}: found {len(combos_data)} combos")
 
                     # Extract video URLs for each variant in combos
                     for combo_key, combo_info in combos_data.items():
                         if isinstance(combo_info, dict) and "variants" in combo_info:
+                            # Create unique render ID using timestamp and variant_id
+                            render_id = f"{variant_id}_{int(datetime.utcnow().timestamp() * 1000)}"
+
                             render_entry = {
+                                "id": render_id,
                                 "variantId": combo_info.get("variant_id", variant_id),
                                 "title": combo_info.get("title", f"Variant {variant_id}"),
                                 "description": combo_info.get("description", ""),
@@ -243,6 +248,7 @@ def _render_variants_background(folder: str, render_data: dict):
                                 render_entry["formats"][fmt] = {"key": key}
 
                             renders.append(render_entry)
+                            logger.info(f"Added render entry with ID {render_id} for variant {variant_id}")
             except Exception as e:
                 logger.warning(f"Could not read combos for variant {variant_id}: {e}")
 
@@ -253,9 +259,24 @@ def _render_variants_background(folder: str, render_data: dict):
 
             async def save_renders():
                 db = await get_database()
+
+                # Get existing renders
+                job_doc = await db.jobs.find_one({"folder": folder})
+                existing_renders = job_doc.get("renders", []) if job_doc else []
+
+                logger.info(f"Found {len(existing_renders)} existing renders in database")
+                logger.info(f"Adding {len(renders)} new renders")
+
+                # Simply append new renders to existing ones
+                # Each render has a unique ID with timestamp, so no duplicates
+                all_renders = existing_renders + renders
+
+                logger.info(f"Total renders after merge: {len(all_renders)}")
+
+                # Update with combined list
                 await db.jobs.update_one(
                     {"folder": folder},
-                    {"$set": {"renders": renders}}
+                    {"$set": {"renders": all_renders}}
                 )
 
             # Run async update from sync context
@@ -264,8 +285,9 @@ def _render_variants_background(folder: str, render_data: dict):
             if main_loop:
                 future = asyncio.run_coroutine_threadsafe(save_renders(), main_loop)
                 future.result(timeout=10)
-
-            logger.info(f"Saved {len(renders)} render results to MongoDB")
+                logger.info(f"Saved {len(renders)} render results to MongoDB (preserving existing renders)")
+            else:
+                logger.error("Could not save renders: main event loop not available")
 
         # Mark as complete (100%)
         update_job_status_sync(

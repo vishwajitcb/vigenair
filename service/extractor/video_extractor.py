@@ -42,13 +42,32 @@ def process_video(
   )
   size = len(video_chunks)
   logging.info('EXTRACTOR - processing video with %d chunks...', size)
-  StorageService.upload_gcs_dir(
-      source_directory=output_dir,
-      bucket_name=gcs_bucket_name,
-      target_dir=media_file.gcs_folder,
-  )
+
+  # Only upload video chunk files, not the entire directory
+  # to avoid race conditions with audio processing
+  for chunk_path in video_chunks:
+    chunk_basename = os.path.basename(chunk_path)
+    StorageService.upload_gcs_file(
+        file_path=chunk_path,
+        bucket_name=gcs_bucket_name,
+        destination_file_name=f"{media_file.gcs_folder}/{ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR}/{chunk_basename}",
+    )
+
+  # Process all video chunks immediately (not just single-chunk videos)
   if size == 1:
+    logging.info('EXTRACTOR - analyzing single video chunk...')
     extract_video(media_file, gcs_bucket_name)
+  else:
+    # Process each chunk
+    logging.info('EXTRACTOR - analyzing %d video chunks...', size)
+    for i, chunk_path in enumerate(video_chunks, start=1):
+      # Chunks are renamed with pattern: {num}-{total}_vvv.mp4
+      chunk_basename = os.path.basename(chunk_path)
+      chunk_file = Utils.TriggerFile(
+          f"{media_file.gcs_folder}/{ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR}/{chunk_basename}"
+      )
+      logging.info('EXTRACTOR - analyzing video chunk %d/%d: %s', i, size, chunk_basename)
+      extract_video(chunk_file, gcs_bucket_name)
 
 
 def extract_video(
@@ -182,7 +201,7 @@ def _get_video_chunks(
     result.append(video_file_path)
 
   if file_count:
-    Utils.rename_chunks(
+    result = Utils.rename_chunks(
         result, ConfigService.INPUT_EXTRACTION_VIDEO_FILENAME_SUFFIX
     )
 
