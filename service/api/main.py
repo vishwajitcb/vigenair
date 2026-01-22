@@ -45,7 +45,7 @@ class PollEndpointFilter(logging.Filter):
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from api.routes import upload, status, segments, render, files, jobs
+from api.routes import upload, status, segments, render, files, jobs, auth
 from api.models.responses import HealthResponse
 from db.mongodb import init_db, close_db
 
@@ -76,6 +76,7 @@ app.add_middleware(
 )
 
 # Include routers
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(jobs.router, prefix="/api/v1/jobs", tags=["jobs"])
 app.include_router(upload.router, prefix="/api/v1/videos", tags=["videos"])
 app.include_router(status.router, prefix="/api/v1/videos", tags=["status"])

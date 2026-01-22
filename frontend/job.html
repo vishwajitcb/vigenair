@@ -33,6 +33,9 @@
                 <div class="h-6 w-px bg-gray-300"></div>
                 <h1 id="jobName" class="text-xl font-semibold text-gray-900">Loading...</h1>
                 <div id="statusBadge" class="ml-auto"></div>
+                <button id="logoutBtn" class="text-gray-600 hover:text-gray-900 px-3 py-2 rounded-lg font-medium transition-colors">
+                    Logout
+                </button>
             </div>
         </div>
     </header>
@@ -210,6 +213,15 @@
     <!-- Toast Container -->
     <div id="toastContainer" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2"></div>
 
+    <script type="module">
+        import { checkAuth, logout } from './js/auth.js';
+
+        // Check auth on page load
+        checkAuth();
+
+        // Add logout handler
+        document.getElementById('logoutBtn').addEventListener('click', logout);
+    </script>
     <script type="module" src="js/pages/job-detail.js"></script>
 </body>
 </html>

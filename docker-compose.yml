@@ -38,6 +38,9 @@ services:
       # CORS (adjust for production)
       - CORS_ORIGINS=${CORS_ORIGINS:-*}
 
+      # Authentication
+      - AUTH_CREDENTIAL=${AUTH_CREDENTIAL}
+
       # MongoDB
       - MONGODB_URI=${MONGODB_URI:-mongodb://mongodb:27017}
       - MONGODB_DB=${MONGODB_DB:-vigenair}
