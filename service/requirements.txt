@@ -46,6 +46,9 @@ pandas==1.5.3
 motor==3.3.2
 pymongo==4.6.1
 
+# Redis (for shared token storage across workers)
+redis==5.0.1
+
 # Utilities
 protobuf>=4.21.0,<5.0.0
 Werkzeug==2.3.8

@@ -9,14 +9,22 @@ from typing import Dict
 
 from fastapi import APIRouter, HTTPException, Depends, Header
 from pydantic import BaseModel
+import redis
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# In-memory token storage (simple approach)
-active_tokens: Dict[str, datetime] = {}
+# Redis connection for shared token storage across workers
+redis_client = redis.Redis(
+    host=os.environ.get("REDIS_HOST", "redis"),
+    port=int(os.environ.get("REDIS_PORT", "6379")),
+    db=0,
+    decode_responses=True
+)
+
 TOKEN_EXPIRY_HOURS = 24
+TOKEN_EXPIRY_SECONDS = TOKEN_EXPIRY_HOURS * 3600
 
 
 class LoginRequest(BaseModel):
@@ -62,12 +70,19 @@ def verify_credentials(username: str, password: str) -> bool:
         return False
 
 
-def cleanup_expired_tokens():
-    """Remove expired tokens from storage."""
-    now = datetime.now()
-    expired = [token for token, expiry in active_tokens.items() if expiry < now]
-    for token in expired:
-        del active_tokens[token]
+def store_token(token: str, expiry_seconds: int = TOKEN_EXPIRY_SECONDS):
+    """Store token in Redis with expiration."""
+    redis_client.setex(f"auth_token:{token}", expiry_seconds, "1")
+
+
+def verify_token_exists(token: str) -> bool:
+    """Check if token exists in Redis."""
+    return redis_client.exists(f"auth_token:{token}") > 0
+
+
+def delete_token(token: str):
+    """Delete token from Redis."""
+    redis_client.delete(f"auth_token:{token}")
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -77,15 +92,12 @@ async def login(request: LoginRequest):
 
     Validates credentials and returns a token if successful.
     """
-    cleanup_expired_tokens()
-
     if not verify_credentials(request.username, request.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Generate token
+    # Generate token and store in Redis
     token = secrets.token_urlsafe(32)
-    expiry = datetime.now() + timedelta(hours=TOKEN_EXPIRY_HOURS)
-    active_tokens[token] = expiry
+    store_token(token, TOKEN_EXPIRY_SECONDS)
 
     logger.info(f"User '{request.username}' logged in successfully")
 
@@ -101,8 +113,8 @@ async def logout(authorization: str = Header(None)):
     """
     if authorization and authorization.startswith("Bearer "):
         token = authorization.split(" ")[1]
-        if token in active_tokens:
-            del active_tokens[token]
+        if verify_token_exists(token):
+            delete_token(token)
             logger.info("User logged out successfully")
             return {"message": "Logged out successfully"}
 
@@ -120,17 +132,19 @@ async def verify_token(authorization: str = Header(None)):
         # No auth configured, always valid
         return {"valid": True}
 
-    cleanup_expired_tokens()
-
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="No authorization token provided")
 
     token = authorization.split(" ")[1]
 
-    if token not in active_tokens:
+    if not verify_token_exists(token):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    return {"valid": True, "expires_at": active_tokens[token].isoformat()}
+    # Get TTL from Redis
+    ttl = redis_client.ttl(f"auth_token:{token}")
+    expires_at = datetime.now() + timedelta(seconds=ttl) if ttl > 0 else datetime.now()
+
+    return {"valid": True, "expires_at": expires_at.isoformat()}
 
 
 def verify_auth(authorization: str = Header(None)):
@@ -143,14 +157,12 @@ def verify_auth(authorization: str = Header(None)):
         # No auth configured, allow all
         return True
 
-    cleanup_expired_tokens()
-
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="No authorization token provided")
 
     token = authorization.split(" ")[1]
 
-    if token not in active_tokens:
+    if not verify_token_exists(token):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
     return True

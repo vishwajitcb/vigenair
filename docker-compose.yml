@@ -44,8 +44,14 @@ services:
       # MongoDB
       - MONGODB_URI=${MONGODB_URI:-mongodb://mongodb:27017}
       - MONGODB_DB=${MONGODB_DB:-vigenair}
+
+      # Redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     depends_on:
       mongodb:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     volumes:
       # Temp storage for video processing
