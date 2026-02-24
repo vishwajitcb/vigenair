@@ -55,6 +55,9 @@ CONFIG_MAX_AUDIO_CHUNK_SIZE = float(
         '300'  # seconds
     )
 )
+CONFIG_MAX_CONCURRENCY = int(
+    os.environ.get('CONFIG_MAX_CONCURRENCY', '5')
+)
 CONFIG_DEFAULT_FADE_OUT_DURATION = os.environ.get(
     'CONFIG_DEFAULT_FADE_OUT_DURATION',
     '1'  # seconds

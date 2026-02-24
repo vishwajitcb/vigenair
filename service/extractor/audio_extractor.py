@@ -89,15 +89,21 @@ def _process_video_with_audio(
         gcs_bucket_name,
     )
   else:
-    # Process each chunk
+    # Process chunks in parallel (I/O-heavy: S3 download, API call, S3 upload)
     logging.info('EXTRACTOR - analyzing %d audio chunks...', size)
-    for i, chunk_path in enumerate(audio_chunks, start=1):
-      chunk_basename = os.path.basename(chunk_path)
-      chunk_file = Utils.TriggerFile(
-          f"{media_file.gcs_folder}/{ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR}/{chunk_basename}"
-      )
-      logging.info('EXTRACTOR - analyzing audio chunk %d/%d: %s', i, size, chunk_basename)
-      extract_audio(chunk_file, gcs_bucket_name)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=ConfigService.CONFIG_MAX_CONCURRENCY) as executor:
+      futures = {}
+      for i, chunk_path in enumerate(audio_chunks, start=1):
+        chunk_basename = os.path.basename(chunk_path)
+        chunk_file = Utils.TriggerFile(
+            f"{media_file.gcs_folder}/{ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR}/{chunk_basename}"
+        )
+        logging.info('EXTRACTOR - submitting audio chunk %d/%d: %s', i, size, chunk_basename)
+        futures[executor.submit(extract_audio, chunk_file, gcs_bucket_name)] = i
+      for future in concurrent.futures.as_completed(futures):
+        idx = futures[future]
+        future.result()  # propagate exceptions
+        logging.info('EXTRACTOR - finished audio chunk %d/%d', idx, size)
 
 
 def _process_video_without_audio(

@@ -378,6 +378,103 @@ def get_presigned_url(key: str, expiration: int = 3600) -> str:
     return url
 
 
+def create_multipart_upload(key: str, content_type: str = 'video/mp4') -> str:
+    """Initiates a multipart upload to S3.
+
+    Args:
+        key: The S3 object key.
+        content_type: The MIME type of the file.
+
+    Returns:
+        The upload ID string.
+    """
+    s3_client = _get_s3_client()
+    bucket = _get_bucket()
+
+    response = s3_client.create_multipart_upload(
+        Bucket=bucket,
+        Key=key,
+        ContentType=content_type,
+    )
+    upload_id = response['UploadId']
+    logging.info('MULTIPART - Initiated upload for "%s", upload_id="%s".', key, upload_id)
+    return upload_id
+
+
+def generate_presigned_upload_url(
+    key: str, upload_id: str, part_number: int, expiration: int = 3600
+) -> str:
+    """Generates a presigned URL for uploading a single part.
+
+    Args:
+        key: The S3 object key.
+        upload_id: The multipart upload ID.
+        part_number: The part number (1-indexed).
+        expiration: URL expiration time in seconds (default 1 hour).
+
+    Returns:
+        The presigned PUT URL string.
+    """
+    s3_client = _get_s3_client()
+    bucket = _get_bucket()
+
+    url = s3_client.generate_presigned_url(
+        'upload_part',
+        Params={
+            'Bucket': bucket,
+            'Key': key,
+            'UploadId': upload_id,
+            'PartNumber': part_number,
+        },
+        ExpiresIn=expiration,
+    )
+    return url
+
+
+def complete_multipart_upload(
+    key: str, upload_id: str, parts: list
+) -> dict:
+    """Completes a multipart upload by assembling all parts.
+
+    Args:
+        key: The S3 object key.
+        upload_id: The multipart upload ID.
+        parts: List of dicts with 'ETag' and 'PartNumber' keys.
+
+    Returns:
+        The S3 CompleteMultipartUpload response.
+    """
+    s3_client = _get_s3_client()
+    bucket = _get_bucket()
+
+    response = s3_client.complete_multipart_upload(
+        Bucket=bucket,
+        Key=key,
+        UploadId=upload_id,
+        MultipartUpload={'Parts': parts},
+    )
+    logging.info('MULTIPART - Completed upload for "%s", upload_id="%s".', key, upload_id)
+    return response
+
+
+def abort_multipart_upload(key: str, upload_id: str) -> None:
+    """Aborts a multipart upload and cleans up uploaded parts.
+
+    Args:
+        key: The S3 object key.
+        upload_id: The multipart upload ID.
+    """
+    s3_client = _get_s3_client()
+    bucket = _get_bucket()
+
+    s3_client.abort_multipart_upload(
+        Bucket=bucket,
+        Key=key,
+        UploadId=upload_id,
+    )
+    logging.info('MULTIPART - Aborted upload for "%s", upload_id="%s".', key, upload_id)
+
+
 # Backward compatibility aliases for existing code
 download_gcs_file = download_file
 upload_gcs_file = upload_file

@@ -18,9 +18,11 @@ This module provides functionality to extract all available video information
 from an input video file.
 """
 
+import concurrent.futures
 import logging
 import os
 import pathlib
+import time
 from typing import Sequence
 
 import config as ConfigService
@@ -58,16 +60,21 @@ def process_video(
     logging.info('EXTRACTOR - analyzing single video chunk...')
     extract_video(media_file, gcs_bucket_name)
   else:
-    # Process each chunk
+    # Process chunks in parallel (I/O-heavy: S3 download, API call, S3 upload)
     logging.info('EXTRACTOR - analyzing %d video chunks...', size)
-    for i, chunk_path in enumerate(video_chunks, start=1):
-      # Chunks are renamed with pattern: {num}-{total}_vvv.mp4
-      chunk_basename = os.path.basename(chunk_path)
-      chunk_file = Utils.TriggerFile(
-          f"{media_file.gcs_folder}/{ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR}/{chunk_basename}"
-      )
-      logging.info('EXTRACTOR - analyzing video chunk %d/%d: %s', i, size, chunk_basename)
-      extract_video(chunk_file, gcs_bucket_name)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=ConfigService.CONFIG_MAX_CONCURRENCY) as executor:
+      futures = {}
+      for i, chunk_path in enumerate(video_chunks, start=1):
+        chunk_basename = os.path.basename(chunk_path)
+        chunk_file = Utils.TriggerFile(
+            f"{media_file.gcs_folder}/{ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR}/{chunk_basename}"
+        )
+        logging.info('EXTRACTOR - submitting video chunk %d/%d: %s', i, size, chunk_basename)
+        futures[executor.submit(extract_video, chunk_file, gcs_bucket_name)] = i
+      for future in concurrent.futures.as_completed(futures):
+        idx = futures[future]
+        future.result()  # propagate exceptions
+        logging.info('EXTRACTOR - finished video chunk %d/%d', idx, size)
 
 
 def extract_video(
@@ -81,15 +88,34 @@ def extract_video(
   is_chunk = (
       ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR in media_file.full_gcs_path
   )
-  VideoService.analyse_video(
-      video_file_path=media_file.full_gcs_path,
-      bucket_name=gcs_bucket_name,
-      gcs_folder=media_file.gcs_folder,
-      output_file_name=(
-          f'{media_file.file_name}_analysis.json'
-          if is_chunk else ConfigService.OUTPUT_ANALYSIS_FILE
-      ),
-  )
+  max_retries = 3
+  for attempt in range(1, max_retries + 1):
+    try:
+      VideoService.analyse_video(
+          video_file_path=media_file.full_gcs_path,
+          bucket_name=gcs_bucket_name,
+          gcs_folder=media_file.gcs_folder,
+          output_file_name=(
+              f'{media_file.file_name}_analysis.json'
+              if is_chunk else ConfigService.OUTPUT_ANALYSIS_FILE
+          ),
+      )
+      break
+    except Exception as e:
+      if attempt < max_retries:
+        wait = 30 * attempt
+        logging.warning(
+            'VIDEO_ANALYSIS - chunk#%s attempt %d/%d failed: %s. '
+            'Retrying in %ds...',
+            video_id, attempt, max_retries, e, wait,
+        )
+        time.sleep(wait)
+      else:
+        logging.error(
+            'VIDEO_ANALYSIS - chunk#%s failed after %d attempts: %s',
+            video_id, max_retries, e,
+        )
+        raise
   logging.info(
       'THREADING - analyse_video finished for chunk#%s!',
       video_id,

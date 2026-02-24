@@ -106,6 +106,27 @@ class ApiClient {
         return await response.json();
     }
 
+    async initiateMultipartUpload(filename, fileSize, contentType, analyzeAudio, userId = 'anonymous') {
+        return this.request('/videos/upload/initiate', {
+            method: 'POST',
+            body: JSON.stringify({ filename, fileSize, contentType, analyzeAudio, userId }),
+        });
+    }
+
+    async completeMultipartUpload(uploadId, folder, s3Key, parts) {
+        return this.request('/videos/upload/complete', {
+            method: 'POST',
+            body: JSON.stringify({ uploadId, folder, s3Key, parts }),
+        });
+    }
+
+    async abortMultipartUpload(uploadId, folder, s3Key) {
+        return this.request('/videos/upload/abort', {
+            method: 'POST',
+            body: JSON.stringify({ uploadId, folder, s3Key }),
+        });
+    }
+
     async getVideoStatus(folder) {
         return this.request(`/videos/${encodeURIComponent(folder)}/status`);
     }

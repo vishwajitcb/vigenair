@@ -15,6 +15,7 @@
 """Video upload endpoint."""
 
 import logging
+import math
 import os
 import tempfile
 from datetime import datetime
@@ -24,7 +25,16 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Uploa
 
 import storage as StorageService
 import utils as Utils
-from api.models.responses import UploadResponse, VideoInfo, VideoListResponse
+from api.models.responses import (
+    MultipartAbortRequest,
+    MultipartCompleteRequest,
+    MultipartCompleteResponse,
+    MultipartInitiateRequest,
+    MultipartInitiateResponse,
+    UploadResponse,
+    VideoInfo,
+    VideoListResponse,
+)
 from db.job_service import (
     create_job_sync,
     update_job_status_sync,
@@ -32,9 +42,12 @@ from db.job_service import (
     update_job_error_sync
 )
 from db.models import JobStatus, JobStage
+from db.mongodb import get_database
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+DEFAULT_PART_SIZE = 100 * 1024 * 1024  # 100 MB
 
 
 def _process_video_background(folder: str, local_video_path: str, s3_key: str):
@@ -138,8 +151,164 @@ def _process_video_background(folder: str, local_video_path: str, s3_key: str):
 
     finally:
         # Cleanup local video file
-        if os.path.exists(local_video_path):
+        if local_video_path and os.path.exists(local_video_path):
             os.unlink(local_video_path)
+
+
+@router.post("/upload/initiate", response_model=MultipartInitiateResponse)
+async def initiate_multipart_upload(request: MultipartInitiateRequest):
+    """Initiate a multipart upload and return presigned URLs for each part.
+
+    Args:
+        request: MultipartInitiateRequest with filename, fileSize, contentType, etc.
+
+    Returns:
+        MultipartInitiateResponse with uploadId, presigned URLs, and metadata.
+    """
+    # Validate file extension
+    file_ext = os.path.splitext(request.filename)[1].lower()
+    if not file_ext or not Utils.VideoExtension.has_value(file_ext[1:]):
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported video format: {file_ext}"
+        )
+
+    # Generate folder name (same logic as existing upload)
+    timestamp = int(datetime.now().timestamp() * 1000)
+    encoded_user_id = request.userId.replace("@", "_at_").replace(".", "_dot_")
+    transcription_service = "w" if request.analyzeAudio else "n"
+
+    sanitized_name = Utils.sanitise_filename(os.path.splitext(request.filename)[0])
+    folder = f"{sanitized_name}--{transcription_service}--{timestamp}--{encoded_user_id}"
+
+    s3_key = f"{folder}/input{file_ext}"
+
+    # Calculate parts
+    part_size = DEFAULT_PART_SIZE
+    total_parts = math.ceil(request.fileSize / part_size)
+    if total_parts > 10000:
+        part_size = math.ceil(request.fileSize / 10000)
+        total_parts = math.ceil(request.fileSize / part_size)
+
+    try:
+        # Initiate multipart upload in S3
+        upload_id = StorageService.create_multipart_upload(s3_key, request.contentType)
+
+        # Generate presigned URLs for each part (1-indexed)
+        presigned_urls = []
+        for part_number in range(1, total_parts + 1):
+            url = StorageService.generate_presigned_upload_url(
+                s3_key, upload_id, part_number
+            )
+            presigned_urls.append(url)
+
+        # Create MongoDB job
+        try:
+            create_job_sync(
+                folder=folder,
+                name=sanitized_name,
+                user_id=request.userId,
+                input_video_key=s3_key,
+            )
+            logger.info(f"Created MongoDB job for multipart upload: {folder}")
+        except Exception as db_error:
+            logger.warning(f"Failed to create MongoDB job (continuing anyway): {db_error}")
+
+        return MultipartInitiateResponse(
+            uploadId=upload_id,
+            folder=folder,
+            s3Key=s3_key,
+            presignedUrls=presigned_urls,
+            partSize=part_size,
+            totalParts=total_parts,
+        )
+
+    except Exception as e:
+        logger.exception(f"Error initiating multipart upload: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to initiate upload: {str(e)}"
+        )
+
+
+@router.post("/upload/complete", response_model=MultipartCompleteResponse)
+async def complete_multipart(
+    request: MultipartCompleteRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Complete a multipart upload after all parts have been uploaded.
+
+    Args:
+        request: MultipartCompleteRequest with uploadId, folder, s3Key, and parts.
+        background_tasks: FastAPI background tasks handler.
+
+    Returns:
+        MultipartCompleteResponse with status.
+    """
+    try:
+        # Sort parts by PartNumber
+        sorted_parts = sorted(
+            [{"ETag": p.ETag, "PartNumber": p.PartNumber} for p in request.parts],
+            key=lambda x: x["PartNumber"],
+        )
+
+        # Complete the multipart upload in S3
+        StorageService.complete_multipart_upload(
+            request.s3Key, request.uploadId, sorted_parts
+        )
+
+        logger.info(f"Multipart upload completed: {request.s3Key}")
+
+        # Update job status
+        try:
+            update_job_status_sync(
+                request.folder,
+                stage=JobStage.EXTRACTING_AUDIO,
+                progress=5,
+            )
+        except Exception as db_error:
+            logger.warning(f"Failed to update job status: {db_error}")
+
+        # Trigger background processing (empty string for local_video_path)
+        background_tasks.add_task(
+            _process_video_background, request.folder, "", request.s3Key
+        )
+
+        return MultipartCompleteResponse(
+            folder=request.folder,
+            status="processing",
+            message="Upload completed. Processing started.",
+        )
+
+    except Exception as e:
+        logger.exception(f"Error completing multipart upload: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to complete upload: {str(e)}"
+        )
+
+
+@router.post("/upload/abort")
+async def abort_multipart(request: MultipartAbortRequest):
+    """Abort a multipart upload and clean up.
+
+    Args:
+        request: MultipartAbortRequest with uploadId, folder, and s3Key.
+
+    Returns:
+        Status dict.
+    """
+    try:
+        StorageService.abort_multipart_upload(request.s3Key, request.uploadId)
+    except Exception as e:
+        logger.warning(f"Error aborting multipart upload (may already be completed): {e}")
+
+    # Delete MongoDB job
+    try:
+        db = await get_database()
+        await db.jobs.delete_one({"folder": request.folder})
+        logger.info(f"Deleted MongoDB job for aborted upload: {request.folder}")
+    except Exception as db_error:
+        logger.warning(f"Failed to delete MongoDB job: {db_error}")
+
+    return {"status": "aborted"}
 
 
 @router.post("/upload", response_model=UploadResponse)

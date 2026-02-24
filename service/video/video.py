@@ -592,7 +592,7 @@ def analyse_video(
             local_video_path,
             video_file_path,
         )
-        response_text = future.result(timeout=600)  # 10 minute timeout for video
+        response_text = future.result(timeout=1800)  # 30 minute timeout for video
 
     # Parse response
     result = _parse_gemini_response(response_text, video_file_path)

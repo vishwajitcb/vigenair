@@ -112,3 +112,50 @@ class SplitSegmentResponse(BaseModel):
     """Response from split segment endpoint."""
     status: str
     message: str
+
+
+class PartInfo(BaseModel):
+    """A completed part in a multipart upload."""
+    ETag: str
+    PartNumber: int
+
+
+class MultipartInitiateRequest(BaseModel):
+    """Request to initiate a multipart upload."""
+    filename: str
+    fileSize: int
+    contentType: str = "video/mp4"
+    analyzeAudio: bool = True
+    userId: str = "anonymous"
+
+
+class MultipartInitiateResponse(BaseModel):
+    """Response from multipart upload initiation."""
+    uploadId: str
+    folder: str
+    s3Key: str
+    presignedUrls: List[str]
+    partSize: int
+    totalParts: int
+
+
+class MultipartCompleteRequest(BaseModel):
+    """Request to complete a multipart upload."""
+    uploadId: str
+    folder: str
+    s3Key: str
+    parts: List[PartInfo]
+
+
+class MultipartCompleteResponse(BaseModel):
+    """Response from multipart upload completion."""
+    folder: str
+    status: str
+    message: str
+
+
+class MultipartAbortRequest(BaseModel):
+    """Request to abort a multipart upload."""
+    uploadId: str
+    folder: str
+    s3Key: str
