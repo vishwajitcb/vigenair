@@ -48,9 +48,9 @@ async def get_segments(folder: str):
         SegmentsResponse with data.json and transcript.json contents.
     """
     try:
-        bucket = os.environ.get("S3_BUCKET")
+        bucket = os.environ.get("GCS_BUCKET")
         if not bucket:
-            raise HTTPException(status_code=500, detail="S3_BUCKET not configured")
+            raise HTTPException(status_code=500, detail="GCS_BUCKET not configured")
 
         # Try to get data.json
         data_key = f"{folder}/{ConfigService.OUTPUT_DATA_FILE}"
@@ -98,7 +98,8 @@ async def generate_variants(folder: str, request: GenerateVariantsRequest):
         GenerateVariantsResponse with generated variants.
     """
     try:
-        import google.generativeai as genai
+        import config as ConfigService
+        from google.genai import types
 
         # Get segments data
         data_key = f"{folder}/{ConfigService.OUTPUT_DATA_FILE}"
@@ -201,7 +202,7 @@ Create {num_variants} distinct variants. Output ONLY valid JSON.
             return valid
 
         # Call Gemini with retry logic
-        model = genai.GenerativeModel(ConfigService.CONFIG_TEXT_MODEL)
+        client = ConfigService.get_genai_client()
 
         max_retries = 3
         retry_delay = 2  # seconds
@@ -214,12 +215,13 @@ Create {num_variants} distinct variants. Output ONLY valid JSON.
             try:
                 logger.info(f"Gemini API call attempt {attempt + 1}/{max_retries} (target: {target_duration:.1f}s, max: {max_allowed_duration:.1f}s)")
 
-                response = model.generate_content(
-                    generation_prompt,
-                    generation_config={
-                        "max_output_tokens": 8192,
-                        "temperature": 0.7,
-                    },
+                response = client.models.generate_content(
+                    model=ConfigService.CONFIG_TEXT_MODEL,
+                    contents=generation_prompt,
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=8192,
+                        temperature=0.7,
+                    ),
                 )
 
                 # Parse response
@@ -285,7 +287,7 @@ def _split_segment_background(folder: str, request: SplitSegmentRequest):
     try:
         logger.info(f"Starting segment split for folder: {folder}")
 
-        bucket = os.environ.get("S3_BUCKET")
+        bucket = os.environ.get("GCS_BUCKET")
 
         # Write split request file to trigger the extractor
         split_data = {

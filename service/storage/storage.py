@@ -14,65 +14,66 @@
 
 """Vigenair storage service.
 
-This module provides methods for interacting with Amazon S3 storage.
-Replaces the original Google Cloud Storage implementation.
+This module provides methods for interacting with Google Cloud Storage.
 """
 
+import datetime
 import logging
 import os
 import pathlib
 from typing import Optional, Sequence, Union
 
-import boto3
-from botocore.exceptions import ClientError
+from google.cloud import storage as gcs_storage
 
 import utils as Utils
 
-# Initialize S3 client
-_s3_client = None
+# Initialize GCS client singleton
+_gcs_client = None
 
 
-def _get_s3_client():
-    """Get or create the S3 client singleton."""
-    global _s3_client
-    if _s3_client is None:
-        _s3_client = boto3.client(
-            's3',
-            region_name=os.environ.get('AWS_REGION', 'us-east-1'),
-        )
-    return _s3_client
+def _get_gcs_client():
+    """Get or create the GCS client singleton."""
+    global _gcs_client
+    if _gcs_client is None:
+        _gcs_client = gcs_storage.Client()
+    return _gcs_client
 
 
-def _get_bucket():
-    """Get the S3 bucket name from environment."""
-    bucket = os.environ.get('S3_BUCKET')
+def _get_bucket_name():
+    """Get the GCS bucket name from environment."""
+    bucket = os.environ.get('GCS_BUCKET')
     if not bucket:
-        raise ValueError("S3_BUCKET environment variable is not set")
+        raise ValueError("GCS_BUCKET environment variable is not set")
     return bucket
+
+
+def _get_bucket(bucket_name: Optional[str] = None):
+    """Get a GCS bucket object."""
+    client = _get_gcs_client()
+    name = bucket_name or _get_bucket_name()
+    return client.bucket(name)
 
 
 def download_file(
     file_path: Union[str, Utils.TriggerFile],
     output_dir: Optional[str] = None,
     fetch_contents: bool = False,
-    bucket_name: Optional[str] = None,  # Kept for backward compatibility, ignored
+    bucket_name: Optional[str] = None,
 ) -> Union[Optional[str], Optional[bytes]]:
-    """Downloads a file from S3 and returns its path or contents.
+    """Downloads a file from GCS and returns its path or contents.
 
     Args:
         file_path: The path of the file to download (string or TriggerFile).
         output_dir: Directory path to store the downloaded file in.
         fetch_contents: Whether to fetch the file contents instead of writing to a
             file.
-        bucket_name: Deprecated - kept for backward compatibility, ignored.
-            Bucket is read from S3_BUCKET environment variable.
+        bucket_name: The name of the bucket (optional, uses GCS_BUCKET env var).
 
     Returns:
         The retrieved file path or contents based on `fetch_contents`, or None if
         the file was not found.
     """
-    s3_client = _get_s3_client()
-    bucket = _get_bucket()
+    bucket = _get_bucket(bucket_name)
 
     # Handle both string and TriggerFile inputs
     if isinstance(file_path, Utils.TriggerFile):
@@ -82,25 +83,30 @@ def download_file(
         key = file_path
         file_name = os.path.basename(key)
 
+    blob = bucket.blob(key)
+
     try:
-        if fetch_contents:
-            response = s3_client.get_object(Bucket=bucket, Key=key)
-            result = response['Body'].read()
-        else:
-            destination_file_name = str(pathlib.Path(output_dir, file_name))
-            s3_client.download_file(bucket, key, destination_file_name)
-            result = destination_file_name
-
-        logging.info('DOWNLOAD - Fetched file "%s" from bucket "%s".', key, bucket)
-        return result
-
-    except ClientError as e:
-        if e.response['Error']['Code'] == '404' or e.response['Error']['Code'] == 'NoSuchKey':
+        if not blob.exists():
             logging.warning(
-                'DOWNLOAD - Could not find file "%s" in bucket "%s".', key, bucket
+                'DOWNLOAD - Could not find file "%s" in bucket "%s".', key, bucket.name
             )
             return None
-        raise
+
+        if fetch_contents:
+            result = blob.download_as_bytes()
+        else:
+            destination_file_name = str(pathlib.Path(output_dir, file_name))
+            blob.download_to_filename(destination_file_name)
+            result = destination_file_name
+
+        logging.info('DOWNLOAD - Fetched file "%s" from bucket "%s".', key, bucket.name)
+        return result
+
+    except Exception as e:
+        logging.warning(
+            'DOWNLOAD - Error fetching file "%s" from bucket "%s": %s', key, bucket.name, e
+        )
+        return None
 
 
 def upload_file(
@@ -109,34 +115,28 @@ def upload_file(
     bucket_name: Optional[str] = None,
     overwrite: bool = False,
 ) -> None:
-    """Uploads a file to S3.
+    """Uploads a file to GCS.
 
     Args:
         file_path: The path of the file to upload.
-        destination_file_name: The name/key of the file in S3.
-        bucket_name: The name of the bucket (optional, uses S3_BUCKET env var).
+        destination_file_name: The name/key of the file in GCS.
+        bucket_name: The name of the bucket (optional, uses GCS_BUCKET env var).
         overwrite: Whether to overwrite existing files.
     """
-    s3_client = _get_s3_client()
-    bucket = bucket_name or _get_bucket()
+    bucket = _get_bucket(bucket_name)
+    blob = bucket.blob(destination_file_name)
 
     try:
-        if not overwrite:
-            # Check if file exists
-            try:
-                s3_client.head_object(Bucket=bucket, Key=destination_file_name)
-                logging.info(
-                    'UPLOAD - File "%s" already exists, skipping.', destination_file_name
-                )
-                return
-            except ClientError as e:
-                if e.response['Error']['Code'] != '404':
-                    raise
+        if not overwrite and blob.exists():
+            logging.info(
+                'UPLOAD - File "%s" already exists, skipping.', destination_file_name
+            )
+            return
 
-        s3_client.upload_file(file_path, bucket, destination_file_name)
+        blob.upload_from_filename(file_path)
         logging.info('UPLOAD - Uploaded path "%s".', destination_file_name)
 
-    except ClientError as e:
+    except Exception as e:
         logging.error('UPLOAD - Failed to upload "%s": %s', destination_file_name, e)
         raise
 
@@ -146,15 +146,14 @@ def upload_dir(
     bucket_name: str,
     target_dir: str,
 ) -> None:
-    """Uploads all files in a directory to S3.
+    """Uploads all files in a directory to GCS.
 
     Args:
         source_directory: The directory to upload.
         bucket_name: The name of the bucket to upload to.
         target_dir: The directory/prefix within the bucket to upload to.
     """
-    s3_client = _get_s3_client()
-    bucket = bucket_name or _get_bucket()
+    bucket = _get_bucket(bucket_name)
 
     directory_path = pathlib.Path(source_directory)
     paths = directory_path.rglob('*')
@@ -162,20 +161,19 @@ def upload_dir(
     for path in paths:
         if path.is_file():
             relative_path = path.relative_to(source_directory)
-            s3_key = f'{target_dir}/{relative_path}'
+            gcs_key = f'{target_dir}/{relative_path}'
+            blob = bucket.blob(gcs_key)
 
-            try:
-                # Check if file exists
-                s3_client.head_object(Bucket=bucket, Key=s3_key)
-                logging.info('UPLOAD - File "%s" exists, skipping.', s3_key)
-            except ClientError as e:
-                if e.response['Error']['Code'] == '404':
-                    s3_client.upload_file(str(path), bucket, s3_key)
-                    logging.info('UPLOAD - Uploaded path "%s".', s3_key)
-                else:
+            if blob.exists():
+                logging.info('UPLOAD - File "%s" exists, skipping.', gcs_key)
+            else:
+                try:
+                    blob.upload_from_filename(str(path))
+                    logging.info('UPLOAD - Uploaded path "%s".', gcs_key)
+                except Exception as e:
                     logging.warning(
                         'UPLOAD - Failed to upload path "%s" due to exception: %r.',
-                        s3_key,
+                        gcs_key,
                         e,
                     )
 
@@ -185,36 +183,33 @@ def filter_video_files(
     bucket_name: Optional[str] = None,
     first_only: bool = False,
 ) -> Sequence[str]:
-    """Filters video files in S3 based on a prefix.
+    """Filters video files in GCS based on a prefix.
 
     Args:
         prefix: The prefix to filter files by.
-        bucket_name: The name of the bucket (optional, uses S3_BUCKET env var).
+        bucket_name: The name of the bucket (optional, uses GCS_BUCKET env var).
         first_only: Whether to only return the first matching file.
 
     Returns:
         A list of video files matching the given prefix, or an empty list if no
         files match.
     """
-    s3_client = _get_s3_client()
-    bucket = bucket_name or _get_bucket()
+    client = _get_gcs_client()
+    bucket_n = bucket_name or _get_bucket_name()
     result = []
 
-    paginator = s3_client.get_paginator('list_objects_v2')
+    for blob in client.list_blobs(bucket_n, prefix=prefix):
+        key = blob.name
+        logging.info('FILTER - Found object with key "%s".', key)
 
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get('Contents', []):
-            key = obj['Key']
-            logging.info('FILTER - Found object with key "%s".', key)
+        _, file_ext = os.path.splitext(key)
+        file_ext = file_ext[1:]
 
-            _, file_ext = os.path.splitext(key)
-            file_ext = file_ext[1:]
-
-            if file_ext and Utils.VideoExtension.has_value(file_ext):
-                logging.info('FILTER - Found video file "%s".', key)
-                result.append(key)
-                if first_only:
-                    return result
+        if file_ext and Utils.VideoExtension.has_value(file_ext):
+            logging.info('FILTER - Found video file "%s".', key)
+            result.append(key)
+            if first_only:
+                return result
 
     return result
 
@@ -227,7 +222,7 @@ def list_files(
     download_dir: Optional[str] = None,
     bucket_name: Optional[str] = None,
 ) -> Sequence[Union[bytes, str]]:
-    """Lists/filters files in S3 based on prefix and optional suffix.
+    """Lists/filters files in GCS based on prefix and optional suffix.
 
     Args:
         prefix: The prefix to filter files by.
@@ -235,40 +230,36 @@ def list_files(
         fetch_content: Whether to return file names or their content.
         download: Whether to download files locally.
         download_dir: Directory to download files to.
-        bucket_name: The name of the bucket (optional, uses S3_BUCKET env var).
+        bucket_name: The name of the bucket (optional, uses GCS_BUCKET env var).
 
     Returns:
         A list of file keys, contents, or local paths depending on parameters.
     """
-    s3_client = _get_s3_client()
-    bucket = bucket_name or _get_bucket()
+    client = _get_gcs_client()
+    bucket_n = bucket_name or _get_bucket_name()
     result = []
 
-    paginator = s3_client.get_paginator('list_objects_v2')
+    for blob in client.list_blobs(bucket_n, prefix=prefix):
+        key = blob.name
 
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get('Contents', []):
-            key = obj['Key']
+        if suffix and not key.endswith(suffix):
+            continue
 
-            if suffix and not key.endswith(suffix):
-                continue
+        logging.info('FILTER - Found matching file "%s".', key)
 
-            logging.info('FILTER - Found matching file "%s".', key)
-
-            if download and download_dir:
-                file_path, file_ext = os.path.splitext(key)
-                file_path = pathlib.Path(file_path)
-                file_name = file_path.name
-                destination_file_name = str(
-                    pathlib.Path(download_dir, f'{file_name}{file_ext}')
-                )
-                s3_client.download_file(bucket, key, destination_file_name)
-                result.append(destination_file_name)
-            elif fetch_content:
-                response = s3_client.get_object(Bucket=bucket, Key=key)
-                result.append(response['Body'].read())
-            else:
-                result.append(key)
+        if download and download_dir:
+            file_path, file_ext = os.path.splitext(key)
+            file_path = pathlib.Path(file_path)
+            file_name = file_path.name
+            destination_file_name = str(
+                pathlib.Path(download_dir, f'{file_name}{file_ext}')
+            )
+            blob.download_to_filename(destination_file_name)
+            result.append(destination_file_name)
+        elif fetch_content:
+            result.append(blob.download_as_bytes())
+        else:
+            result.append(key)
 
     return result
 
@@ -277,14 +268,13 @@ def delete_file(
     file_path: Union[str, Utils.TriggerFile],
     bucket_name: Optional[str] = None,
 ) -> None:
-    """Deletes a file from S3.
+    """Deletes a file from GCS.
 
     Args:
         file_path: The path of the file to delete.
-        bucket_name: The name of the bucket (optional, uses S3_BUCKET env var).
+        bucket_name: The name of the bucket (optional, uses GCS_BUCKET env var).
     """
-    s3_client = _get_s3_client()
-    bucket = bucket_name or _get_bucket()
+    bucket = _get_bucket(bucket_name)
 
     # Handle both string and TriggerFile inputs
     if isinstance(file_path, Utils.TriggerFile):
@@ -292,21 +282,22 @@ def delete_file(
     else:
         key = file_path
 
+    blob = bucket.blob(key)
+
     try:
-        # Check if file exists first
-        s3_client.head_object(Bucket=bucket, Key=key)
-
-        # Delete the file
-        s3_client.delete_object(Bucket=bucket, Key=key)
-        logging.info('DELETE - Deleted file "%s" from bucket "%s".', key, bucket)
-
-    except ClientError as e:
-        if e.response['Error']['Code'] == '404':
+        if not blob.exists():
             logging.warning(
-                'DELETE - Could not find file "%s" in bucket "%s".', key, bucket
+                'DELETE - Could not find file "%s" in bucket "%s".', key, bucket.name
             )
-        else:
-            raise
+            return
+
+        blob.delete()
+        logging.info('DELETE - Deleted file "%s" from bucket "%s".', key, bucket.name)
+
+    except Exception as e:
+        logging.warning(
+            'DELETE - Error deleting file "%s" from bucket "%s": %s', key, bucket.name, e
+        )
 
 
 def download_dir(
@@ -314,7 +305,7 @@ def download_dir(
     dir_path: str,
     output_dir: str,
 ) -> int:
-    """Downloads all files in a directory from S3.
+    """Downloads all files in a directory from GCS.
 
     Args:
         bucket_name: The name of the bucket to download from.
@@ -324,33 +315,30 @@ def download_dir(
     Returns:
         The number of files downloaded.
     """
-    s3_client = _get_s3_client()
-    bucket = bucket_name or _get_bucket()
+    client = _get_gcs_client()
+    bucket_n = bucket_name or _get_bucket_name()
     prefix = f'{dir_path}/'
     count_files = 0
 
-    paginator = s3_client.get_paginator('list_objects_v2')
+    for blob in client.list_blobs(bucket_n, prefix=prefix):
+        key = blob.name
+        if key == prefix:
+            continue
 
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get('Contents', []):
-            key = obj['Key']
-            if key == prefix:
-                continue
+        filename = key.replace(prefix, '')
+        local_path = str(pathlib.Path(output_dir, filename))
 
-            filename = key.replace(prefix, '')
-            local_path = str(pathlib.Path(output_dir, filename))
+        # Create subdirectories if needed
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
-            # Create subdirectories if needed
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
-            s3_client.download_file(bucket, key, local_path)
-            count_files += 1
+        blob.download_to_filename(local_path)
+        count_files += 1
 
     logging.info(
         'DOWNLOAD - Fetched "%d" files from bucket "%s" and folder "%s" '
         'into path "%s".',
         count_files,
-        bucket,
+        bucket_n,
         dir_path,
         output_dir,
     )
@@ -358,124 +346,126 @@ def download_dir(
 
 
 def get_presigned_url(key: str, expiration: int = 3600) -> str:
-    """Generates a presigned URL for accessing an S3 object.
+    """Generates a signed URL for accessing a GCS object.
 
     Args:
-        key: The S3 object key.
+        key: The GCS object key.
         expiration: URL expiration time in seconds (default 1 hour).
 
     Returns:
-        The presigned URL string.
+        The signed URL string.
     """
-    s3_client = _get_s3_client()
     bucket = _get_bucket()
+    blob = bucket.blob(key)
 
-    url = s3_client.generate_presigned_url(
-        'get_object',
-        Params={'Bucket': bucket, 'Key': key},
-        ExpiresIn=expiration,
+    url = blob.generate_signed_url(
+        version='v4',
+        expiration=datetime.timedelta(seconds=expiration),
+        method='GET',
     )
     return url
 
 
-def create_multipart_upload(key: str, content_type: str = 'video/mp4') -> str:
-    """Initiates a multipart upload to S3.
+def get_signed_upload_url(key: str, content_type: str = 'application/octet-stream', expiration: int = 7200) -> str:
+    """Generates a signed URL for uploading (PUT) a GCS object.
 
     Args:
-        key: The S3 object key.
+        key: The GCS object key.
+        content_type: The MIME type of the file being uploaded.
+        expiration: URL expiration time in seconds (default 2 hours).
+
+    Returns:
+        The signed upload URL string.
+    """
+    bucket = _get_bucket()
+    blob = bucket.blob(key)
+
+    url = blob.generate_signed_url(
+        version='v4',
+        expiration=datetime.timedelta(seconds=expiration),
+        method='PUT',
+        content_type=content_type,
+    )
+    return url
+
+
+def get_gs_uri(key: str) -> str:
+    """Returns the gs:// URI for a GCS object.
+
+    Args:
+        key: The GCS object key.
+
+    Returns:
+        The gs:// URI string (e.g., gs://bucket/key).
+    """
+    bucket_name = _get_bucket_name()
+    return f'gs://{bucket_name}/{key}'
+
+
+def create_resumable_upload_session(key: str, content_type: str = 'video/mp4') -> str:
+    """Creates a resumable upload session for a GCS object.
+
+    Args:
+        key: The GCS object key.
         content_type: The MIME type of the file.
 
     Returns:
-        The upload ID string.
+        The resumable upload session URI.
     """
-    s3_client = _get_s3_client()
     bucket = _get_bucket()
+    blob = bucket.blob(key)
 
-    response = s3_client.create_multipart_upload(
-        Bucket=bucket,
-        Key=key,
-        ContentType=content_type,
-    )
-    upload_id = response['UploadId']
-    logging.info('MULTIPART - Initiated upload for "%s", upload_id="%s".', key, upload_id)
-    return upload_id
+    session_uri = blob.create_resumable_upload_session(content_type=content_type)
+    logging.info('RESUMABLE_UPLOAD - Created session for "%s".', key)
+    return session_uri
 
 
-def generate_presigned_upload_url(
-    key: str, upload_id: str, part_number: int, expiration: int = 3600
-) -> str:
-    """Generates a presigned URL for uploading a single part.
+def compose_objects(
+    source_keys: Sequence[str],
+    destination_key: str,
+    content_type: str = 'video/mp4',
+) -> None:
+    """Composes multiple GCS objects into a single destination object.
 
     Args:
-        key: The S3 object key.
-        upload_id: The multipart upload ID.
-        part_number: The part number (1-indexed).
-        expiration: URL expiration time in seconds (default 1 hour).
+        source_keys: List of source object keys (max 32).
+        destination_key: The destination object key.
+        content_type: The MIME type of the composed object.
 
-    Returns:
-        The presigned PUT URL string.
+    Raises:
+        ValueError: If more than 32 source keys are provided.
     """
-    s3_client = _get_s3_client()
+    if len(source_keys) > 32:
+        raise ValueError('GCS compose supports a maximum of 32 source objects')
+
     bucket = _get_bucket()
+    source_blobs = [bucket.blob(k) for k in source_keys]
+    destination_blob = bucket.blob(destination_key)
+    destination_blob.content_type = content_type
 
-    url = s3_client.generate_presigned_url(
-        'upload_part',
-        Params={
-            'Bucket': bucket,
-            'Key': key,
-            'UploadId': upload_id,
-            'PartNumber': part_number,
-        },
-        ExpiresIn=expiration,
+    destination_blob.compose(source_blobs)
+    logging.info(
+        'COMPOSE - Composed %d objects into "%s".', len(source_keys), destination_key
     )
-    return url
 
 
-def complete_multipart_upload(
-    key: str, upload_id: str, parts: list
-) -> dict:
-    """Completes a multipart upload by assembling all parts.
+def delete_files(keys: Sequence[str]) -> None:
+    """Batch-deletes multiple files from GCS.
 
     Args:
-        key: The S3 object key.
-        upload_id: The multipart upload ID.
-        parts: List of dicts with 'ETag' and 'PartNumber' keys.
-
-    Returns:
-        The S3 CompleteMultipartUpload response.
+        keys: List of object keys to delete.
     """
-    s3_client = _get_s3_client()
     bucket = _get_bucket()
-
-    response = s3_client.complete_multipart_upload(
-        Bucket=bucket,
-        Key=key,
-        UploadId=upload_id,
-        MultipartUpload={'Parts': parts},
-    )
-    logging.info('MULTIPART - Completed upload for "%s", upload_id="%s".', key, upload_id)
-    return response
+    for key in keys:
+        try:
+            blob = bucket.blob(key)
+            blob.delete()
+            logging.info('DELETE - Deleted file "%s".', key)
+        except Exception as e:
+            logging.warning('DELETE - Failed to delete "%s": %s', key, e)
 
 
-def abort_multipart_upload(key: str, upload_id: str) -> None:
-    """Aborts a multipart upload and cleans up uploaded parts.
-
-    Args:
-        key: The S3 object key.
-        upload_id: The multipart upload ID.
-    """
-    s3_client = _get_s3_client()
-    bucket = _get_bucket()
-
-    s3_client.abort_multipart_upload(
-        Bucket=bucket,
-        Key=key,
-        UploadId=upload_id,
-    )
-    logging.info('MULTIPART - Aborted upload for "%s", upload_id="%s".', key, upload_id)
-
-
-# Backward compatibility aliases for existing code
+# Backward compatibility aliases
 download_gcs_file = download_file
 upload_gcs_file = upload_file
 upload_gcs_dir = upload_dir

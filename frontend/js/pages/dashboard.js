@@ -19,6 +19,8 @@ let pollInterval = null;
 let activeUpload = null;
 
 const MULTIPART_THRESHOLD = 100 * 1024 * 1024; // 100 MB
+const PARALLEL_PART_TARGET_SIZE = 256 * 1024 * 1024; // 256 MB per part
+const MAX_CONCURRENT_PARTS = 6;
 
 // Elements
 const jobsGrid = $('#jobsGrid');
@@ -222,12 +224,24 @@ function openUploadModal() {
 }
 
 function closeUploadModal() {
-    // Abort active multipart upload if in progress
+    // Abort active upload if in progress
     if (activeUpload && !activeUpload.aborted) {
         activeUpload.aborted = true;
-        api.abortMultipartUpload(
-            activeUpload.uploadId, activeUpload.folder, activeUpload.s3Key
-        ).catch(err => console.warn('Abort cleanup error:', err));
+
+        // Abort all in-flight fetch requests
+        if (activeUpload.abortControllers) {
+            activeUpload.abortControllers.forEach(c => c.abort());
+        }
+
+        if (activeUpload.numParts) {
+            api.abortParallelUpload(
+                activeUpload.folder, activeUpload.objectKey, activeUpload.numParts
+            ).catch(err => console.warn('Abort cleanup error:', err));
+        } else {
+            api.abortResumableUpload(
+                activeUpload.folder, activeUpload.objectKey
+            ).catch(err => console.warn('Abort cleanup error:', err));
+        }
         activeUpload = null;
     }
 
@@ -265,7 +279,7 @@ async function handleUpload() {
     if (!selectedFile) return;
 
     if (selectedFile.size > MULTIPART_THRESHOLD) {
-        await handleMultipartUpload();
+        await handleParallelUpload();
     } else {
         await handleSimpleUpload();
     }
@@ -310,7 +324,7 @@ async function handleSimpleUpload() {
     }
 }
 
-async function handleMultipartUpload() {
+async function handleParallelUpload() {
     const analyzeAudio = $('#analyzeAudio').checked;
     const progressDiv = $('#uploadProgress');
     const progressBar = $('#progressBar');
@@ -326,103 +340,120 @@ async function handleMultipartUpload() {
         if (statusLabel && label) statusLabel.textContent = label;
     }
 
-    updateProgress(0, 'Initiating upload...');
+    updateProgress(0, 'Initiating parallel upload...');
+    let firstError = null;
 
     try {
-        // 1. Initiate
-        const initResponse = await api.initiateMultipartUpload(
+        // 1. Calculate number of parts
+        const numParts = Math.max(2, Math.min(
+            Math.ceil(selectedFile.size / PARALLEL_PART_TARGET_SIZE), 20
+        ));
+
+        // 2. Initiate parallel upload — get signed URLs for each part
+        const initResponse = await api.initiateParallelUpload(
             selectedFile.name,
             selectedFile.size,
             selectedFile.type || 'video/mp4',
             analyzeAudio,
+            numParts,
         );
 
-        const { uploadId, folder, s3Key, presignedUrls, partSize, totalParts } = initResponse;
+        const { folder, objectKey, parts } = initResponse;
+        const actualNumParts = parts.length;
 
-        activeUpload = { uploadId, folder, s3Key, aborted: false };
+        const abortControllers = [];
+        activeUpload = { folder, objectKey, numParts: actualNumParts, aborted: false, abortControllers };
 
-        // Save to localStorage for potential resume
-        localStorage.setItem('activeMultipartUpload', JSON.stringify({
-            uploadId, folder, s3Key, totalParts, partSize, fileName: selectedFile.name,
-        }));
+        updateProgress(1, `Uploading 0/${actualNumParts} parts...`);
 
-        updateProgress(1, `Uploading 0/${totalParts} parts...`);
+        // 3. Track per-part progress
+        const partBytesUploaded = new Array(actualNumParts).fill(0);
+        let completedParts = 0;
 
-        // 2. Upload parts with concurrency pool
-        const CONCURRENCY = 4;
-        const MAX_RETRIES = 3;
-        const completedParts = [];
-        let completedCount = 0;
-        let partIndex = 0;
+        function refreshProgress() {
+            const totalUploaded = partBytesUploaded.reduce((a, b) => a + b, 0);
+            const pct = (totalUploaded / selectedFile.size) * 95; // reserve 5% for compose
+            updateProgress(pct, `Uploading ${completedParts}/${actualNumParts} parts...`);
+        }
 
-        async function uploadPart(partNum) {
-            const start = (partNum - 1) * partSize;
-            const end = Math.min(start + partSize, selectedFile.size);
-            const blob = selectedFile.slice(start, end);
-            const url = presignedUrls[partNum - 1];
+        // 4. Upload a single part via signed URL (one PUT per part)
+        async function uploadPart(part) {
+            const MAX_RETRIES = 3;
+            const partBlob = selectedFile.slice(part.offset, part.offset + part.size);
 
             for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-                if (activeUpload && activeUpload.aborted) {
-                    throw new Error('Upload aborted');
-                }
+                if (activeUpload && activeUpload.aborted) return;
+
+                const controller = new AbortController();
+                abortControllers.push(controller);
 
                 try {
-                    const response = await fetch(url, {
+                    const response = await fetch(part.signedUrl, {
                         method: 'PUT',
-                        body: blob,
+                        headers: { 'Content-Type': 'application/octet-stream' },
+                        body: partBlob,
+                        signal: controller.signal,
                     });
 
-                    if (!response.ok) {
-                        throw new Error(`Part ${partNum} failed: HTTP ${response.status}`);
+                    if (response.ok) {
+                        partBytesUploaded[part.partIndex] = part.size;
+                        completedParts++;
+                        refreshProgress();
+                        return;
                     }
 
-                    const etag = response.headers.get('ETag');
-                    return { ETag: etag, PartNumber: partNum };
-                } catch (err) {
-                    if (attempt === MAX_RETRIES || (activeUpload && activeUpload.aborted)) {
-                        throw err;
+                    const body = await response.text().catch(() => '');
+                    console.error(`Part ${part.partIndex} attempt ${attempt}: HTTP ${response.status} ${body}`);
+                    if (attempt === MAX_RETRIES) {
+                        throw new Error(`Part ${part.partIndex} failed: HTTP ${response.status}`);
                     }
-                    // Exponential backoff: 1s, 2s, 4s
-                    await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+                } catch (err) {
+                    if (err.name === 'AbortError' || (activeUpload && activeUpload.aborted)) return;
+                    console.error(`Part ${part.partIndex} attempt ${attempt}:`, err.message);
+                    if (attempt === MAX_RETRIES) throw err;
+                }
+
+                await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+            }
+        }
+
+        // 5. Run parts with concurrency limit
+        const partQueue = [...parts];
+        const workers = [];
+
+        async function worker() {
+            while (partQueue.length > 0) {
+                if (activeUpload && activeUpload.aborted) return;
+                const part = partQueue.shift();
+                if (!part) return;
+                try {
+                    await uploadPart(part);
+                } catch (err) {
+                    if (!firstError) firstError = err;
+                    if (activeUpload) activeUpload.aborted = true;
+                    abortControllers.forEach(c => c.abort());
+                    return;
                 }
             }
         }
 
-        // Worker pool
-        async function worker() {
-            while (true) {
-                let myPartNum;
-                // Grab next part atomically
-                partIndex++;
-                myPartNum = partIndex;
-                if (myPartNum > totalParts) break;
-
-                const result = await uploadPart(myPartNum);
-                completedParts.push(result);
-                completedCount++;
-
-                const pct = (completedCount / totalParts) * 95;
-                updateProgress(pct, `Uploading ${completedCount}/${totalParts} parts...`);
-            }
-        }
-
-        const workers = [];
-        for (let i = 0; i < Math.min(CONCURRENCY, totalParts); i++) {
+        for (let i = 0; i < Math.min(MAX_CONCURRENT_PARTS, actualNumParts); i++) {
             workers.push(worker());
         }
+
         await Promise.all(workers);
+
+        if (firstError) throw firstError;
 
         if (activeUpload && activeUpload.aborted) {
             throw new Error('Upload aborted');
         }
 
-        // 3. Complete
-        updateProgress(96, 'Finalizing upload...');
+        // 6. Compose — trigger backend to compose parts and start processing
+        updateProgress(96, 'Composing parts...');
 
-        await api.completeMultipartUpload(uploadId, folder, s3Key, completedParts);
+        await api.completeParallelUpload(folder, objectKey, actualNumParts);
 
-        // Cleanup
-        localStorage.removeItem('activeMultipartUpload');
         activeUpload = null;
 
         updateProgress(100, 'Upload complete!');
@@ -434,22 +465,27 @@ async function handleMultipartUpload() {
         }, 500);
 
     } catch (error) {
-        if (error.message === 'Upload aborted') {
+        const wasUserCancel = error.message === 'Upload aborted';
+
+        if (wasUserCancel) {
             showToast('Upload cancelled', 'info');
         } else {
-            showToast('Failed to upload video', 'error');
-            console.error('Multipart upload error:', error);
-
-            // Abort the upload on failure
-            if (activeUpload && !activeUpload.aborted) {
-                activeUpload.aborted = true;
-                api.abortMultipartUpload(
-                    activeUpload.uploadId, activeUpload.folder, activeUpload.s3Key
-                ).catch(err => console.warn('Abort cleanup error:', err));
-            }
+            console.error('Parallel upload error:', error.name, error.message, error.stack);
+            showToast(`Upload failed: ${error.message}`, 'error');
         }
 
-        localStorage.removeItem('activeMultipartUpload');
+        if (activeUpload) {
+            if (!activeUpload.aborted) {
+                activeUpload.aborted = true;
+                if (activeUpload.abortControllers) {
+                    activeUpload.abortControllers.forEach(c => c.abort());
+                }
+            }
+            api.abortParallelUpload(
+                activeUpload.folder, activeUpload.objectKey, activeUpload.numParts
+            ).catch(err => console.warn('Abort cleanup error:', err));
+        }
+
         activeUpload = null;
         $('#startUpload').disabled = false;
         progressDiv.classList.add('hidden');

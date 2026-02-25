@@ -120,7 +120,7 @@ async def startup_event():
     logger.info("Applied filter to suppress polling endpoint access logs")
 
     # Verify required environment variables - FAIL if missing
-    required_vars = ["S3_BUCKET", "GOOGLE_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+    required_vars = ["GCS_BUCKET", "GCS_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS"]
     missing_vars = [var for var in required_vars if not os.environ.get(var)]
 
     if missing_vars:
@@ -139,33 +139,27 @@ async def startup_event():
         logger.error(error_msg)
         raise RuntimeError(error_msg)
 
-    # Initialize Google AI and verify connectivity
-    google_api_key = os.environ.get("GOOGLE_API_KEY")
+    # Initialize google-genai (Vertex AI) and verify connectivity
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=google_api_key)
-
-        # Verify the API key works by listing models
-        models = list(genai.list_models())
-        logger.info(f"Google AI Studio SDK initialized - {len(models)} models available")
+        import config as ConfigService
+        client = ConfigService.get_genai_client()
+        models = list(client.models.list())
+        logger.info(f"Google GenAI SDK (Vertex AI) initialized - {len(models)} models available")
     except Exception as e:
-        error_msg = f"FATAL: Failed to initialize Google AI SDK: {e}"
+        error_msg = f"FATAL: Failed to initialize Google GenAI SDK: {e}"
         logger.error(error_msg)
         raise RuntimeError(error_msg)
 
-    # Verify S3 connectivity
+    # Verify GCS connectivity
     try:
-        import boto3
-        s3_client = boto3.client(
-            's3',
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.environ.get("AWS_REGION", "us-east-1")
-        )
-        s3_client.head_bucket(Bucket=os.environ.get("S3_BUCKET"))
-        logger.info(f"S3 connectivity verified - bucket: {os.environ.get('S3_BUCKET')}")
+        from google.cloud import storage as gcs_storage
+        gcs_client = gcs_storage.Client()
+        bucket = gcs_client.bucket(os.environ.get("GCS_BUCKET"))
+        if not bucket.exists():
+            raise ValueError(f"GCS bucket does not exist: {os.environ.get('GCS_BUCKET')}")
+        logger.info(f"GCS connectivity verified - bucket: {os.environ.get('GCS_BUCKET')}")
     except Exception as e:
-        error_msg = f"FATAL: Failed to connect to S3: {e}"
+        error_msg = f"FATAL: Failed to connect to GCS: {e}"
         logger.error(error_msg)
         raise RuntimeError(error_msg)
 

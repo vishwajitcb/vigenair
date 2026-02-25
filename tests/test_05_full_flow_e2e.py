@@ -3,12 +3,12 @@
 
 This test replicates EXACTLY what the main app does:
 1. Extract audio from video
-2. Upload audio to Gemini
-3. Transcribe with exact prompt/config from app
+2. Upload audio to GCS
+3. Transcribe with exact prompt/config from app via gs:// URI
 4. Parse response with exact regex from app
 5. Write VTT file locally
-6. Upload VTT to S3
-7. Read VTT back from S3
+6. Upload VTT to GCS
+7. Read VTT back from GCS
 8. Verify content
 
 This mirrors the code in:
@@ -32,8 +32,9 @@ sys.path.insert(0, SERVICE_DIR)
 from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
 
-import boto3
-import google.generativeai as genai
+from google import genai
+from google.genai import types
+from google.cloud import storage as gcs_storage
 import pandas as pd
 
 # ============================================================
@@ -72,7 +73,7 @@ TRANSCRIBE_AUDIO_CONFIG = {
 
 TRANSCRIBE_AUDIO_PATTERN = r'.*Language: ?(.*)\n*.*Confidence: ?(.*)\n*```csv\n(.*)```\n*```vtt\n(.*)```'
 
-CONFIG_DEFAULT_SAFETY_CONFIG = [
+CONFIG_DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
@@ -87,7 +88,21 @@ CONFIG_TRANSCRIPTION_MODEL_GEMINI = 'gemini-2.5-flash'
 
 TEST_VIDEO = os.path.join(PROJECT_ROOT, "Ep 01_1.mp4")
 TEST_FOLDER = "test_e2e_transcription"
-S3_BUCKET = os.environ.get('S3_BUCKET', 'vigenair')
+GCS_BUCKET = os.environ.get('GCS_BUCKET', 'vigenair')
+
+
+def get_client():
+    """Get Vertex AI genai client."""
+    return genai.Client(
+        vertexai=True,
+        project=os.environ.get('GCS_PROJECT_ID'),
+        location=os.environ.get('GCS_LOCATION', 'us-central1'),
+    )
+
+
+def get_gcs_client():
+    """Get GCS storage client."""
+    return gcs_storage.Client()
 
 
 def step_1_extract_audio(video_path: str, output_dir: str) -> str:
@@ -129,9 +144,9 @@ def step_1_extract_audio(video_path: str, output_dir: str) -> str:
 
 
 def step_2_transcribe_audio(audio_file_path: str, output_dir: str) -> tuple:
-    """Step 2: Transcribe audio with Gemini (mirrors audio.transcribe_audio)"""
+    """Step 2: Transcribe audio with Gemini via Vertex AI (mirrors audio.transcribe_audio)"""
     print("\n" + "=" * 60)
-    print("STEP 2: Transcribe Audio with Gemini")
+    print("STEP 2: Transcribe Audio with Gemini (Vertex AI)")
     print("=" * 60)
 
     # Initialize variables exactly as in the app
@@ -139,36 +154,34 @@ def step_2_transcribe_audio(audio_file_path: str, output_dir: str) -> tuple:
     video_language = DEFAULT_VIDEO_LANGUAGE
     language_probability = 0.0
     subtitles_content = None
-    audio_file = None
+    temp_gcs_blob = None
 
-    # Initialize Gemini
-    genai.configure(api_key=os.environ.get('GOOGLE_API_KEY'))
-    transcription_model = genai.GenerativeModel(CONFIG_TRANSCRIPTION_MODEL_GEMINI)
+    # Initialize Vertex AI client
+    client = get_client()
+    gcs_client = get_gcs_client()
 
     print(f"  Using model: {CONFIG_TRANSCRIPTION_MODEL_GEMINI}")
 
     try:
-        # Upload audio file to Gemini Files API
-        print(f"  Uploading audio to Gemini...")
-        audio_file = genai.upload_file(audio_file_path, mime_type='audio/wav')
-        print(f"  Uploaded: {audio_file.name}")
+        # Upload audio to GCS for gs:// URI access
+        print(f"  Uploading audio to GCS...")
+        bucket = gcs_client.bucket(GCS_BUCKET)
+        temp_key = f"_test_temp/e2e_audio_{int(time.time())}.wav"
+        temp_gcs_blob = bucket.blob(temp_key)
+        temp_gcs_blob.upload_from_filename(audio_file_path, content_type='audio/wav')
+        gs_uri = f"gs://{GCS_BUCKET}/{temp_key}"
+        print(f"  Uploaded: {gs_uri}")
 
-        # Wait for processing
-        print(f"  Waiting for processing...")
-        while audio_file.state.name == 'PROCESSING':
-            time.sleep(2)
-            audio_file = genai.get_file(audio_file.name)
-
-        if audio_file.state.name == 'FAILED':
-            print(f"  ERROR: Audio processing failed")
-            return None, None, None, None
-
-        # Generate transcription
+        # Generate transcription using gs:// URI
         print(f"  Generating transcription...")
-        response = transcription_model.generate_content(
-            [audio_file, TRANSCRIBE_AUDIO_PROMPT],
-            generation_config=TRANSCRIBE_AUDIO_CONFIG,
-            safety_settings=CONFIG_DEFAULT_SAFETY_CONFIG,
+        audio_part = types.Part.from_uri(file_uri=gs_uri, mime_type='audio/wav')
+        response = client.models.generate_content(
+            model=CONFIG_TRANSCRIPTION_MODEL_GEMINI,
+            contents=[audio_part, TRANSCRIBE_AUDIO_PROMPT],
+            config=types.GenerateContentConfig(
+                **TRANSCRIBE_AUDIO_CONFIG,
+                safety_settings=CONFIG_DEFAULT_SAFETY_SETTINGS,
+            ),
         )
 
         if (response.candidates and response.candidates[0].content.parts
@@ -192,7 +205,6 @@ def step_2_transcribe_audio(audio_file_path: str, output_dir: str) -> tuple:
                 print(f"  Response preview:")
                 for line in text[:500].split('\n'):
                     print(f"    {line}")
-                # Continue with empty values (as app does after our fix)
             else:
                 video_language = result.group(1)
                 language_probability = result.group(2)
@@ -225,13 +237,13 @@ def step_2_transcribe_audio(audio_file_path: str, output_dir: str) -> tuple:
         traceback.print_exc()
 
     finally:
-        # Cleanup Gemini file
-        if audio_file:
+        # Cleanup GCS temp file
+        if temp_gcs_blob:
             try:
-                genai.delete_file(audio_file.name)
-                print(f"  Cleaned up Gemini file: {audio_file.name}")
+                temp_gcs_blob.delete()
+                print(f"  Cleaned up GCS temp file")
             except Exception as e:
-                print(f"  Warning: Failed to cleanup Gemini file: {e}")
+                print(f"  Warning: Failed to cleanup GCS temp file: {e}")
 
     return transcription_dataframe, video_language, language_probability, subtitles_content
 
@@ -242,7 +254,6 @@ def step_3_write_vtt_file(audio_file_path: str, subtitles_content: str) -> str:
     print("STEP 3: Write VTT File Locally")
     print("=" * 60)
 
-    # EXACT code from app: audio.py lines 328-335
     subtitles_output_path = audio_file_path.replace('.wav', f'.{OUTPUT_SUBTITLES_TYPE}')
 
     print(f"  Output path: {subtitles_output_path}")
@@ -252,57 +263,53 @@ def step_3_write_vtt_file(audio_file_path: str, subtitles_content: str) -> str:
             f.write(subtitles_content)
             print(f"  PASS: Wrote {len(subtitles_content)} chars to VTT file")
         else:
-            pass  # Empty file (EXACT behavior from app)
+            pass
             print(f"  WARNING: No subtitles content - wrote EMPTY file!")
 
-    # Verify file
     file_size = os.path.getsize(subtitles_output_path)
     print(f"  File size: {file_size} bytes")
 
     return subtitles_output_path
 
 
-def step_4_upload_to_s3(local_path: str, s3_key: str) -> bool:
-    """Step 4: Upload VTT to S3 (mirrors storage.upload_file)"""
+def step_4_upload_to_gcs(local_path: str, gcs_key: str) -> bool:
+    """Step 4: Upload VTT to GCS (mirrors storage.upload_file)"""
     print("\n" + "=" * 60)
-    print("STEP 4: Upload VTT to S3")
+    print("STEP 4: Upload VTT to GCS")
     print("=" * 60)
 
-    s3_client = boto3.client(
-        's3',
-        region_name=os.environ.get('AWS_REGION', 'us-east-1'),
-    )
+    gcs_client = get_gcs_client()
+    bucket = gcs_client.bucket(GCS_BUCKET)
 
-    print(f"  Bucket: {S3_BUCKET}")
-    print(f"  Key: {s3_key}")
+    print(f"  Bucket: {GCS_BUCKET}")
+    print(f"  Key: {gcs_key}")
     print(f"  Local file: {local_path}")
 
     try:
-        s3_client.upload_file(local_path, S3_BUCKET, s3_key)
-        print(f"  PASS: Uploaded to S3")
+        blob = bucket.blob(gcs_key)
+        blob.upload_from_filename(local_path)
+        print(f"  PASS: Uploaded to GCS")
         return True
     except Exception as e:
         print(f"  ERROR: Failed to upload: {e}")
         return False
 
 
-def step_5_download_from_s3(s3_key: str) -> bytes:
-    """Step 5: Download VTT from S3 (mirrors storage.download_file with fetch_contents=True)"""
+def step_5_download_from_gcs(gcs_key: str) -> bytes:
+    """Step 5: Download VTT from GCS (mirrors storage.download_file with fetch_contents=True)"""
     print("\n" + "=" * 60)
-    print("STEP 5: Download VTT from S3")
+    print("STEP 5: Download VTT from GCS")
     print("=" * 60)
 
-    s3_client = boto3.client(
-        's3',
-        region_name=os.environ.get('AWS_REGION', 'us-east-1'),
-    )
+    gcs_client = get_gcs_client()
+    bucket = gcs_client.bucket(GCS_BUCKET)
 
-    print(f"  Bucket: {S3_BUCKET}")
-    print(f"  Key: {s3_key}")
+    print(f"  Bucket: {GCS_BUCKET}")
+    print(f"  Key: {gcs_key}")
 
     try:
-        response = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
-        content = response['Body'].read()
+        blob = bucket.blob(gcs_key)
+        content = blob.download_as_bytes()
         print(f"  PASS: Downloaded {len(content)} bytes")
         return content
     except Exception as e:
@@ -316,12 +323,10 @@ def step_6_api_check(content: bytes) -> bool:
     print("STEP 6: API Response Check")
     print("=" * 60)
 
-    # EXACT code from api/routes/files.py line 96-97
     if not content:
         print(f"  RESULT: API would return 404 (content is None/empty)")
         return False
 
-    # In Python, empty bytes b'' is falsy!
     if content == b'':
         print(f"  RESULT: API would return 404 (content is empty bytes)")
         print(f"  NOTE: 'if not content' evaluates to True for empty bytes!")
@@ -331,20 +336,19 @@ def step_6_api_check(content: bytes) -> bool:
     return True
 
 
-def cleanup_s3(s3_key: str):
-    """Cleanup test file from S3"""
+def cleanup_gcs(gcs_key: str):
+    """Cleanup test file from GCS"""
     print("\n" + "=" * 60)
-    print("CLEANUP: Removing test file from S3")
+    print("CLEANUP: Removing test file from GCS")
     print("=" * 60)
 
-    s3_client = boto3.client(
-        's3',
-        region_name=os.environ.get('AWS_REGION', 'us-east-1'),
-    )
+    gcs_client = get_gcs_client()
+    bucket = gcs_client.bucket(GCS_BUCKET)
 
     try:
-        s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
-        print(f"  Deleted: {s3_key}")
+        blob = bucket.blob(gcs_key)
+        blob.delete()
+        print(f"  Deleted: {gcs_key}")
     except Exception as e:
         print(f"  Warning: Failed to cleanup: {e}")
 
@@ -359,19 +363,19 @@ if __name__ == "__main__":
         print(f"ERROR: Test video not found: {TEST_VIDEO}")
         sys.exit(1)
 
-    if not os.environ.get('GOOGLE_API_KEY'):
-        print("ERROR: GOOGLE_API_KEY not set")
+    if not os.environ.get('GCS_PROJECT_ID'):
+        print("ERROR: GCS_PROJECT_ID not set")
         sys.exit(1)
 
-    if not os.environ.get('AWS_ACCESS_KEY_ID'):
-        print("ERROR: AWS credentials not set")
+    if not os.environ.get('GCS_BUCKET'):
+        print("ERROR: GCS_BUCKET not set")
         sys.exit(1)
 
     # Create temp directory
     tmp_dir = tempfile.mkdtemp(prefix='vigenair_test_')
     print(f"\nTemp directory: {tmp_dir}")
 
-    s3_vtt_key = f"{TEST_FOLDER}/input.vtt"
+    gcs_vtt_key = f"{TEST_FOLDER}/input.vtt"
 
     try:
         # Step 1: Extract audio
@@ -385,12 +389,12 @@ if __name__ == "__main__":
         # Step 3: Write VTT file
         vtt_path = step_3_write_vtt_file(audio_path, vtt_content)
 
-        # Step 4: Upload to S3
-        if not step_4_upload_to_s3(vtt_path, s3_vtt_key):
+        # Step 4: Upload to GCS
+        if not step_4_upload_to_gcs(vtt_path, gcs_vtt_key):
             sys.exit(1)
 
-        # Step 5: Download from S3
-        content = step_5_download_from_s3(s3_vtt_key)
+        # Step 5: Download from GCS
+        content = step_5_download_from_gcs(gcs_vtt_key)
 
         # Step 6: API check
         api_ok = step_6_api_check(content)
@@ -404,8 +408,8 @@ if __name__ == "__main__":
         print(f"  Language detected: {language}")
         print(f"  VTT content generated: {'YES' if vtt_content else 'NO'}")
         print(f"  VTT file size: {os.path.getsize(vtt_path)} bytes")
-        print(f"  S3 upload: SUCCESS")
-        print(f"  S3 download: {len(content) if content else 0} bytes")
+        print(f"  GCS upload: SUCCESS")
+        print(f"  GCS download: {len(content) if content else 0} bytes")
         print(f"  API would return: {'200 OK' if api_ok else '404 NOT FOUND'}")
 
         if not api_ok:
@@ -415,7 +419,7 @@ if __name__ == "__main__":
 
     finally:
         # Cleanup
-        cleanup_s3(s3_vtt_key)
+        cleanup_gcs(gcs_vtt_key)
 
         # Keep temp dir for inspection
         print(f"\n  Temp files kept at: {tmp_dir}")

@@ -16,7 +16,9 @@ from dotenv import load_dotenv
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
+from google.cloud import storage as gcs_storage
 import pandas as pd
 
 # Test files
@@ -57,6 +59,27 @@ RULES:
 IMPROVED_PATTERN = r'Language[:\s]+([^\n]+)\n[\s\S]*?Confidence[:\s]+([^\n]+)\n[\s\S]*?```csv\n([\s\S]*?)```[\s\S]*?```vtt\n([\s\S]*?)```'
 
 
+def get_client():
+    """Get Vertex AI genai client."""
+    return genai.Client(
+        vertexai=True,
+        project=os.environ.get('GCS_PROJECT_ID'),
+        location=os.environ.get('GCS_LOCATION', 'us-central1'),
+    )
+
+
+def upload_audio_to_gcs(audio_path: str) -> tuple:
+    """Upload audio to GCS and return (gs_uri, blob)."""
+    gcs_client = gcs_storage.Client()
+    bucket_name = os.environ.get('GCS_BUCKET')
+    bucket = gcs_client.bucket(bucket_name)
+    temp_key = f"_test_temp/pipeline_audio_{int(time.time())}.wav"
+    blob = bucket.blob(temp_key)
+    blob.upload_from_filename(audio_path, content_type='audio/wav')
+    gs_uri = f"gs://{bucket_name}/{temp_key}"
+    return gs_uri, blob
+
+
 def extract_audio():
     """Extract audio from video."""
     print("Extracting audio from video...")
@@ -79,33 +102,37 @@ def extract_audio():
 
 
 def transcribe_audio(prompt: str, model_name: str = 'gemini-2.5-flash'):
-    """Run transcription with Gemini."""
+    """Run transcription with Gemini via Vertex AI."""
     print(f"\nTranscribing with {model_name}...")
 
-    genai.configure(api_key=os.environ.get('GOOGLE_API_KEY'))
+    client = get_client()
 
-    # Upload
-    audio_file = genai.upload_file(TEST_AUDIO, mime_type='audio/wav')
-    print(f"  Uploaded: {audio_file.name}")
+    # Upload audio to GCS
+    print("  Uploading audio to GCS...")
+    gs_uri, blob = upload_audio_to_gcs(TEST_AUDIO)
+    print(f"  Uploaded: {gs_uri}")
 
-    # Wait for processing
-    while audio_file.state.name == 'PROCESSING':
-        time.sleep(2)
-        audio_file = genai.get_file(audio_file.name)
-
-    if audio_file.state.name == 'FAILED':
-        print("  FAIL: Processing failed")
+    try:
+        # Generate transcription using gs:// URI
+        audio_part = types.Part.from_uri(file_uri=gs_uri, mime_type='audio/wav')
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[audio_part, prompt],
+            config=types.GenerateContentConfig(
+                max_output_tokens=8192,
+                temperature=0.1,
+            ),
+        )
+    except Exception as e:
+        print(f"  FAIL: API error: {e}")
+        blob.delete()
         return None
 
-    # Generate
-    model = genai.GenerativeModel(model_name)
-    response = model.generate_content(
-        [audio_file, prompt],
-        generation_config={'max_output_tokens': 8192, 'temperature': 0.1}
-    )
-
-    # Cleanup
-    genai.delete_file(audio_file.name)
+    # Cleanup GCS temp file
+    try:
+        blob.delete()
+    except:
+        pass
 
     if response.candidates and response.candidates[0].content.parts:
         text = response.candidates[0].content.parts[0].text
@@ -246,8 +273,8 @@ if __name__ == "__main__":
         print(f"FAIL: Test video not found: {TEST_VIDEO}")
         sys.exit(1)
 
-    if not os.environ.get('GOOGLE_API_KEY'):
-        print("FAIL: GOOGLE_API_KEY not set")
+    if not os.environ.get('GCS_PROJECT_ID'):
+        print("FAIL: GCS_PROJECT_ID not set")
         sys.exit(1)
 
     # Extract audio

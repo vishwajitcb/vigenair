@@ -125,7 +125,7 @@ def _render_variants_background(folder: str, render_data: dict):
             progress=0
         )
 
-        bucket = os.environ.get("S3_BUCKET")
+        bucket = os.environ.get("GCS_BUCKET")
 
         # Transform variants to combiner format
         variants = render_data.get("variants", [])

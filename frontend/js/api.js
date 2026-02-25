@@ -106,24 +106,45 @@ class ApiClient {
         return await response.json();
     }
 
-    async initiateMultipartUpload(filename, fileSize, contentType, analyzeAudio, userId = 'anonymous') {
+    async initiateResumableUpload(filename, fileSize, contentType, analyzeAudio, userId = 'anonymous') {
         return this.request('/videos/upload/initiate', {
             method: 'POST',
             body: JSON.stringify({ filename, fileSize, contentType, analyzeAudio, userId }),
         });
     }
 
-    async completeMultipartUpload(uploadId, folder, s3Key, parts) {
+    async completeResumableUpload(folder, objectKey) {
         return this.request('/videos/upload/complete', {
             method: 'POST',
-            body: JSON.stringify({ uploadId, folder, s3Key, parts }),
+            body: JSON.stringify({ folder, objectKey }),
         });
     }
 
-    async abortMultipartUpload(uploadId, folder, s3Key) {
+    async abortResumableUpload(folder, objectKey) {
         return this.request('/videos/upload/abort', {
             method: 'POST',
-            body: JSON.stringify({ uploadId, folder, s3Key }),
+            body: JSON.stringify({ folder, objectKey }),
+        });
+    }
+
+    async initiateParallelUpload(filename, fileSize, contentType, analyzeAudio, numParts, userId = 'anonymous') {
+        return this.request('/videos/upload/initiate-parallel', {
+            method: 'POST',
+            body: JSON.stringify({ filename, fileSize, contentType, analyzeAudio, numParts, userId }),
+        });
+    }
+
+    async completeParallelUpload(folder, objectKey, numParts) {
+        return this.request('/videos/upload/complete-parallel', {
+            method: 'POST',
+            body: JSON.stringify({ folder, objectKey, numParts }),
+        });
+    }
+
+    async abortParallelUpload(folder, objectKey, numParts) {
+        return this.request('/videos/upload/abort', {
+            method: 'POST',
+            body: JSON.stringify({ folder, objectKey, numParts }),
         });
     }
 

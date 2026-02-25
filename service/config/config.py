@@ -15,24 +15,20 @@
 """Vigenair config.
 
 This module contains all configuration constants and runtime variables used by
-Vigenair. Updated to use Google AI Studio SDK instead of Vertex AI.
+Vigenair. Uses Vertex AI via google-genai SDK for Gemini calls.
 """
 
 import os
 
 import torch
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
-# Google AI Studio API Key (replaces GCP project-based auth)
-GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY', '')
+# GCS Configuration
+GCS_BUCKET = os.environ.get('GCS_BUCKET', '')
+GCS_PROJECT_ID = os.environ.get('GCS_PROJECT_ID', '')
+GCS_LOCATION = os.environ.get('GCS_LOCATION', 'us-central1')
 
-# AWS/S3 Configuration (replaces GCS)
-S3_BUCKET = os.environ.get('S3_BUCKET', '')
-AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
-
-# Legacy GCP variables (kept for backward compatibility during migration)
-GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID', 'my-gcp-project')
-GCP_LOCATION = os.environ.get('GCP_LOCATION', 'us-central1')
+# Gemini API location (Gemini 3 models require 'global')
+GEMINI_LOCATION = os.environ.get('GEMINI_LOCATION', 'global')
 
 # Model Configuration
 CONFIG_TEXT_MODEL = os.environ.get('CONFIG_TEXT_MODEL', 'gemini-3-flash-preview')
@@ -71,13 +67,29 @@ USER_AGENT_ID = f'cloud-solutions/mas-vigenair-backend-{CONFIG_BACKEND_VERSION}'
 # https://en.wikipedia.org/wiki/Fade_(audio_engineering)#:~:text=Appropriate%20fade%2Din%20time,10ms.%5B14%5D
 CONFIG_DEFAULT_FADE_OUT_BUFFER = 0.1
 
-# Safety configuration for Google AI Studio (updated from Vertex AI)
-CONFIG_DEFAULT_SAFETY_CONFIG = {
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-}
+# Safety configuration for google-genai SDK (string-keyed dicts)
+CONFIG_DEFAULT_SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"},
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
+]
+
+# GenAI client singleton
+_genai_client = None
+
+def get_genai_client():
+    """Get or create the google-genai Client singleton (Vertex AI mode)."""
+    global _genai_client
+    if _genai_client is None:
+        from google import genai
+        _genai_client = genai.Client(
+            vertexai=True,
+            project=GCS_PROJECT_ID,
+            location=GEMINI_LOCATION,
+        )
+    return _genai_client
+
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 INPUT_FILENAME = 'input'
@@ -112,9 +124,8 @@ OUTPUT_AV_SEGMENTS_DIR = 'av_segments_cuts'
 OUTPUT_ANALYSIS_CHUNKS_DIR = 'analysis_chunks'
 OUTPUT_COMBINATION_ASSETS_DIR = 'assets'
 
-# S3 Base URL (replaces GCS_BASE_URL)
-S3_BASE_URL = f'https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com' if S3_BUCKET else ''
-GCS_BASE_URL = S3_BASE_URL  # Backward compatibility alias
+# GCS Base URL for public access
+GCS_BASE_URL = f'https://storage.googleapis.com/{GCS_BUCKET}' if GCS_BUCKET else ''
 
 SEGMENT_SCREENSHOT_EXT = '.jpg'
 SEGMENT_ANNOTATIONS_PATTERN = '(.*Description:\n?)?(.*)\n*Keywords:\n?(.*)'

@@ -24,10 +24,12 @@ from unittest import mock
 sys.modules['config'] = mock.MagicMock()
 sys.modules['storage'] = mock.MagicMock()
 sys.modules['utils'] = mock.MagicMock()
-# Mock Google AI Studio SDK (replaces vertexai)
+# Mock google-genai SDK and google-cloud-storage
 sys.modules['google'] = mock.MagicMock()
-sys.modules['google.generativeai'] = mock.MagicMock()
-sys.modules['google.generativeai.types'] = mock.MagicMock()
+sys.modules['google.genai'] = mock.MagicMock()
+sys.modules['google.genai.types'] = mock.MagicMock()
+sys.modules['google.cloud'] = mock.MagicMock()
+sys.modules['google.cloud.storage'] = mock.MagicMock()
 sys.modules['pandas'] = mock.MagicMock()
 
 # Add project root to sys.path
@@ -44,17 +46,16 @@ class CombinerTest(unittest.TestCase):
     self.mock_storage = sys.modules['storage']
     self.mock_utils = sys.modules['utils']
     self.mock_config = sys.modules['config']
-    self.mock_genai = sys.modules['google.generativeai']
 
     # Reset mocks to ensure test isolation
     self.mock_storage.reset_mock()
     self.mock_utils.reset_mock()
     self.mock_config.reset_mock()
-    self.mock_genai.reset_mock()
 
     # Setup common config mocks
-    self.mock_config.GOOGLE_API_KEY = 'test-api-key'
-    self.mock_config.S3_BUCKET = 'test-bucket'
+    self.mock_config.GCS_BUCKET = 'test-bucket'
+    self.mock_config.GCS_PROJECT_ID = 'test-project'
+    self.mock_config.GCS_LOCATION = 'us-central1'
     self.mock_config.CONFIG_TEXT_MODEL = 'text-model'
     self.mock_config.CONFIG_VISION_MODEL = 'vision-model'
     self.mock_config.OUTPUT_COMBINATIONS_FILE = 'combos.json'
@@ -68,8 +69,11 @@ class CombinerTest(unittest.TestCase):
     self.mock_config.CONFIG_DEFAULT_FADE_OUT_BUFFER = 0.5
     self.mock_config.FFMPEG_SQUARE_BLUR_FILTER = 'boxblur'
     self.mock_config.FFMPEG_VERTICAL_BLUR_FILTER = 'boxblur'
-    self.mock_config.S3_BASE_URL = 'https://test-bucket.s3.us-east-1.amazonaws.com'
-    self.mock_config.GCS_BASE_URL = self.mock_config.S3_BASE_URL  # Backward compat alias
+    self.mock_config.GCS_BASE_URL = 'https://storage.googleapis.com/test-bucket'
+
+    # Mock get_genai_client
+    mock_client = mock.MagicMock()
+    self.mock_config.get_genai_client.return_value = mock_client
 
   def _get_mock_variant_json_bytes(self):
     """Returns a byte string representing a list containing one valid VideoVariant."""
@@ -324,8 +328,9 @@ class CombinerTest(unittest.TestCase):
     mock_part.text = 'Headline: H1\nDescription: D1'
     mock_response.candidates = [mock.Mock(content=mock.Mock(parts=[mock_part]))]
 
-    mock_vision_model = mock.Mock()
-    mock_vision_model.generate_content.return_value = mock_response
+    mock_client = mock.MagicMock()
+    mock_client.models.generate_content.return_value = mock_response
+    self.mock_config.get_genai_client.return_value = mock_client
 
     # Configure pandas mock to return expected data
     mock_pandas = sys.modules['pandas']
@@ -334,7 +339,7 @@ class CombinerTest(unittest.TestCase):
     mock_df.to_dict.return_value = [{'headline': 'H1', 'description': 'D1'}]
 
     assets = combiner._generate_text_assets(
-        mock_vision_model, 'gs://video', 'en', mock.Mock(variant_id=1)
+        'vision-model', 'gs://video', 'en', mock.Mock(variant_id=1)
     )
 
     self.assertEqual(len(assets), 1)

@@ -26,10 +26,21 @@ sys.path.insert(0, SERVICE_DIR)
 from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
+from google.cloud import storage as gcs_storage
 
 # Test audio file
 TEST_AUDIO = "/tmp/test_extracted_audio.wav"
+
+
+def get_client():
+    """Get Vertex AI genai client."""
+    return genai.Client(
+        vertexai=True,
+        project=os.environ.get('GCS_PROJECT_ID'),
+        location=os.environ.get('GCS_LOCATION', 'us-central1'),
+    )
 
 
 def simple_task(x):
@@ -106,24 +117,31 @@ def do_transcription(audio_path):
         print(f"      [DoTranscription] Audio file not found!")
         return None
 
-    genai.configure(api_key=os.environ.get('GOOGLE_API_KEY'))
+    client = get_client()
+    gcs_client = gcs_storage.Client()
+    bucket_name = os.environ.get('GCS_BUCKET')
+    bucket = gcs_client.bucket(bucket_name)
 
-    # Upload and transcribe (simplified)
-    audio_file = genai.upload_file(audio_path, mime_type='audio/wav')
-    print(f"      [DoTranscription] Uploaded: {audio_file.name}")
+    # Upload audio to GCS
+    temp_key = f"_test_temp/executor_test_{int(time.time())}.wav"
+    blob = bucket.blob(temp_key)
+    blob.upload_from_filename(audio_path, content_type='audio/wav')
+    gs_uri = f"gs://{bucket_name}/{temp_key}"
+    print(f"      [DoTranscription] Uploaded: {gs_uri}")
 
-    # Wait for processing
-    while audio_file.state.name == 'PROCESSING':
-        time.sleep(1)
-        audio_file = genai.get_file(audio_file.name)
-
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    response = model.generate_content(
-        [audio_file, "What language is spoken in this audio? Reply with just the language name."],
-        generation_config={'max_output_tokens': 100}
-    )
-
-    genai.delete_file(audio_file.name)
+    try:
+        audio_part = types.Part.from_uri(file_uri=gs_uri, mime_type='audio/wav')
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[audio_part, "What language is spoken in this audio? Reply with just the language name."],
+            config=types.GenerateContentConfig(max_output_tokens=100),
+        )
+    finally:
+        # Cleanup
+        try:
+            blob.delete()
+        except:
+            pass
 
     if response.candidates:
         result = response.candidates[0].content.parts[0].text

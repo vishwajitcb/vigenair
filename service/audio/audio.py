@@ -15,7 +15,7 @@
 """Vigenair audio service.
 
 This module contains functions to extract, split and transcribe audio files.
-Uses Gemini for transcription.
+Uses Gemini for transcription via gs:// URIs.
 """
 
 import datetime
@@ -29,7 +29,6 @@ import time
 from typing import Optional, Sequence, Tuple
 
 import config as ConfigService
-import google.generativeai as genai
 import pandas as pd
 import utils as Utils
 
@@ -276,25 +275,31 @@ def transcribe_audio(
 ) -> Tuple[pd.DataFrame, str, float]:
   """Transcribes an audio file using Gemini and returns the transcription.
 
+  Uploads the local audio file to GCS, uses gs:// URI with Vertex AI Gemini,
+  then cleans up the temp GCS file.
+
   Args:
     output_dir: Directory where the transcription will be saved.
     audio_file_path: Path to the audio file that will be transcribed.
-    gcs_folder: The S3 folder (kept for backward compatibility).
-    gcs_bucket_name: The S3 bucket (kept for backward compatibility).
+    gcs_folder: The GCS folder for temporary uploads.
+    gcs_bucket_name: The GCS bucket name.
 
   Returns:
     A tuple of (transcription dataframe, detected language, confidence).
   """
   import json
-  import typing_extensions as typing
+  import storage as StorageService
+  from google.genai import types
 
   transcription_dataframe = pd.DataFrame()
   video_language = ConfigService.DEFAULT_VIDEO_LANGUAGE
   language_probability = 0.0
   subtitles_content = ''
-  audio_file = None
+  temp_gcs_key = None
 
   # Define structured output schema
+  import typing_extensions as typing
+
   class TranscriptionSegment(typing.TypedDict):
     start: str
     end: str
@@ -305,11 +310,7 @@ def transcribe_audio(
     confidence: float
     segments: list[TranscriptionSegment]
 
-  # Initialize Google AI Studio SDK
-  genai.configure(api_key=ConfigService.GOOGLE_API_KEY)
-  transcription_model = genai.GenerativeModel(
-      ConfigService.CONFIG_TRANSCRIPTION_MODEL_GEMINI
-  )
+  client = ConfigService.get_genai_client()
 
   try:
     # Get audio duration to determine expected minimum segments
@@ -321,14 +322,19 @@ def transcribe_audio(
         audio_duration, min_expected_segments
     )
 
-    # Upload audio file to Gemini Files API
-    audio_file = genai.upload_file(audio_file_path, mime_type='audio/wav')
-    # Wait for file to be ready
-    while audio_file.state.name == 'PROCESSING':
-      time.sleep(2)
-      audio_file = genai.get_file(audio_file.name)
-    if audio_file.state.name == 'FAILED':
-      raise ValueError(f'Audio processing failed: {audio_file.state.name}')
+    # Upload audio to GCS as temp file, then use gs:// URI
+    audio_filename = os.path.basename(audio_file_path)
+    temp_gcs_key = f'{gcs_folder}/_temp_audio_{audio_filename}'
+    StorageService.upload_file(
+        file_path=audio_file_path,
+        destination_file_name=temp_gcs_key,
+        bucket_name=gcs_bucket_name,
+        overwrite=True,
+    )
+    gs_uri = StorageService.get_gs_uri(temp_gcs_key)
+    logging.info('TRANSCRIPTION - Uploaded audio to GCS: %s', gs_uri)
+
+    audio_part = types.Part.from_uri(file_uri=gs_uri, mime_type='audio/wav')
 
     # Retry logic for insufficient segmentation
     max_retries = 3
@@ -339,16 +345,16 @@ def transcribe_audio(
     for attempt in range(max_retries):
       logging.info('TRANSCRIPTION - Attempt %d/%d', attempt + 1, max_retries)
 
-      # Use structured output with JSON schema
-      response = transcription_model.generate_content(
-          [audio_file, ConfigService.TRANSCRIBE_AUDIO_PROMPT_JSON],
-          generation_config={
-              'response_mime_type': 'application/json',
-              'response_schema': TranscriptionResponse,
-              'temperature': 0.1,  # Lower temperature for more consistent output
-              'max_output_tokens': 65536,  # Max tokens for gemini-3-flash
-          },
-          safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
+      response = client.models.generate_content(
+          model=ConfigService.CONFIG_TRANSCRIPTION_MODEL_GEMINI,
+          contents=[audio_part, ConfigService.TRANSCRIBE_AUDIO_PROMPT_JSON],
+          config=types.GenerateContentConfig(
+              response_mime_type='application/json',
+              response_schema=TranscriptionResponse,
+              temperature=0.1,
+              max_output_tokens=65536,
+              safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_SETTINGS,
+          ),
       )
 
       if response.candidates and response.candidates[0].content.parts:
@@ -438,14 +444,14 @@ def transcribe_audio(
         'Returning empty transcription...'
     )
   finally:
-    # Clean up uploaded file from Gemini to prevent quota exhaustion
-    if audio_file:
+    # Clean up temporary GCS file
+    if temp_gcs_key:
       try:
-        genai.delete_file(audio_file.name)
-        logging.info('TRANSCRIPTION - Cleaned up Gemini file: %s', audio_file.name)
+        StorageService.delete_file(temp_gcs_key, bucket_name=gcs_bucket_name)
+        logging.info('TRANSCRIPTION - Cleaned up temp GCS file: %s', temp_gcs_key)
       except Exception as cleanup_error:
         logging.warning(
-            'TRANSCRIPTION - Failed to clean up Gemini file: %s',
+            'TRANSCRIPTION - Failed to clean up temp GCS file: %s',
             cleanup_error
         )
 

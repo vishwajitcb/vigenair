@@ -37,7 +37,6 @@ import audio as AudioService
 import config as ConfigService
 import extractor.audio_extractor as AudioExtractor
 import extractor.video_extractor as VideoExtractor
-import google.generativeai as genai
 import pandas as pd
 import storage as StorageService
 import utils as Utils
@@ -45,35 +44,42 @@ import video as VideoService
 
 
 def gemini_generate_with_retry(
-    model,
+    model_name,
     content,
     generation_config,
-    safety_settings,
+    safety_settings=None,
     max_retries: int = 3,
     retry_delay: float = 2.0,
 ):
   """Call Gemini generate_content with retry logic.
 
   Args:
-    model: The Gemini model instance.
-    content: The content to send (can be list with files and prompts).
+    model_name: The Gemini model name string.
+    content: The content to send (can be list with parts and prompts).
     generation_config: Generation config dict.
-    safety_settings: Safety settings for the model.
+    safety_settings: Safety settings list (optional).
     max_retries: Maximum number of retry attempts.
     retry_delay: Base delay between retries (uses exponential backoff).
 
   Returns:
     The Gemini response object, or None if all retries failed.
   """
+  from google.genai import types
+
+  client = ConfigService.get_genai_client()
   last_error = None
+
+  config_kwargs = dict(generation_config)
+  if safety_settings:
+    config_kwargs['safety_settings'] = safety_settings
 
   for attempt in range(max_retries):
     try:
       logging.info(f'Gemini API call attempt {attempt + 1}/{max_retries}')
-      response = model.generate_content(
-          content,
-          generation_config=generation_config,
-          safety_settings=safety_settings,
+      response = client.models.generate_content(
+          model=model_name,
+          contents=content,
+          config=types.GenerateContentConfig(**config_kwargs),
       )
       # Check if we got a valid response
       if (
@@ -99,92 +105,41 @@ def gemini_generate_with_retry(
   return None
 
 
-def gemini_upload_file_with_retry(
+def upload_to_gcs_for_gemini(
     file_path: str,
+    gcs_folder: str,
+    bucket_name: str,
     mime_type: str = 'video/mp4',
-    max_retries: int = 3,
-    retry_delay: float = 2.0,
-    wait_for_processing: bool = True,
 ):
-  """Upload file to Gemini Files API with retry logic and proper error handling.
+  """Upload a local file to GCS and return a Part.from_uri for Gemini.
 
   Args:
     file_path: Path to the local file to upload.
+    gcs_folder: GCS folder for the temporary upload.
+    bucket_name: GCS bucket name.
     mime_type: MIME type of the file.
-    max_retries: Maximum number of retry attempts.
-    retry_delay: Base delay between retries (uses exponential backoff).
-    wait_for_processing: Whether to wait for file processing to complete.
 
   Returns:
-    The Gemini file object, or None if all retries failed.
+    A google.genai.types.Part for use with Gemini, or None on failure.
   """
-  last_error = None
+  from google.genai import types
 
-  for attempt in range(max_retries):
-    video_file = None
-    try:
-      logging.info(
-          f'GEMINI_UPLOAD - Attempt {attempt + 1}/{max_retries} for {file_path}'
-      )
-
-      # Force garbage collection before upload to free memory
-      gc.collect()
-
-      # Upload the file
-      video_file = genai.upload_file(file_path, mime_type=mime_type)
-      logging.info(
-          f'GEMINI_UPLOAD - File uploaded successfully: {video_file.name}'
-      )
-
-      if wait_for_processing:
-        # Wait for file to be ready with timeout
-        max_wait_time = 120  # 2 minutes max wait
-        wait_start = time.time()
-        while video_file.state.name == 'PROCESSING':
-          if time.time() - wait_start > max_wait_time:
-            raise TimeoutError(
-                f'File processing timed out after {max_wait_time}s'
-            )
-          time.sleep(2)
-          video_file = genai.get_file(video_file.name)
-
-        if video_file.state.name == 'FAILED':
-          raise ValueError(f'Video processing failed: {video_file.state.name}')
-
-      logging.info(
-          f'GEMINI_UPLOAD - File ready: {video_file.name}, state: {video_file.state.name}'
-      )
-      return video_file
-
-    except Exception as e:
-      last_error = str(e)
-      error_type = type(e).__name__
-      logging.warning(
-          f'GEMINI_UPLOAD - Attempt {attempt + 1} failed ({error_type}): {last_error}'
-      )
-      logging.warning(f'GEMINI_UPLOAD - Traceback: {traceback.format_exc()}')
-
-      # Try to clean up the uploaded file if it exists
-      if video_file is not None:
-        try:
-          genai.delete_file(video_file.name)
-          logging.info(f'GEMINI_UPLOAD - Cleaned up failed upload: {video_file.name}')
-        except Exception:
-          pass  # Ignore cleanup errors
-
-      # Wait before retry (exponential backoff)
-      if attempt < max_retries - 1:
-        sleep_time = retry_delay * (2 ** attempt)
-        logging.info(f'GEMINI_UPLOAD - Waiting {sleep_time}s before retry...')
-        time.sleep(sleep_time)
-        # Force garbage collection between retries
-        gc.collect()
-
-  logging.error(
-      f'GEMINI_UPLOAD - All {max_retries} attempts failed for {file_path}. '
-      f'Last error: {last_error}'
-  )
-  return None
+  try:
+    filename = os.path.basename(file_path)
+    temp_gcs_key = f'{gcs_folder}/_temp_{filename}'
+    StorageService.upload_file(
+        file_path=file_path,
+        destination_file_name=temp_gcs_key,
+        bucket_name=bucket_name,
+        overwrite=True,
+    )
+    gs_uri = StorageService.get_gs_uri(temp_gcs_key)
+    logging.info(f'GCS_UPLOAD - Uploaded {file_path} to {gs_uri}')
+    return types.Part.from_uri(file_uri=gs_uri, mime_type=mime_type), temp_gcs_key
+  except Exception as e:
+    logging.error(f'GCS_UPLOAD - Failed to upload {file_path}: {e}')
+    logging.warning(f'GCS_UPLOAD - Traceback: {traceback.format_exc()}')
+    return None, None
 
 
 def log_memory_usage(context: str = ''):
@@ -241,19 +196,11 @@ class Extractor:
     self.gcs_bucket_name = gcs_bucket_name
     self.media_file = media_file
 
-    # Validate and initialize Google AI Studio SDK
-    api_key = ConfigService.GOOGLE_API_KEY
-    if not api_key:
-      raise ValueError(
-          "GOOGLE_API_KEY environment variable is not set. "
-          "Please configure it before running the extractor."
-      )
-
-    genai.configure(api_key=api_key)
-    self.vision_model = genai.GenerativeModel(ConfigService.CONFIG_VISION_MODEL)
+    # Initialize google-genai client (Vertex AI)
+    self.vision_model_name = ConfigService.CONFIG_VISION_MODEL
     logging.info(
         'EXTRACTOR - Initialized with model: %s',
-        ConfigService.CONFIG_VISION_MODEL
+        self.vision_model_name
     )
 
   def initial_extract(self):
@@ -343,7 +290,6 @@ class Extractor:
         logging.info('EXTRACTOR - Restored converted mp4 for processing')
 
     # Run audio and video processing in parallel using ThreadPoolExecutor
-    # This is safe with boto3 (threads share memory, no fork issues)
     # Provides ~2-4 min time savings depending on video length
     logging.info('EXTRACTOR - Starting parallel audio and video processing...')
 
@@ -741,7 +687,7 @@ class Extractor:
               row=row,
               video_file_path=video_file_path,
               cuts_path=cuts_path,
-              vision_model=self.vision_model,
+              vision_model_name=self.vision_model_name,
               s3_cut_path=(
                   f'{s3_cuts_folder_path}/'
                   f"{row['av_segment_id'].replace('.0', '')}{video_ext}"
@@ -765,9 +711,9 @@ class Extractor:
           descriptions[index] = ''
           keywords[index] = ''
 
-        # Build S3 URL for the segment resources
+        # Build GCS URL for the segment resources
         resources_base_path = (
-            f'{ConfigService.S3_BASE_URL}/'
+            f'{ConfigService.GCS_BASE_URL}/'
             f'{parse.quote(self.media_file.gcs_root_folder)}/'
             f'{ConfigService.OUTPUT_AV_SEGMENTS_DIR}/'
             f"{optimised_av_segments.loc[index, 'av_segment_id'].replace('.0', '')}"
@@ -819,35 +765,16 @@ class Extractor:
     ])
     rows = []
     try:
-      # Download video from S3 if it's an S3 path, otherwise use local path
-      local_video_path = video_file_path
-      if not os.path.exists(video_file_path):
-        # It's an S3 key, download it
-        tmp_dir = tempfile.mkdtemp()
-        local_video_path = StorageService.download_file(
-            file_path=Utils.TriggerFile(video_file_path),
-            output_dir=tmp_dir,
-            bucket_name=self.gcs_bucket_name,
-        )
-
-      # Upload to Gemini Files API with retry logic
-      video_file = gemini_upload_file_with_retry(
-          file_path=local_video_path,
-          mime_type='video/mp4',
-          max_retries=3,
-          wait_for_processing=True,
-      )
-      if video_file is None:
-        logging.warning(
-            'ANNOTATION - Could not upload video for enhancement, skipping'
-        )
-        return optimised_av_segments
+      # Get gs:// URI for direct Gemini access
+      gs_uri = StorageService.get_gs_uri(video_file_path)
+      from google.genai import types
+      video_part = types.Part.from_uri(file_uri=gs_uri, mime_type='video/mp4')
 
       response = gemini_generate_with_retry(
-          model=self.vision_model,
-          content=[video_file, prompt],
+          model_name=self.vision_model_name,
+          content=[video_part, prompt],
           generation_config=ConfigService.ENHANCE_SEGMENT_ANNOTATIONS_CONFIG,
-          safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
+          safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_SETTINGS,
       )
       if response:
         text = response.candidates[0].content.parts[0].text
@@ -1052,7 +979,7 @@ def _cut_and_annotate_av_segment_with_retry(
     row: pd.Series,
     video_file_path: str,
     cuts_path: str,
-    vision_model,
+    vision_model_name: str,
     s3_cut_path: str,
     bucket_name: str,
     max_retries: int = 2,
@@ -1063,9 +990,9 @@ def _cut_and_annotate_av_segment_with_retry(
     row: The A/V segment data as a row in a DataFrame.
     video_file_path: Path to the input video file.
     cuts_path: The local directory to store the A/V segment cuts.
-    vision_model: The Gemini model to generate the A/V segment descriptions.
-    s3_cut_path: The path to store the A/V segment cut in S3.
-    bucket_name: The S3 bucket name to store the A/V segment cut.
+    vision_model_name: The Gemini model name string.
+    s3_cut_path: The path to store the A/V segment cut in GCS.
+    bucket_name: The GCS bucket name to store the A/V segment cut.
     max_retries: Maximum number of retry attempts for the entire process.
 
   Returns:
@@ -1083,7 +1010,7 @@ def _cut_and_annotate_av_segment_with_retry(
           row=row,
           video_file_path=video_file_path,
           cuts_path=cuts_path,
-          vision_model=vision_model,
+          vision_model_name=vision_model_name,
           s3_cut_path=s3_cut_path,
           bucket_name=bucket_name,
       )
@@ -1118,7 +1045,7 @@ def _cut_and_annotate_av_segment(
     row: pd.Series,
     video_file_path: str,
     cuts_path: str,
-    vision_model,
+    vision_model_name: str,
     s3_cut_path: str,
     bucket_name: str,
 ) -> Tuple[str, str]:
@@ -1128,9 +1055,9 @@ def _cut_and_annotate_av_segment(
     row: The A/V segment data as a row in a DataFrame.
     video_file_path: Path to the input video file.
     cuts_path: The local directory to store the A/V segment cuts.
-    vision_model: The Gemini model to generate the A/V segment descriptions.
-    s3_cut_path: The path to store the A/V segment cut in S3.
-    bucket_name: The S3 bucket name to store the A/V segment cut.
+    vision_model_name: The Gemini model name string.
+    s3_cut_path: The path to store the A/V segment cut in GCS.
+    bucket_name: The GCS bucket name to store the A/V segment cut.
 
   Returns:
     A tuple of the A/V segment description and keywords.
@@ -1204,26 +1131,17 @@ def _cut_and_annotate_av_segment(
   )
   description = ''
   keywords = ''
-  video_file = None
   try:
-    # Upload to Gemini Files API for analysis with retry logic
-    video_file = gemini_upload_file_with_retry(
-        file_path=full_cut_path,
-        mime_type='video/mp4',
-        max_retries=3,
-        wait_for_processing=True,
-    )
-    if video_file is None:
-      logging.warning(
-          f'ANNOTATION - Could not upload segment {av_segment_id} to Gemini, skipping annotation'
-      )
-      return description, keywords
+    # The segment cut was already uploaded to GCS above, use gs:// URI
+    gs_uri = StorageService.get_gs_uri(s3_cut_dest_file)
+    from google.genai import types
+    video_part = types.Part.from_uri(file_uri=gs_uri, mime_type='video/mp4')
 
     response = gemini_generate_with_retry(
-        model=vision_model,
-        content=[video_file, ConfigService.SEGMENT_ANNOTATIONS_PROMPT],
+        model_name=vision_model_name,
+        content=[video_part, ConfigService.SEGMENT_ANNOTATIONS_PROMPT],
         generation_config=ConfigService.SEGMENT_ANNOTATIONS_CONFIG,
-        safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
+        safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_SETTINGS,
     )
     if response:
       text = response.candidates[0].content.parts[0].text

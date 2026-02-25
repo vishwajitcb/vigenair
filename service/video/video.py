@@ -27,7 +27,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import google.generativeai as genai
 import config as ConfigService
 import pandas as pd
 
@@ -453,61 +452,38 @@ def _annotation_results_to_dict(result: VideoAnnotationResults) -> Dict[str, Any
 
 
 def _run_gemini_video_analysis(
-    local_video_path: str,
+    gs_uri: str,
     video_file_path: str,
 ) -> str:
-    """Runs Gemini Vision analysis in a thread.
-
-    Note: Uses ThreadPoolExecutor for cleaner timeout handling and to avoid
-    blocking the main thread during long-running API calls.
+    """Runs Gemini Vision analysis using gs:// URI via Vertex AI.
 
     Args:
-        local_video_path: Path to the local video file.
-        video_file_path: Original S3 path (for logging).
+        gs_uri: The gs:// URI of the video in GCS.
+        video_file_path: Original GCS path (for logging).
 
     Returns:
         The response text from Gemini.
     """
-    # Initialize Gemini (must be done in each thread/process)
-    api_key = os.environ.get('GOOGLE_API_KEY')
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY environment variable is not set")
+    from google.genai import types
 
-    genai.configure(api_key=api_key)
+    client = ConfigService.get_genai_client()
 
-    # Upload video to Gemini Files API
-    logging.info('VIDEO_ANALYSIS - Uploading video to Gemini...')
-    video_file = genai.upload_file(local_video_path)
-
-    # Wait for processing
-    while video_file.state.name == 'PROCESSING':
-        time.sleep(2)
-        video_file = genai.get_file(video_file.name)
-
-    if video_file.state.name == 'FAILED':
-        raise ValueError(f'Video processing failed: {video_file.state.name}')
-
-    logging.info('VIDEO_ANALYSIS - Video uploaded, running analysis...')
+    logging.info('VIDEO_ANALYSIS - Using gs:// URI: %s', gs_uri)
     logging.info('VIDEO_ANALYSIS - Using model: %s', ConfigService.CONFIG_VISION_MODEL)
 
-    # Create model and analyze
-    model = genai.GenerativeModel(ConfigService.CONFIG_VISION_MODEL)
+    video_part = types.Part.from_uri(file_uri=gs_uri, mime_type='video/mp4')
 
     try:
-        response = model.generate_content(
-            [video_file, ConfigService.VIDEO_ANALYSIS_PROMPT],
-            generation_config=ConfigService.VIDEO_ANALYSIS_CONFIG,
+        response = client.models.generate_content(
+            model=ConfigService.CONFIG_VISION_MODEL,
+            contents=[video_part, ConfigService.VIDEO_ANALYSIS_PROMPT],
+            config=types.GenerateContentConfig(
+                **ConfigService.VIDEO_ANALYSIS_CONFIG,
+            ),
         )
     except Exception as e:
         logging.error('VIDEO_ANALYSIS - Gemini API call failed: %s', str(e))
         raise
-
-    # Cleanup uploaded Gemini file
-    try:
-        genai.delete_file(video_file.name)
-        logging.info('VIDEO_ANALYSIS - Cleaned up Gemini file: %s', video_file.name)
-    except Exception as e:
-        logging.warning('Failed to delete uploaded video file: %s', e)
 
     # Check for empty response (e.g., content moderation)
     if not response.candidates:
@@ -553,13 +529,13 @@ def analyse_video(
 ) -> VideoAnnotationResults:
     """Runs video analysis via Gemini Vision API and returns the results.
 
-    Note: Uses ThreadPoolExecutor for Gemini API calls to enable timeout handling
-    and avoid blocking during long-running API operations.
+    Uses gs:// URI to pass the video directly to Gemini via Vertex AI,
+    eliminating the need to download from GCS or upload to Gemini Files API.
 
     Args:
-        video_file_path: Path to the video file (local path or S3 key).
-        bucket_name: S3 bucket name.
-        gcs_folder: S3 folder path for storing results.
+        video_file_path: GCS key of the video file.
+        bucket_name: GCS bucket name.
+        gcs_folder: GCS folder path for storing results.
         output_file_name: Name of the output analysis file.
 
     Returns:
@@ -568,28 +544,17 @@ def analyse_video(
     import concurrent.futures
     import tempfile
     import storage as StorageService
-    import utils as Utils
 
     logging.info('VIDEO_ANALYSIS - Starting Gemini Vision analysis for: %s', video_file_path)
 
-    # Download video from S3 if it's not a local file
-    local_video_path = video_file_path
-    tmp_dir = None
-    if not os.path.exists(video_file_path):
-        tmp_dir = tempfile.mkdtemp()
-        logging.info('VIDEO_ANALYSIS - Downloading video from S3: %s', video_file_path)
-        local_video_path = StorageService.download_file(
-            file_path=Utils.TriggerFile(video_file_path),
-            output_dir=tmp_dir,
-        )
-        if not local_video_path:
-            raise ValueError(f"Failed to download video from S3: {video_file_path}")
+    # Get gs:// URI for direct Gemini access (no download needed)
+    gs_uri = StorageService.get_gs_uri(video_file_path)
 
     # Run Gemini analysis in a thread to avoid issues with forked processes
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
             _run_gemini_video_analysis,
-            local_video_path,
+            gs_uri,
             video_file_path,
         )
         response_text = future.result(timeout=1800)  # 30 minute timeout for video
@@ -599,7 +564,7 @@ def analyse_video(
 
     logging.info('VIDEO_ANALYSIS - Analysis complete. Found %d shots.', len(result.shot_annotations))
 
-    # Save analysis results to S3
+    # Save analysis results to GCS
     result_dict = _annotation_results_to_dict(result)
     output_json = {'annotation_results': [result_dict]}
 
@@ -608,11 +573,11 @@ def analyse_video(
         temp_json_path = f.name
 
     try:
-        s3_destination = f'{gcs_folder}/{output_file_name}'
-        logging.info('VIDEO_ANALYSIS - Uploading analysis to S3: %s', s3_destination)
+        gcs_destination = f'{gcs_folder}/{output_file_name}'
+        logging.info('VIDEO_ANALYSIS - Uploading analysis to GCS: %s', gcs_destination)
         StorageService.upload_file(
             file_path=temp_json_path,
-            destination_file_name=s3_destination,
+            destination_file_name=gcs_destination,
             overwrite=True,
         )
         logging.info('VIDEO_ANALYSIS - Successfully saved %s', output_file_name)

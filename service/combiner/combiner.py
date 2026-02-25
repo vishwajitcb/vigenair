@@ -34,7 +34,6 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 from urllib import parse
 
 import config as ConfigService
-import google.generativeai as genai
 import pandas as pd
 import storage as StorageService
 import utils as Utils
@@ -215,10 +214,10 @@ class Combiner:
     """
     self.gcs_bucket_name = gcs_bucket_name
     self.render_file = render_file
-    # Initialize Google AI Studio SDK
-    genai.configure(api_key=ConfigService.GOOGLE_API_KEY)
-    self.text_model = genai.GenerativeModel(ConfigService.CONFIG_TEXT_MODEL)
-    self.vision_model = genai.GenerativeModel(ConfigService.CONFIG_VISION_MODEL)
+    # Initialize google-genai client (Vertex AI)
+    self.genai_client = ConfigService.get_genai_client()
+    self.text_model_name = ConfigService.CONFIG_TEXT_MODEL
+    self.vision_model_name = ConfigService.CONFIG_VISION_MODEL
 
   def check_finalise_render(self, variants_count: int):
     """Checks whether all variants have been rendered to trigger `finalise`."""
@@ -424,7 +423,7 @@ class Combiner:
         speech_track_path=speech_track_path,
         music_track_path=music_track_path,
         video_variant=video_variant,
-        vision_model=self.vision_model,
+        vision_model_name=self.vision_model_name,
         video_language=video_language,
     )
     combo = dataclasses.asdict(video_variant)
@@ -767,7 +766,7 @@ def _render_video_variant_hevc_4k(
     crop_video_file_paths: Dict,
     has_audio: bool,
     video_variant,
-    vision_model,
+    vision_model_name: str,
     video_language: str,
     shot_timestamps: list,
 ) -> Dict[str, Any]:
@@ -872,7 +871,7 @@ def _render_video_variant(
     speech_track_path: Optional[str],
     music_track_path: Optional[str],
     video_variant: VideoVariant,
-    vision_model,
+    vision_model_name: str,
     video_language: str,
 ) -> Dict[str, Any]:
   """Renders a video variant in all formats."""
@@ -952,7 +951,7 @@ def _render_video_variant(
         crop_video_file_paths=crop_video_file_paths,
         has_audio=has_audio,
         video_variant=video_variant,
-        vision_model=vision_model,
+        vision_model_name=vision_model_name,
         video_language=video_language,
         shot_timestamps=shot_timestamps,
     )
@@ -1099,7 +1098,7 @@ def _render_video_variant(
           continuous_audio_select_filter=continuous_audio_select_filter,
       )
     rendered_paths[vf_member] = _render_format(
-        vision_model=vision_model,
+        vision_model_name=vision_model_name,
         input_video_path=input_for_format,
         output_path=output_dir,
         gcs_bucket_name=gcs_bucket_name,
@@ -1138,7 +1137,7 @@ def _render_video_variant(
 
   if video_variant.render_settings.generate_text_assets:
     text_assets = _generate_text_assets(
-        vision_model=vision_model,
+        vision_model_name=vision_model_name,
         local_video_path=base_combo_path,
         video_language=video_language,
         video_variant=video_variant,
@@ -1225,7 +1224,7 @@ def _get_variant_ffmpeg_commands(
 
 
 def _render_format(
-    vision_model,
+    vision_model_name: str,
     input_video_path: str,
     output_path: str,
     gcs_bucket_name: str,
@@ -1366,7 +1365,7 @@ def _render_format(
         target_dir=gcs_folder_path,
     )
     assets = _generate_image_assets(
-        vision_model=vision_model,
+        vision_model_name=vision_model_name,
         video_file_path=output_video_path,
         gcs_bucket_name=gcs_bucket_name,
         gcs_folder_path=gcs_folder_path,
@@ -1381,30 +1380,39 @@ def _render_format(
 
 
 def _generate_text_assets(
-    vision_model,
+    vision_model_name: str,
     local_video_path: str,
     video_language: str,
     video_variant: VideoVariant,
 ) -> Optional[Sequence[Dict[str, str]]]:
   """Generates text ad assets for a video variant."""
+  from google.genai import types
+
   prompt = ConfigService.GENERATE_ASSETS_PROMPT.format(
       video_language=video_language
   )
   assets = None
-  video_file = None
+  temp_gcs_key = None
   try:
-    # Upload video to Gemini Files API
-    video_file = genai.upload_file(local_video_path, mime_type='video/mp4')
-    # Wait for file to be ready
-    while video_file.state.name == 'PROCESSING':
-      time.sleep(2)
-      video_file = genai.get_file(video_file.name)
-    if video_file.state.name == 'FAILED':
-      raise ValueError(f'Video processing failed: {video_file.state.name}')
-    response = vision_model.generate_content(
-        [video_file, prompt],
-        generation_config=ConfigService.GENERATE_ASSETS_CONFIG,
-        safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
+    # Upload video to GCS, then use gs:// URI
+    filename = os.path.basename(local_video_path)
+    temp_gcs_key = f'_temp_assets/{filename}'
+    StorageService.upload_file(
+        file_path=local_video_path,
+        destination_file_name=temp_gcs_key,
+        overwrite=True,
+    )
+    gs_uri = StorageService.get_gs_uri(temp_gcs_key)
+    video_part = types.Part.from_uri(file_uri=gs_uri, mime_type='video/mp4')
+
+    client = ConfigService.get_genai_client()
+    response = client.models.generate_content(
+        model=vision_model_name,
+        contents=[video_part, prompt],
+        config=types.GenerateContentConfig(
+            **ConfigService.GENERATE_ASSETS_CONFIG,
+            safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_SETTINGS,
+        ),
     )
     if (
         response.candidates and response.candidates[0].content.parts
@@ -1457,13 +1465,13 @@ def _generate_text_assets(
         'Continuing...', video_variant.variant_id
     )
   finally:
-    # Clean up uploaded file from Gemini to prevent quota exhaustion
-    if video_file:
+    # Clean up temporary GCS file
+    if temp_gcs_key:
       try:
-        genai.delete_file(video_file.name)
-        logging.info('ASSETS - Cleaned up Gemini file: %s', video_file.name)
+        StorageService.delete_file(temp_gcs_key)
+        logging.info('ASSETS - Cleaned up temp GCS file: %s', temp_gcs_key)
       except Exception as cleanup_error:
-        logging.warning('ASSETS - Failed to clean up Gemini file: %s', cleanup_error)
+        logging.warning('ASSETS - Failed to clean up temp GCS file: %s', cleanup_error)
   return assets
 
 
@@ -1515,7 +1523,7 @@ def _generate_video_script(
 
 
 def _generate_image_assets(
-    vision_model,
+    vision_model_name: str,
     video_file_path: str,
     gcs_bucket_name: str,
     gcs_folder_path: str,
@@ -1541,7 +1549,7 @@ def _generate_image_assets(
         format_type=format_type,
     )
     _identify_and_extract_key_frames(
-        vision_model=vision_model,
+        vision_model_name=vision_model_name,
         video_file_path=video_file_path,
         image_assets_path=image_assets_path,
         gcs_bucket_name=gcs_bucket_name,
@@ -1600,7 +1608,7 @@ def _extract_video_thumbnails(
 
 
 def _identify_and_extract_key_frames(
-    vision_model,
+    vision_model_name: str,
     video_file_path: str,
     image_assets_path: str,
     gcs_bucket_name: str,
@@ -1610,21 +1618,31 @@ def _identify_and_extract_key_frames(
     format_type: str,
 ):
   """Identifies key frames via Gemini and extracts them."""
+  from google.genai import types
+
   results = []
-  video_file = None
+  temp_gcs_key = None
   try:
-    # Upload video to Gemini Files API (video_file_path is local)
-    video_file = genai.upload_file(video_file_path, mime_type='video/mp4')
-    # Wait for file to be ready
-    while video_file.state.name == 'PROCESSING':
-      time.sleep(2)
-      video_file = genai.get_file(video_file.name)
-    if video_file.state.name == 'FAILED':
-      raise ValueError(f'Video processing failed: {video_file.state.name}')
-    response = vision_model.generate_content(
-        [video_file, ConfigService.KEY_FRAMES_PROMPT],
-        generation_config=ConfigService.KEY_FRAMES_CONFIG,
-        safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_CONFIG,
+    # Upload video to GCS, then use gs:// URI
+    filename = os.path.basename(video_file_path)
+    temp_gcs_key = f'{gcs_folder_path}/_temp_keyframes_{filename}'
+    StorageService.upload_file(
+        file_path=video_file_path,
+        destination_file_name=temp_gcs_key,
+        bucket_name=gcs_bucket_name,
+        overwrite=True,
+    )
+    gs_uri = StorageService.get_gs_uri(temp_gcs_key)
+    video_part = types.Part.from_uri(file_uri=gs_uri, mime_type='video/mp4')
+
+    client = ConfigService.get_genai_client()
+    response = client.models.generate_content(
+        model=vision_model_name,
+        contents=[video_part, ConfigService.KEY_FRAMES_PROMPT],
+        config=types.GenerateContentConfig(
+            **ConfigService.KEY_FRAMES_CONFIG,
+            safety_settings=ConfigService.CONFIG_DEFAULT_SAFETY_SETTINGS,
+        ),
     )
     if (
         response.candidates and response.candidates[0].content.parts
@@ -1637,13 +1655,13 @@ def _identify_and_extract_key_frames(
   except Exception:  # pylint: disable=broad-exception-caught
     logging.exception('Encountered error while identifying key frames!')
   finally:
-    # Clean up uploaded file from Gemini to prevent quota exhaustion
-    if video_file:
+    # Clean up temporary GCS file
+    if temp_gcs_key:
       try:
-        genai.delete_file(video_file.name)
-        logging.info('KEY_FRAMES - Cleaned up Gemini file: %s', video_file.name)
+        StorageService.delete_file(temp_gcs_key, bucket_name=gcs_bucket_name)
+        logging.info('KEY_FRAMES - Cleaned up temp GCS file: %s', temp_gcs_key)
       except Exception as cleanup_error:
-        logging.warning('KEY_FRAMES - Failed to clean up Gemini file: %s', cleanup_error)
+        logging.warning('KEY_FRAMES - Failed to clean up temp GCS file: %s', cleanup_error)
 
   if results:
     for index, key_frame_timestamp in enumerate(results):

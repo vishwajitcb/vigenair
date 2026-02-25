@@ -26,11 +26,15 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Uploa
 import storage as StorageService
 import utils as Utils
 from api.models.responses import (
-    MultipartAbortRequest,
-    MultipartCompleteRequest,
-    MultipartCompleteResponse,
-    MultipartInitiateRequest,
-    MultipartInitiateResponse,
+    ParallelUploadCompleteRequest,
+    ParallelUploadInitiateRequest,
+    ParallelUploadInitiateResponse,
+    PartUploadInfo,
+    ResumableUploadAbortRequest,
+    ResumableUploadCompleteRequest,
+    ResumableUploadCompleteResponse,
+    ResumableUploadInitiateRequest,
+    ResumableUploadInitiateResponse,
     UploadResponse,
     VideoInfo,
     VideoListResponse,
@@ -47,16 +51,17 @@ from db.mongodb import get_database
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-DEFAULT_PART_SIZE = 100 * 1024 * 1024  # 100 MB
+# GCS resumable upload chunk size must be a multiple of 256 KB
+DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB
 
 
-def _process_video_background(folder: str, local_video_path: str, s3_key: str):
+def _process_video_background(folder: str, local_video_path: str, gcs_key: str):
     """Background task to process uploaded video.
 
     Args:
-        folder: The S3 folder for this video.
-        local_video_path: Path to the local video file.
-        s3_key: The S3 key where the video is stored.
+        folder: The GCS folder for this video.
+        local_video_path: Path to the local video file (empty for resumable uploads).
+        gcs_key: The GCS key where the video is stored.
     """
     import extractor as ExtractorService
     import json
@@ -68,10 +73,10 @@ def _process_video_background(folder: str, local_video_path: str, s3_key: str):
         update_job_status_sync(folder, stage=JobStage.EXTRACTING_AUDIO, progress=10)
 
         # Create trigger file object
-        trigger_file = Utils.TriggerFile(s3_key)
+        trigger_file = Utils.TriggerFile(gcs_key)
 
         # Initialize and run extractor
-        bucket = os.environ.get("S3_BUCKET")
+        bucket = os.environ.get("GCS_BUCKET")
         extractor_instance = ExtractorService.Extractor(
             gcs_bucket_name=bucket, media_file=trigger_file
         )
@@ -123,7 +128,7 @@ def _process_video_background(folder: str, local_video_path: str, s3_key: str):
                 logger.info(f"Updated MongoDB with {len(mongo_segments)} segments for: {folder}")
         except Exception as seg_error:
             logger.warning(f"Failed to update segments in MongoDB: {seg_error}")
-            # Still mark as complete since S3 files exist
+            # Still mark as complete since GCS files exist
             update_job_status_sync(
                 folder,
                 status=JobStatus.SEGMENTS_READY,
@@ -137,7 +142,7 @@ def _process_video_background(folder: str, local_video_path: str, s3_key: str):
         # Update MongoDB with error
         update_job_error_sync(folder, str(e))
 
-        # Write error file to S3
+        # Write error file to GCS
         error_key = f"{folder}/error.txt"
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
             f.write(str(e))
@@ -155,15 +160,15 @@ def _process_video_background(folder: str, local_video_path: str, s3_key: str):
             os.unlink(local_video_path)
 
 
-@router.post("/upload/initiate", response_model=MultipartInitiateResponse)
-async def initiate_multipart_upload(request: MultipartInitiateRequest):
-    """Initiate a multipart upload and return presigned URLs for each part.
+@router.post("/upload/initiate", response_model=ResumableUploadInitiateResponse)
+async def initiate_resumable_upload(request: ResumableUploadInitiateRequest):
+    """Initiate a GCS resumable upload and return the session URI.
 
     Args:
-        request: MultipartInitiateRequest with filename, fileSize, contentType, etc.
+        request: ResumableUploadInitiateRequest with filename, fileSize, contentType, etc.
 
     Returns:
-        MultipartInitiateResponse with uploadId, presigned URLs, and metadata.
+        ResumableUploadInitiateResponse with sessionUri, folder, objectKey, and chunkSize.
     """
     # Validate file extension
     file_ext = os.path.splitext(request.filename)[1].lower()
@@ -180,26 +185,13 @@ async def initiate_multipart_upload(request: MultipartInitiateRequest):
     sanitized_name = Utils.sanitise_filename(os.path.splitext(request.filename)[0])
     folder = f"{sanitized_name}--{transcription_service}--{timestamp}--{encoded_user_id}"
 
-    s3_key = f"{folder}/input{file_ext}"
-
-    # Calculate parts
-    part_size = DEFAULT_PART_SIZE
-    total_parts = math.ceil(request.fileSize / part_size)
-    if total_parts > 10000:
-        part_size = math.ceil(request.fileSize / 10000)
-        total_parts = math.ceil(request.fileSize / part_size)
+    object_key = f"{folder}/input{file_ext}"
 
     try:
-        # Initiate multipart upload in S3
-        upload_id = StorageService.create_multipart_upload(s3_key, request.contentType)
-
-        # Generate presigned URLs for each part (1-indexed)
-        presigned_urls = []
-        for part_number in range(1, total_parts + 1):
-            url = StorageService.generate_presigned_upload_url(
-                s3_key, upload_id, part_number
-            )
-            presigned_urls.append(url)
+        # Create a GCS resumable upload session
+        session_uri = StorageService.create_resumable_upload_session(
+            object_key, request.contentType
+        )
 
         # Create MongoDB job
         try:
@@ -207,55 +199,46 @@ async def initiate_multipart_upload(request: MultipartInitiateRequest):
                 folder=folder,
                 name=sanitized_name,
                 user_id=request.userId,
-                input_video_key=s3_key,
+                input_video_key=object_key,
             )
-            logger.info(f"Created MongoDB job for multipart upload: {folder}")
+            logger.info(f"Created MongoDB job for resumable upload: {folder}")
         except Exception as db_error:
             logger.warning(f"Failed to create MongoDB job (continuing anyway): {db_error}")
 
-        return MultipartInitiateResponse(
-            uploadId=upload_id,
+        return ResumableUploadInitiateResponse(
+            sessionUri=session_uri,
             folder=folder,
-            s3Key=s3_key,
-            presignedUrls=presigned_urls,
-            partSize=part_size,
-            totalParts=total_parts,
+            objectKey=object_key,
+            chunkSize=DEFAULT_CHUNK_SIZE,
+            totalSize=request.fileSize,
         )
 
     except Exception as e:
-        logger.exception(f"Error initiating multipart upload: {e}")
+        logger.exception(f"Error initiating resumable upload: {e}")
         raise HTTPException(
             status_code=500, detail=f"Failed to initiate upload: {str(e)}"
         )
 
 
-@router.post("/upload/complete", response_model=MultipartCompleteResponse)
-async def complete_multipart(
-    request: MultipartCompleteRequest,
+@router.post("/upload/complete", response_model=ResumableUploadCompleteResponse)
+async def complete_resumable_upload(
+    request: ResumableUploadCompleteRequest,
     background_tasks: BackgroundTasks,
 ):
-    """Complete a multipart upload after all parts have been uploaded.
+    """Complete a resumable upload after all chunks have been uploaded.
+
+    The file is already in GCS at this point. This endpoint triggers
+    background processing.
 
     Args:
-        request: MultipartCompleteRequest with uploadId, folder, s3Key, and parts.
+        request: ResumableUploadCompleteRequest with folder and objectKey.
         background_tasks: FastAPI background tasks handler.
 
     Returns:
-        MultipartCompleteResponse with status.
+        ResumableUploadCompleteResponse with status.
     """
     try:
-        # Sort parts by PartNumber
-        sorted_parts = sorted(
-            [{"ETag": p.ETag, "PartNumber": p.PartNumber} for p in request.parts],
-            key=lambda x: x["PartNumber"],
-        )
-
-        # Complete the multipart upload in S3
-        StorageService.complete_multipart_upload(
-            request.s3Key, request.uploadId, sorted_parts
-        )
-
-        logger.info(f"Multipart upload completed: {request.s3Key}")
+        logger.info(f"Resumable upload completed: {request.objectKey}")
 
         # Update job status
         try:
@@ -269,37 +252,35 @@ async def complete_multipart(
 
         # Trigger background processing (empty string for local_video_path)
         background_tasks.add_task(
-            _process_video_background, request.folder, "", request.s3Key
+            _process_video_background, request.folder, "", request.objectKey
         )
 
-        return MultipartCompleteResponse(
+        return ResumableUploadCompleteResponse(
             folder=request.folder,
             status="processing",
             message="Upload completed. Processing started.",
         )
 
     except Exception as e:
-        logger.exception(f"Error completing multipart upload: {e}")
+        logger.exception(f"Error completing resumable upload: {e}")
         raise HTTPException(
             status_code=500, detail=f"Failed to complete upload: {str(e)}"
         )
 
 
 @router.post("/upload/abort")
-async def abort_multipart(request: MultipartAbortRequest):
-    """Abort a multipart upload and clean up.
+async def abort_resumable_upload(request: ResumableUploadAbortRequest):
+    """Abort a resumable upload and clean up.
+
+    GCS resumable upload sessions expire automatically, so we just
+    clean up MongoDB.
 
     Args:
-        request: MultipartAbortRequest with uploadId, folder, and s3Key.
+        request: ResumableUploadAbortRequest with folder and objectKey.
 
     Returns:
         Status dict.
     """
-    try:
-        StorageService.abort_multipart_upload(request.s3Key, request.uploadId)
-    except Exception as e:
-        logger.warning(f"Error aborting multipart upload (may already be completed): {e}")
-
     # Delete MongoDB job
     try:
         db = await get_database()
@@ -308,7 +289,172 @@ async def abort_multipart(request: MultipartAbortRequest):
     except Exception as db_error:
         logger.warning(f"Failed to delete MongoDB job: {db_error}")
 
+    # Clean up parallel upload temp parts if applicable
+    if request.numParts:
+        try:
+            folder = request.folder
+            part_keys = [
+                f"{folder}/_parts/part_{i:03d}" for i in range(request.numParts)
+            ]
+            StorageService.delete_files(part_keys)
+            logger.info(f"Cleaned up {request.numParts} temp parts for: {folder}")
+        except Exception as cleanup_error:
+            logger.warning(f"Failed to clean up temp parts: {cleanup_error}")
+
     return {"status": "aborted"}
+
+
+# GCS resumable upload chunk size alignment (256 KB)
+ALIGNMENT = 256 * 1024
+
+
+@router.post("/upload/initiate-parallel", response_model=ParallelUploadInitiateResponse)
+async def initiate_parallel_upload(request: ParallelUploadInitiateRequest):
+    """Initiate a parallel upload with N parts using signed URLs.
+
+    Generates signed PUT URLs for each part so the browser can upload
+    directly to GCS without CORS issues (no custom headers needed).
+
+    Args:
+        request: ParallelUploadInitiateRequest with filename, fileSize, numParts, etc.
+
+    Returns:
+        ParallelUploadInitiateResponse with signed upload URLs, offsets, and sizes.
+    """
+    # Validate file extension
+    file_ext = os.path.splitext(request.filename)[1].lower()
+    if not file_ext or not Utils.VideoExtension.has_value(file_ext[1:]):
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported video format: {file_ext}"
+        )
+
+    # Generate folder name (same logic as existing upload)
+    timestamp = int(datetime.now().timestamp() * 1000)
+    encoded_user_id = request.userId.replace("@", "_at_").replace(".", "_dot_")
+    transcription_service = "w" if request.analyzeAudio else "n"
+
+    sanitized_name = Utils.sanitise_filename(os.path.splitext(request.filename)[0])
+    folder = f"{sanitized_name}--{transcription_service}--{timestamp}--{encoded_user_id}"
+
+    object_key = f"{folder}/input{file_ext}"
+
+    num_parts = max(2, min(request.numParts, 32))
+
+    # Calculate part sizes (no alignment needed for signed URL uploads)
+    base_part_size = request.fileSize // num_parts
+    remainder = request.fileSize % num_parts
+
+    try:
+        parts = []
+        offset = 0
+        for i in range(num_parts):
+            if offset >= request.fileSize:
+                num_parts = i
+                break
+            # Distribute remainder across first N parts
+            size = base_part_size + (1 if i < remainder else 0)
+            part_key = f"{folder}/_parts/part_{i:03d}"
+
+            signed_url = StorageService.get_signed_upload_url(
+                part_key, content_type='application/octet-stream'
+            )
+
+            parts.append(PartUploadInfo(
+                partIndex=i,
+                signedUrl=signed_url,
+                partKey=part_key,
+                offset=offset,
+                size=size,
+            ))
+            offset += size
+
+        # Create MongoDB job
+        try:
+            create_job_sync(
+                folder=folder,
+                name=sanitized_name,
+                user_id=request.userId,
+                input_video_key=object_key,
+            )
+            logger.info(f"Created MongoDB job for parallel upload: {folder}")
+        except Exception as db_error:
+            logger.warning(f"Failed to create MongoDB job (continuing anyway): {db_error}")
+
+        return ParallelUploadInitiateResponse(
+            folder=folder,
+            objectKey=object_key,
+            totalSize=request.fileSize,
+            numParts=num_parts,
+            parts=parts,
+        )
+
+    except Exception as e:
+        logger.exception(f"Error initiating parallel upload: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to initiate parallel upload: {str(e)}"
+        )
+
+
+@router.post("/upload/complete-parallel", response_model=ResumableUploadCompleteResponse)
+async def complete_parallel_upload(
+    request: ParallelUploadCompleteRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Complete a parallel composite upload by composing parts.
+
+    Verifies all part objects exist, composes them into the final object,
+    deletes temp parts, and triggers background processing.
+
+    Args:
+        request: ParallelUploadCompleteRequest with folder, objectKey, numParts.
+        background_tasks: FastAPI background tasks handler.
+
+    Returns:
+        ResumableUploadCompleteResponse with status.
+    """
+    try:
+        part_keys = [
+            f"{request.folder}/_parts/part_{i:03d}" for i in range(request.numParts)
+        ]
+
+        # Determine content type from object key extension
+        file_ext = os.path.splitext(request.objectKey)[1].lower()
+        content_type = f"video/{file_ext[1:]}" if file_ext else "video/mp4"
+
+        # Compose parts into final object
+        StorageService.compose_objects(part_keys, request.objectKey, content_type)
+
+        # Delete temp parts
+        StorageService.delete_files(part_keys)
+
+        logger.info(f"Parallel upload composed: {request.objectKey}")
+
+        # Update job status
+        try:
+            update_job_status_sync(
+                request.folder,
+                stage=JobStage.EXTRACTING_AUDIO,
+                progress=5,
+            )
+        except Exception as db_error:
+            logger.warning(f"Failed to update job status: {db_error}")
+
+        # Trigger background processing
+        background_tasks.add_task(
+            _process_video_background, request.folder, "", request.objectKey
+        )
+
+        return ResumableUploadCompleteResponse(
+            folder=request.folder,
+            status="processing",
+            message="Upload completed. Processing started.",
+        )
+
+    except Exception as e:
+        logger.exception(f"Error completing parallel upload: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to complete parallel upload: {str(e)}"
+        )
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -356,11 +502,11 @@ async def upload_video(
         tmp_path = tmp_file.name
 
     try:
-        # Upload to S3
-        s3_key = f"{folder}/input{file_ext}"
-        StorageService.upload_file(tmp_path, s3_key)
+        # Upload to GCS
+        gcs_key = f"{folder}/input{file_ext}"
+        StorageService.upload_file(tmp_path, gcs_key)
 
-        logger.info(f"Video uploaded to S3: {s3_key}")
+        logger.info(f"Video uploaded to GCS: {gcs_key}")
 
         # Create job in MongoDB
         try:
@@ -368,7 +514,7 @@ async def upload_video(
                 folder=folder,
                 name=sanitized_name,
                 user_id=user_id,
-                input_video_key=s3_key
+                input_video_key=gcs_key
             )
             logger.info(f"Created MongoDB job: {folder}")
         except Exception as db_error:
@@ -376,7 +522,7 @@ async def upload_video(
 
         # Start background processing
         background_tasks.add_task(
-            _process_video_background, folder, tmp_path, s3_key
+            _process_video_background, folder, tmp_path, gcs_key
         )
 
         return UploadResponse(
@@ -401,11 +547,11 @@ async def list_videos():
         VideoListResponse with list of video information.
     """
     try:
-        bucket = os.environ.get("S3_BUCKET")
+        bucket = os.environ.get("GCS_BUCKET")
         if not bucket:
-            raise HTTPException(status_code=500, detail="S3_BUCKET not configured")
+            raise HTTPException(status_code=500, detail="GCS_BUCKET not configured")
 
-        # List top-level folders in S3
+        # List top-level folders in GCS
         all_objects = StorageService.list_files(prefix="")
 
         # Extract unique folder names and their metadata

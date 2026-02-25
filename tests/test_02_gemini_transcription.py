@@ -15,7 +15,8 @@ from dotenv import load_dotenv
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # Test audio file (created by test_01)
 TEST_AUDIO = "/tmp/test_extracted_audio.wav"
@@ -53,15 +54,28 @@ MODELS_TO_TEST = [
 ]
 
 
-def test_api_key():
-    """Check if API key is configured."""
-    print("Checking API key...")
-    api_key = os.environ.get('GOOGLE_API_KEY')
-    if api_key:
-        print(f"  PASS: API key found ({api_key[:10]}...)")
+def get_client():
+    """Get Vertex AI genai client."""
+    return genai.Client(
+        vertexai=True,
+        project=os.environ.get('GCS_PROJECT_ID'),
+        location=os.environ.get('GCS_LOCATION', 'us-central1'),
+    )
+
+
+def test_credentials():
+    """Check if GCP credentials are configured."""
+    print("Checking GCP credentials...")
+    creds_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+    project_id = os.environ.get('GCS_PROJECT_ID')
+    if creds_path and project_id:
+        print(f"  PASS: Credentials found ({creds_path}), project: {project_id}")
         return True
     else:
-        print("  FAIL: GOOGLE_API_KEY not set in environment")
+        if not creds_path:
+            print("  FAIL: GOOGLE_APPLICATION_CREDENTIALS not set in environment")
+        if not project_id:
+            print("  FAIL: GCS_PROJECT_ID not set in environment")
         return False
 
 
@@ -80,14 +94,13 @@ def test_audio_file():
 def test_list_models():
     """List available Gemini models."""
     print("Listing available models...")
-    genai.configure(api_key=os.environ.get('GOOGLE_API_KEY'))
+    client = get_client()
 
     available = []
-    for m in genai.list_models():
-        if 'generateContent' in m.supported_generation_methods:
-            available.append(m.name)
-            if any(test_model in m.name for test_model in MODELS_TO_TEST):
-                print(f"  - {m.name} (will test)")
+    for m in client.models.list():
+        available.append(m.name)
+        if any(test_model in m.name for test_model in MODELS_TO_TEST):
+            print(f"  - {m.name} (will test)")
 
     return available
 
@@ -97,43 +110,45 @@ def test_transcription(model_name: str):
     print(f"\nTesting transcription with: {model_name}")
     print("-" * 50)
 
-    genai.configure(api_key=os.environ.get('GOOGLE_API_KEY'))
+    client = get_client()
 
-    # Upload audio
-    print("  Uploading audio file...")
+    # Upload audio to GCS for gs:// URI access
+    from google.cloud import storage as gcs_storage
+    gcs_client = gcs_storage.Client()
+    bucket_name = os.environ.get('GCS_BUCKET')
+    bucket = gcs_client.bucket(bucket_name)
+    temp_key = f"_test_temp/test_audio_{int(time.time())}.wav"
+    blob = bucket.blob(temp_key)
+
+    print("  Uploading audio file to GCS...")
     try:
-        audio_file = genai.upload_file(TEST_AUDIO, mime_type='audio/wav')
-        print(f"  Uploaded: {audio_file.name}")
+        blob.upload_from_filename(TEST_AUDIO, content_type='audio/wav')
+        gs_uri = f"gs://{bucket_name}/{temp_key}"
+        print(f"  Uploaded: {gs_uri}")
     except Exception as e:
         print(f"  FAIL: Could not upload audio: {e}")
         return None
 
-    # Wait for processing
-    print("  Waiting for processing...")
-    while audio_file.state.name == 'PROCESSING':
-        time.sleep(2)
-        audio_file = genai.get_file(audio_file.name)
-
-    if audio_file.state.name == 'FAILED':
-        print(f"  FAIL: Audio processing failed")
-        return None
-
-    # Generate transcription
+    # Generate transcription using gs:// URI
     print("  Generating transcription...")
     try:
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(
-            [audio_file, TRANSCRIBE_AUDIO_PROMPT],
-            generation_config={'max_output_tokens': 8192, 'temperature': 0.2}
+        audio_part = types.Part.from_uri(file_uri=gs_uri, mime_type='audio/wav')
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[audio_part, TRANSCRIBE_AUDIO_PROMPT],
+            config=types.GenerateContentConfig(
+                max_output_tokens=8192,
+                temperature=0.2,
+            ),
         )
     except Exception as e:
         print(f"  FAIL: API error: {e}")
-        genai.delete_file(audio_file.name)
+        blob.delete()
         return None
 
-    # Cleanup
+    # Cleanup GCS temp file
     try:
-        genai.delete_file(audio_file.name)
+        blob.delete()
     except:
         pass
 
@@ -207,7 +222,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # Pre-checks
-    if not test_api_key():
+    if not test_credentials():
         sys.exit(1)
 
     if not test_audio_file():

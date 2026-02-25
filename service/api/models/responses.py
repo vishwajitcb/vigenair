@@ -114,14 +114,8 @@ class SplitSegmentResponse(BaseModel):
     message: str
 
 
-class PartInfo(BaseModel):
-    """A completed part in a multipart upload."""
-    ETag: str
-    PartNumber: int
-
-
-class MultipartInitiateRequest(BaseModel):
-    """Request to initiate a multipart upload."""
+class ResumableUploadInitiateRequest(BaseModel):
+    """Request to initiate a resumable upload."""
     filename: str
     fileSize: int
     contentType: str = "video/mp4"
@@ -129,33 +123,73 @@ class MultipartInitiateRequest(BaseModel):
     userId: str = "anonymous"
 
 
-class MultipartInitiateResponse(BaseModel):
-    """Response from multipart upload initiation."""
-    uploadId: str
+class ResumableUploadInitiateResponse(BaseModel):
+    """Response from resumable upload initiation."""
+    sessionUri: str
     folder: str
-    s3Key: str
-    presignedUrls: List[str]
-    partSize: int
-    totalParts: int
+    objectKey: str
+    chunkSize: int
+    totalSize: int
 
 
-class MultipartCompleteRequest(BaseModel):
-    """Request to complete a multipart upload."""
-    uploadId: str
+class ResumableUploadCompleteRequest(BaseModel):
+    """Request to complete a resumable upload."""
     folder: str
-    s3Key: str
-    parts: List[PartInfo]
+    objectKey: str
 
 
-class MultipartCompleteResponse(BaseModel):
-    """Response from multipart upload completion."""
+class ResumableUploadCompleteResponse(BaseModel):
+    """Response from resumable upload completion."""
     folder: str
     status: str
     message: str
 
 
-class MultipartAbortRequest(BaseModel):
-    """Request to abort a multipart upload."""
-    uploadId: str
+class ResumableUploadAbortRequest(BaseModel):
+    """Request to abort a resumable upload."""
     folder: str
-    s3Key: str
+    objectKey: str
+    numParts: Optional[int] = None
+
+
+class ParallelUploadInitiateRequest(BaseModel):
+    """Request to initiate a parallel composite upload."""
+    filename: str
+    fileSize: int
+    contentType: str = "video/mp4"
+    analyzeAudio: bool = True
+    userId: str = "anonymous"
+    numParts: int = 4
+
+
+class PartUploadInfo(BaseModel):
+    """Info for a single part's signed upload URL."""
+    partIndex: int
+    signedUrl: str
+    partKey: str
+    offset: int
+    size: int
+
+
+class ParallelUploadInitiateResponse(BaseModel):
+    """Response from parallel upload initiation."""
+    folder: str
+    objectKey: str
+    totalSize: int
+    numParts: int
+    parts: List[PartUploadInfo]
+
+
+class ParallelUploadCompleteRequest(BaseModel):
+    """Request to complete a parallel composite upload."""
+    folder: str
+    objectKey: str
+    numParts: int
+
+
+# Backward compatibility aliases
+MultipartInitiateRequest = ResumableUploadInitiateRequest
+MultipartInitiateResponse = ResumableUploadInitiateResponse
+MultipartCompleteRequest = ResumableUploadCompleteRequest
+MultipartCompleteResponse = ResumableUploadCompleteResponse
+MultipartAbortRequest = ResumableUploadAbortRequest

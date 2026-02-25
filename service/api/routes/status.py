@@ -38,9 +38,9 @@ async def get_video_status(folder: str):
         StatusResponse with current processing status.
     """
     try:
-        bucket = os.environ.get("S3_BUCKET")
+        bucket = os.environ.get("GCS_BUCKET")
         if not bucket:
-            raise HTTPException(status_code=500, detail="S3_BUCKET not configured")
+            raise HTTPException(status_code=500, detail="GCS_BUCKET not configured")
 
         # List all files in the folder
         prefix = f"{folder}/"
