@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import tempfile
 from datetime import datetime
 
@@ -115,6 +116,7 @@ def _render_variants_background(folder: str, render_data: dict):
     """Background task to render video variants."""
     import combiner as CombinerService
 
+    shared_tmp_dir = None
     try:
         logger.info(f"Starting render for folder: {folder}")
 
@@ -137,6 +139,40 @@ def _render_variants_background(folder: str, render_data: dict):
 
         # Update progress: variants transformed (5%)
         update_job_status_sync(folder, progress=5)
+
+        # Download input video once into a shared temp dir
+        shared_tmp_dir = tempfile.mkdtemp(prefix='render_shared_')
+        cached_video_path = None
+
+        video_file_name = next(
+            iter(
+                StorageService.filter_video_files(
+                    prefix=f'{folder}/{ConfigService.INPUT_FILENAME}',
+                    bucket_name=bucket,
+                    first_only=True,
+                )
+            ), None
+        )
+
+        if video_file_name:
+            cached_video_path = StorageService.download_file(
+                file_path=video_file_name,
+                output_dir=shared_tmp_dir,
+                bucket_name=bucket,
+            )
+            # Fallback: try input.mp4 if input.mov not found
+            if cached_video_path is None and video_file_name.endswith('input.mov'):
+                mp4_name = video_file_name.rsplit('/', 1)[0] + '/input.mp4'
+                cached_video_path = StorageService.download_file(
+                    file_path=mp4_name,
+                    output_dir=shared_tmp_dir,
+                    bucket_name=bucket,
+                )
+
+        if cached_video_path:
+            logger.info(f"Cached input video at: {cached_video_path}")
+        else:
+            logger.warning("Could not cache input video, methods will download individually")
 
         # Write render request file (combiner expects a JSON array)
         with tempfile.NamedTemporaryFile(
@@ -162,7 +198,7 @@ def _render_variants_background(folder: str, render_data: dict):
         combiner_instance = CombinerService.Combiner(
             gcs_bucket_name=bucket, render_file=trigger_file
         )
-        combiner_instance.initial_render()
+        combiner_instance.initial_render(cached_video_path=cached_video_path)
 
         logger.info(f"Initial render completed for: {folder}")
 
@@ -173,32 +209,45 @@ def _render_variants_background(folder: str, render_data: dict):
         num_variants = len(combiner_variants)
         progress_per_variant = 75 / num_variants if num_variants > 0 else 75
 
-        # Now render each variant using the per-variant render files
-        for idx, variant in enumerate(combiner_variants):
+        # Render variants — parallel if multiple, sequential if single
+        def _render_single_variant(idx, variant):
             variant_id = variant.get("variant_id", idx)
             variant_render_key = f"{folder}/{variant_id}-{num_variants}_{ConfigService.INPUT_RENDERING_FILE}"
-
             logger.info(f"Rendering variant {variant_id} from {variant_render_key}")
-
-            # Update status: encoding this variant
-            current_progress = 20 + int(idx * progress_per_variant)
-            update_job_status_sync(
-                folder,
-                stage=JobStage.RENDER_ENCODING,
-                progress=current_progress
-            )
 
             variant_trigger = Utils.TriggerFile(variant_render_key)
             variant_combiner = CombinerService.Combiner(
                 gcs_bucket_name=bucket, render_file=variant_trigger
             )
-            variant_combiner.render()
-
-            # Update progress after variant completes
-            completed_progress = 20 + int((idx + 1) * progress_per_variant)
-            update_job_status_sync(folder, progress=completed_progress)
-
+            variant_combiner.render(cached_video_path=cached_video_path)
             logger.info(f"Variant {variant_id} render completed")
+            return idx
+
+        if num_variants <= 1:
+            # Single variant: render sequentially
+            update_job_status_sync(
+                folder, stage=JobStage.RENDER_ENCODING, progress=20
+            )
+            _render_single_variant(0, combiner_variants[0])
+            update_job_status_sync(folder, progress=95)
+        else:
+            # Multiple variants: render in parallel (max 2 to manage disk/CPU)
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            update_job_status_sync(
+                folder, stage=JobStage.RENDER_ENCODING, progress=20
+            )
+            logger.info(f"Rendering {num_variants} variants in parallel (max_workers=2)")
+            completed_count = 0
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {
+                    executor.submit(_render_single_variant, idx, variant): idx
+                    for idx, variant in enumerate(combiner_variants)
+                }
+                for future in as_completed(futures):
+                    future.result()  # raise if failed
+                    completed_count += 1
+                    completed_progress = 20 + int(completed_count * progress_per_variant)
+                    update_job_status_sync(folder, progress=completed_progress)
 
         # Update status: finalizing (95%)
         update_job_status_sync(
@@ -317,6 +366,12 @@ def _render_variants_background(folder: str, render_data: dict):
         finally:
             if os.path.exists(temp_error_path):
                 os.unlink(temp_error_path)
+
+    finally:
+        # Clean up the shared cached video temp dir
+        if shared_tmp_dir and os.path.exists(shared_tmp_dir):
+            logger.info(f"Cleaning up shared temp dir: {shared_tmp_dir}")
+            shutil.rmtree(shared_tmp_dir, ignore_errors=True)
 
 
 @router.post("/{folder}/render", response_model=RenderResponse)

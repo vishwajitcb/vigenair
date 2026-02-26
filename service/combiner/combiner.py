@@ -282,311 +282,335 @@ class Combiner:
     gc.collect()
     logging.info('COMBINER - Rendering completed successfully!')
 
-  def render(self):
+  def render(self, cached_video_path=None):
     """Renders a single video based on the input rendering settings."""
+    import shutil as _shutil
     variant_id = self.render_file.file_name.split('_')[0]
     logging.info('COMBINER - Starting rendering variant %s...', variant_id)
     tmp_dir = tempfile.mkdtemp()
+    combos_dir = None
     root_video_folder = self.render_file.gcs_root_folder
-    video_file_name = next(
-        iter(
-            StorageService.filter_video_files(
-                prefix=f'{root_video_folder}/{ConfigService.INPUT_FILENAME}',
-                bucket_name=self.gcs_bucket_name,
-                first_only=True,
-            )
-        ), None
-    )
-    logging.info('RENDERING - Video file name: %s', video_file_name)
 
-    # Try to download the file
-    video_file_path = StorageService.download_gcs_file(
-        file_path=Utils.TriggerFile(video_file_name),
-        output_dir=tmp_dir,
-        bucket_name=self.gcs_bucket_name,
-    )
-
-    # If download failed and file was input.mov, try input.mp4
-    # (for backwards compatibility with old .mov files)
-    if video_file_path is None and video_file_name.endswith('input.mov'):
-      folder = video_file_name.rsplit('/', 1)[0]
-      mp4_file_name = f'{folder}/input.mp4'
-      logging.info(
-          'RENDERING - input.mov not found, trying input.mp4: %s',
-          mp4_file_name
-      )
-      video_file_path = StorageService.download_gcs_file(
-          file_path=Utils.TriggerFile(mp4_file_name),
-          output_dir=tmp_dir,
-          bucket_name=self.gcs_bucket_name,
-      )
-
-    if video_file_path is None:
-      raise FileNotFoundError(f'Could not find video file: {video_file_name}')
-
-    logging.info('RENDERING - Video file path: %s', video_file_path)
-    _update_or_create_video_metadata(
-        video_file_path=video_file_path,
-        root_video_folder=root_video_folder,
-        gcs_bucket_name=self.gcs_bucket_name,
-        tmp_dir=tmp_dir,
-    )
-    _, video_ext = os.path.splitext(video_file_path)
-    has_audio = StorageService.download_gcs_file(
-        file_path=Utils.TriggerFile(
-            str(
-                pathlib.Path(
-                    root_video_folder, f'{ConfigService.INPUT_FILENAME}.wav'
+    try:
+      if cached_video_path and os.path.exists(cached_video_path):
+        video_file_path = cached_video_path
+        logging.info('RENDERING - Using cached video file: %s', video_file_path)
+      else:
+        video_file_name = next(
+            iter(
+                StorageService.filter_video_files(
+                    prefix=f'{root_video_folder}/{ConfigService.INPUT_FILENAME}',
+                    bucket_name=self.gcs_bucket_name,
+                    first_only=True,
                 )
-            )
-        ),
-        output_dir=tmp_dir,
-        bucket_name=self.gcs_bucket_name,
-    ) is not None
-    logging.info('RENDERING - Video has audio track? %s', has_audio)
-    speech_track_path = StorageService.download_gcs_file(
-        file_path=Utils.TriggerFile(
-            str(
-                pathlib.Path(
-                    root_video_folder, ConfigService.OUTPUT_SPEECH_FILE
-                )
-            )
-        ),
-        output_dir=tmp_dir,
-        bucket_name=self.gcs_bucket_name,
-    )
-    logging.info('RENDERING - Speech track path: %s', speech_track_path)
-    music_track_path = StorageService.download_gcs_file(
-        file_path=Utils.TriggerFile(
-            str(
-                pathlib.Path(
-                    root_video_folder, ConfigService.OUTPUT_MUSIC_FILE
-                )
-            )
-        ),
-        output_dir=tmp_dir,
-        bucket_name=self.gcs_bucket_name,
-    )
-    logging.info('RENDERING - Music track path: %s', music_track_path)
-    video_language = StorageService.download_gcs_file(
-        file_path=Utils.TriggerFile(
-            str(
-                pathlib.
-                Path(root_video_folder, ConfigService.OUTPUT_LANGUAGE_FILE)
-            )
-        ),
-        output_dir=tmp_dir,
-        bucket_name=self.gcs_bucket_name,
-        fetch_contents=True,
-    ) or ConfigService.DEFAULT_VIDEO_LANGUAGE
-    logging.info('RENDERING - Video language: %s', video_language)
-
-    # Download the pre-cropped *video* files
-    local_crop_video_file_paths = {}
-    for vf_member in VideoFormat:
-      if vf_member.is_horizontal:
-        continue
-
-      crop_video_file_name = Combiner.CROP_FILENAME_TEMPLATE.format(
-          format_type=vf_member.type_name, video_ext=video_ext
-      )
-      gcs_path = str(
-          pathlib.Path(self.render_file.gcs_folder, crop_video_file_name))
-      local_path = StorageService.download_gcs_file(
-          file_path=Utils.TriggerFile(gcs_path),
-          output_dir=tmp_dir,
-          bucket_name=self.gcs_bucket_name,
-      )
-      if local_path:
-          local_crop_video_file_paths[vf_member] = local_path
-
-    render_file_contents = StorageService.download_gcs_file(
-        file_path=self.render_file,
-        bucket_name=self.gcs_bucket_name,
-        fetch_contents=True,
-    )
-    video_variant = list(
-        map(
-            _video_variant_mapper,
-            enumerate(json.loads(render_file_contents.decode('utf-8'))),
+            ), None
         )
-    )[0]
-    combos_dir = tempfile.mkdtemp()
-    rendered_combos = {}
-    rendered_variant_paths = _render_video_variant(
-        output_dir=combos_dir,
-        gcs_folder_path=self.render_file.gcs_folder,
-        gcs_bucket_name=self.gcs_bucket_name,
-        video_file_path=video_file_path,
-        crop_video_file_paths=local_crop_video_file_paths,
-        has_audio=has_audio,
-        speech_track_path=speech_track_path,
-        music_track_path=music_track_path,
-        video_variant=video_variant,
-        vision_model_name=self.vision_model_name,
-        video_language=video_language,
-    )
-    combo = dataclasses.asdict(video_variant)
-    if 'render_settings' in combo and 'formats' in combo['render_settings']:
-        combo['render_settings']['formats'] = [
-            f.aspect_ratio_str for f in combo['render_settings']['formats']
-        ]
+        logging.info('RENDERING - Video file name: %s', video_file_name)
 
-    combo.update(rendered_variant_paths)
-    combo['av_segments'] = {
-        f'_{segment_id}': segment
-        for segment_id, segment in combo['av_segments'].items()
-    }
-    rendered_combos[f'_{video_variant.variant_id}'] = combo
-    logging.info(
-        'RENDERING - Rendered variant as: %r',
-        rendered_combos,
-    )
-    combos_json_path = os.path.join(
-        combos_dir,
-        f'{variant_id}_{ConfigService.OUTPUT_COMBINATIONS_FILE}',
-    )
-    with open(combos_json_path, 'w', encoding='utf8') as f:
-      json.dump(rendered_combos, f, indent=2)
+        # Try to download the file
+        video_file_path = StorageService.download_gcs_file(
+            file_path=Utils.TriggerFile(video_file_name),
+            output_dir=tmp_dir,
+            bucket_name=self.gcs_bucket_name,
+        )
 
-    StorageService.upload_gcs_dir(
-        source_directory=combos_dir,
-        bucket_name=self.gcs_bucket_name,
-        target_dir=self.render_file.gcs_folder,
-    )
+        # If download failed and file was input.mov, try input.mp4
+        # (for backwards compatibility with old .mov files)
+        if video_file_path is None and video_file_name.endswith('input.mov'):
+          folder = video_file_name.rsplit('/', 1)[0]
+          mp4_file_name = f'{folder}/input.mp4'
+          logging.info(
+              'RENDERING - input.mov not found, trying input.mp4: %s',
+              mp4_file_name
+          )
+          video_file_path = StorageService.download_gcs_file(
+              file_path=Utils.TriggerFile(mp4_file_name),
+              output_dir=tmp_dir,
+              bucket_name=self.gcs_bucket_name,
+          )
 
-    self.check_finalise_render(variants_count=int(variant_id.split('-')[1]))
-    gc.collect()
-    logging.info(
-        'COMBINER - Rendering variant %s completed successfully!',
-        variant_id,
-    )
+        if video_file_path is None:
+          raise FileNotFoundError(f'Could not find video file: {video_file_name}')
 
-  def initial_render(self):
-    """Creates cropped video files for all required formats."""
-    logging.info('COMBINER - Starting initial render (cropping)...')
-    tmp_dir = tempfile.mkdtemp()
-    root_video_folder = self.render_file.gcs_root_folder
-    video_file_name = next(
-        iter(
-            StorageService.filter_video_files(
-                prefix=f'{root_video_folder}/{ConfigService.INPUT_FILENAME}',
-                bucket_name=self.gcs_bucket_name,
-                first_only=True,
-            )
-        ), None
-    )
-    logging.info('RENDERING - Video file name: %s', video_file_name)
-
-    # Try to download the file
-    video_file_path = StorageService.download_gcs_file(
-        file_path=Utils.TriggerFile(video_file_name),
-        output_dir=tmp_dir,
-        bucket_name=self.gcs_bucket_name,
-    )
-
-    # If download failed and file was input.mov, try input.mp4
-    # (for backwards compatibility with old .mov files)
-    if video_file_path is None and video_file_name.endswith('input.mov'):
-      folder = video_file_name.rsplit('/', 1)[0]
-      mp4_file_name = f'{folder}/input.mp4'
-      logging.info(
-          'RENDERING - input.mov not found, trying input.mp4: %s',
-          mp4_file_name
+      logging.info('RENDERING - Video file path: %s', video_file_path)
+      _update_or_create_video_metadata(
+          video_file_path=video_file_path,
+          root_video_folder=root_video_folder,
+          gcs_bucket_name=self.gcs_bucket_name,
+          tmp_dir=tmp_dir,
       )
-      video_file_path = StorageService.download_gcs_file(
-          file_path=Utils.TriggerFile(mp4_file_name),
-          output_dir=tmp_dir,
-          bucket_name=self.gcs_bucket_name,
-      )
-
-    if video_file_path is None:
-      raise FileNotFoundError(f'Could not find video file: {video_file_name}')
-
-    logging.info('RENDERING - Video file path: %s', video_file_path)
-    _update_or_create_video_metadata(
-        video_file_path=video_file_path,
-        root_video_folder=root_video_folder,
-        gcs_bucket_name=self.gcs_bucket_name,
-        tmp_dir=tmp_dir,
-    )
-
-    crop_cmd_file_paths = {}
-    for vf_member in VideoFormat:
-      if vf_member.is_horizontal:
-        continue
-      crop_file_name = f'crop_{vf_member.type_name}.txt'
-      crop_path = StorageService.download_gcs_file(
+      _, video_ext = os.path.splitext(video_file_path)
+      has_audio = StorageService.download_gcs_file(
           file_path=Utils.TriggerFile(
-              str(pathlib.Path(self.render_file.gcs_folder, crop_file_name))
-          ),
-          output_dir=tmp_dir,
-          bucket_name=self.gcs_bucket_name,
-      )
-      if crop_path:
-        crop_cmd_file_paths[vf_member] = crop_path
-
-    render_file_contents = StorageService.download_gcs_file(
-        file_path=self.render_file,
-        bucket_name=self.gcs_bucket_name,
-        fetch_contents=True,
-    )
-    video_variants = list(
-        map(
-            _video_variant_mapper,
-            enumerate(json.loads(render_file_contents.decode('utf-8'))),
-        )
-    )
-    logging.info(
-        'RENDERING - Cropping for %d video variants: %r',
-        len(video_variants),
-        video_variants,
-    )
-    combos_dir = tempfile.mkdtemp()
-    _create_cropped_videos(
-        video_variants=video_variants,
-        video_file_path=video_file_path,
-        crop_cmd_file_paths=crop_cmd_file_paths,
-        output_dir=combos_dir,
-    )
-    StorageService.upload_gcs_dir(
-        source_directory=combos_dir,
-        bucket_name=self.gcs_bucket_name,
-        target_dir=self.render_file.gcs_folder,
-    )
-    for video_variant in video_variants:
-      variant_destination_file_path = (
-          f'{video_variant.variant_id}-{len(video_variants)}'
-          f'_{ConfigService.INPUT_RENDERING_FILE}'
-      )
-      variant_dict = dataclasses.asdict(video_variant)
-      if ('render_settings' in variant_dict and
-          'formats' in variant_dict['render_settings']):
-          variant_dict['render_settings']['formats'] = [
-              f.aspect_ratio_str
-              for f in variant_dict['render_settings']['formats']
-          ]
-      variant_dict['av_segments'] = list(variant_dict['av_segments'].values())
-
-      variant_json_path = os.path.join(
-          combos_dir,
-          variant_destination_file_path,
-      )
-      with open(variant_json_path, 'w', encoding='utf8') as f:
-        json.dump([variant_dict], f, indent=2)
-
-      StorageService.upload_gcs_file(
-          file_path=variant_json_path,
-          bucket_name=self.gcs_bucket_name,
-          destination_file_name=str(
-              pathlib.Path(
-                  self.render_file.gcs_folder,
-                  variant_destination_file_path,
+              str(
+                  pathlib.Path(
+                      root_video_folder, f'{ConfigService.INPUT_FILENAME}.wav'
+                  )
               )
           ),
+          output_dir=tmp_dir,
+          bucket_name=self.gcs_bucket_name,
+      ) is not None
+      logging.info('RENDERING - Video has audio track? %s', has_audio)
+      speech_track_path = StorageService.download_gcs_file(
+          file_path=Utils.TriggerFile(
+              str(
+                  pathlib.Path(
+                      root_video_folder, ConfigService.OUTPUT_SPEECH_FILE
+                  )
+              )
+          ),
+          output_dir=tmp_dir,
+          bucket_name=self.gcs_bucket_name,
       )
-    gc.collect()
-    logging.info('COMBINER - Initial render (cropping) completed successfully!')
+      logging.info('RENDERING - Speech track path: %s', speech_track_path)
+      music_track_path = StorageService.download_gcs_file(
+          file_path=Utils.TriggerFile(
+              str(
+                  pathlib.Path(
+                      root_video_folder, ConfigService.OUTPUT_MUSIC_FILE
+                  )
+              )
+          ),
+          output_dir=tmp_dir,
+          bucket_name=self.gcs_bucket_name,
+      )
+      logging.info('RENDERING - Music track path: %s', music_track_path)
+      video_language = StorageService.download_gcs_file(
+          file_path=Utils.TriggerFile(
+              str(
+                  pathlib.
+                  Path(root_video_folder, ConfigService.OUTPUT_LANGUAGE_FILE)
+              )
+          ),
+          output_dir=tmp_dir,
+          bucket_name=self.gcs_bucket_name,
+          fetch_contents=True,
+      ) or ConfigService.DEFAULT_VIDEO_LANGUAGE
+      logging.info('RENDERING - Video language: %s', video_language)
+
+      # Download the pre-cropped *video* files
+      local_crop_video_file_paths = {}
+      for vf_member in VideoFormat:
+        if vf_member.is_horizontal:
+          continue
+
+        crop_video_file_name = Combiner.CROP_FILENAME_TEMPLATE.format(
+            format_type=vf_member.type_name, video_ext=video_ext
+        )
+        gcs_path = str(
+            pathlib.Path(self.render_file.gcs_folder, crop_video_file_name))
+        local_path = StorageService.download_gcs_file(
+            file_path=Utils.TriggerFile(gcs_path),
+            output_dir=tmp_dir,
+            bucket_name=self.gcs_bucket_name,
+        )
+        if local_path:
+            local_crop_video_file_paths[vf_member] = local_path
+
+      render_file_contents = StorageService.download_gcs_file(
+          file_path=self.render_file,
+          bucket_name=self.gcs_bucket_name,
+          fetch_contents=True,
+      )
+      video_variant = list(
+          map(
+              _video_variant_mapper,
+              enumerate(json.loads(render_file_contents.decode('utf-8'))),
+          )
+      )[0]
+      combos_dir = tempfile.mkdtemp()
+      rendered_combos = {}
+      rendered_variant_paths = _render_video_variant(
+          output_dir=combos_dir,
+          gcs_folder_path=self.render_file.gcs_folder,
+          gcs_bucket_name=self.gcs_bucket_name,
+          video_file_path=video_file_path,
+          crop_video_file_paths=local_crop_video_file_paths,
+          has_audio=has_audio,
+          speech_track_path=speech_track_path,
+          music_track_path=music_track_path,
+          video_variant=video_variant,
+          vision_model_name=self.vision_model_name,
+          video_language=video_language,
+      )
+      combo = dataclasses.asdict(video_variant)
+      if 'render_settings' in combo and 'formats' in combo['render_settings']:
+          combo['render_settings']['formats'] = [
+              f.aspect_ratio_str for f in combo['render_settings']['formats']
+          ]
+
+      combo.update(rendered_variant_paths)
+      combo['av_segments'] = {
+          f'_{segment_id}': segment
+          for segment_id, segment in combo['av_segments'].items()
+      }
+      rendered_combos[f'_{video_variant.variant_id}'] = combo
+      logging.info(
+          'RENDERING - Rendered variant as: %r',
+          rendered_combos,
+      )
+      combos_json_path = os.path.join(
+          combos_dir,
+          f'{variant_id}_{ConfigService.OUTPUT_COMBINATIONS_FILE}',
+      )
+      with open(combos_json_path, 'w', encoding='utf8') as f:
+        json.dump(rendered_combos, f, indent=2)
+
+      StorageService.upload_gcs_dir(
+          source_directory=combos_dir,
+          bucket_name=self.gcs_bucket_name,
+          target_dir=self.render_file.gcs_folder,
+      )
+
+      self.check_finalise_render(variants_count=int(variant_id.split('-')[1]))
+      gc.collect()
+      logging.info(
+          'COMBINER - Rendering variant %s completed successfully!',
+          variant_id,
+      )
+    finally:
+      _shutil.rmtree(tmp_dir, ignore_errors=True)
+      if combos_dir:
+        _shutil.rmtree(combos_dir, ignore_errors=True)
+
+  def initial_render(self, cached_video_path=None):
+    """Creates cropped video files for all required formats."""
+    import shutil as _shutil
+    logging.info('COMBINER - Starting initial render (cropping)...')
+    tmp_dir = tempfile.mkdtemp()
+    combos_dir = None
+    root_video_folder = self.render_file.gcs_root_folder
+
+    try:
+      if cached_video_path and os.path.exists(cached_video_path):
+        video_file_path = cached_video_path
+        logging.info('RENDERING - Using cached video file: %s', video_file_path)
+      else:
+        video_file_name = next(
+            iter(
+                StorageService.filter_video_files(
+                    prefix=f'{root_video_folder}/{ConfigService.INPUT_FILENAME}',
+                    bucket_name=self.gcs_bucket_name,
+                    first_only=True,
+                )
+            ), None
+        )
+        logging.info('RENDERING - Video file name: %s', video_file_name)
+
+        # Try to download the file
+        video_file_path = StorageService.download_gcs_file(
+            file_path=Utils.TriggerFile(video_file_name),
+            output_dir=tmp_dir,
+            bucket_name=self.gcs_bucket_name,
+        )
+
+        # If download failed and file was input.mov, try input.mp4
+        # (for backwards compatibility with old .mov files)
+        if video_file_path is None and video_file_name.endswith('input.mov'):
+          folder = video_file_name.rsplit('/', 1)[0]
+          mp4_file_name = f'{folder}/input.mp4'
+          logging.info(
+              'RENDERING - input.mov not found, trying input.mp4: %s',
+              mp4_file_name
+          )
+          video_file_path = StorageService.download_gcs_file(
+              file_path=Utils.TriggerFile(mp4_file_name),
+              output_dir=tmp_dir,
+              bucket_name=self.gcs_bucket_name,
+          )
+
+        if video_file_path is None:
+          raise FileNotFoundError(f'Could not find video file: {video_file_name}')
+
+      logging.info('RENDERING - Video file path: %s', video_file_path)
+      _update_or_create_video_metadata(
+          video_file_path=video_file_path,
+          root_video_folder=root_video_folder,
+          gcs_bucket_name=self.gcs_bucket_name,
+          tmp_dir=tmp_dir,
+      )
+
+      crop_cmd_file_paths = {}
+      for vf_member in VideoFormat:
+        if vf_member.is_horizontal:
+          continue
+        crop_file_name = f'crop_{vf_member.type_name}.txt'
+        crop_path = StorageService.download_gcs_file(
+            file_path=Utils.TriggerFile(
+                str(pathlib.Path(self.render_file.gcs_folder, crop_file_name))
+            ),
+            output_dir=tmp_dir,
+            bucket_name=self.gcs_bucket_name,
+        )
+        if crop_path:
+          crop_cmd_file_paths[vf_member] = crop_path
+
+      render_file_contents = StorageService.download_gcs_file(
+          file_path=self.render_file,
+          bucket_name=self.gcs_bucket_name,
+          fetch_contents=True,
+      )
+      video_variants = list(
+          map(
+              _video_variant_mapper,
+              enumerate(json.loads(render_file_contents.decode('utf-8'))),
+          )
+      )
+      logging.info(
+          'RENDERING - Cropping for %d video variants: %r',
+          len(video_variants),
+          video_variants,
+      )
+      combos_dir = tempfile.mkdtemp()
+      _create_cropped_videos(
+          video_variants=video_variants,
+          video_file_path=video_file_path,
+          crop_cmd_file_paths=crop_cmd_file_paths,
+          output_dir=combos_dir,
+      )
+      StorageService.upload_gcs_dir(
+          source_directory=combos_dir,
+          bucket_name=self.gcs_bucket_name,
+          target_dir=self.render_file.gcs_folder,
+      )
+      for video_variant in video_variants:
+        variant_destination_file_path = (
+            f'{video_variant.variant_id}-{len(video_variants)}'
+            f'_{ConfigService.INPUT_RENDERING_FILE}'
+        )
+        variant_dict = dataclasses.asdict(video_variant)
+        if ('render_settings' in variant_dict and
+            'formats' in variant_dict['render_settings']):
+            variant_dict['render_settings']['formats'] = [
+                f.aspect_ratio_str
+                for f in variant_dict['render_settings']['formats']
+            ]
+        variant_dict['av_segments'] = list(variant_dict['av_segments'].values())
+
+        variant_json_path = os.path.join(
+            combos_dir,
+            variant_destination_file_path,
+        )
+        with open(variant_json_path, 'w', encoding='utf8') as f:
+          json.dump([variant_dict], f, indent=2)
+
+        StorageService.upload_gcs_file(
+            file_path=variant_json_path,
+            bucket_name=self.gcs_bucket_name,
+            destination_file_name=str(
+                pathlib.Path(
+                    self.render_file.gcs_folder,
+                    variant_destination_file_path,
+                )
+            ),
+        )
+      gc.collect()
+      logging.info('COMBINER - Initial render (cropping) completed successfully!')
+    finally:
+      _shutil.rmtree(tmp_dir, ignore_errors=True)
+      if combos_dir:
+        _shutil.rmtree(combos_dir, ignore_errors=True)
 
 
 def _video_variant_mapper(
@@ -861,6 +885,245 @@ def _render_video_variant_hevc_4k(
       shutil.rmtree(segments_dir)
 
 
+def _extract_segments_and_concat(
+    video_file_path: str,
+    shot_timestamps: Sequence[Tuple[float, float]],
+    has_audio: bool,
+    speech_track_path: Optional[str],
+    music_track_path: Optional[str],
+    render_settings,
+    output_path: str,
+    video_duration: float,
+) -> None:
+  """Extracts video segments using -ss seeking and concatenates them.
+
+  This is much faster than select='between(...)' for large files because
+  -ss seeks to the nearest keyframe instead of decoding the entire file.
+  """
+  import shutil
+
+  segments_dir = tempfile.mkdtemp(prefix='segments_')
+
+  try:
+    use_music_overlay = render_settings.use_music_overlay
+    use_continuous_audio = render_settings.use_continuous_audio
+
+    # Determine effective audio mode
+    effective_mode = 'segment'  # default: each segment keeps its own audio
+    if has_audio:
+      if use_continuous_audio:
+        effective_mode = 'continuous'
+      elif use_music_overlay and speech_track_path and music_track_path:
+        effective_mode = 'music'
+      elif use_music_overlay:
+        # Fallback: no separated tracks, use continuous
+        logging.warning(
+            'RENDERING - Music overlay requested but audio tracks not separated. '
+            'Falling back to continuous audio mode.'
+        )
+        effective_mode = 'continuous'
+
+    logging.info(
+        'RENDERING - Segment extraction: %d segments, audio mode=%s',
+        len(shot_timestamps), effective_mode,
+    )
+
+    # Calculate total duration and overlay_start for continuous/music modes
+    total_duration = sum(end - start for start, end in shot_timestamps)
+    variant_first_segment_start = min(s for s, _ in shot_timestamps)
+    variant_last_segment_end = max(e for _, e in shot_timestamps)
+
+    overlay_start = variant_first_segment_start
+    if render_settings.overlay_type:
+      match render_settings.overlay_type:
+        case Utils.RenderOverlayType.VIDEO_START.value:
+          overlay_start = 0
+        case Utils.RenderOverlayType.VIDEO_END.value:
+          overlay_start = video_duration - total_duration
+        case Utils.RenderOverlayType.VARIANT_END.value:
+          overlay_start = variant_last_segment_end - total_duration
+        case Utils.RenderOverlayType.VARIANT_START.value:
+          overlay_start = variant_first_segment_start
+
+    # Step 1: Extract each segment with -ss seeking
+    segment_files = []
+    for idx, (start_time, end_time) in enumerate(shot_timestamps):
+      duration = end_time - start_time
+      segment_path = os.path.join(segments_dir, f'segment_{idx}.mp4')
+
+      logging.info(
+          'RENDERING - Extracting segment %d: %.2fs to %.2fs (duration: %.2fs)',
+          idx, start_time, end_time, duration,
+      )
+
+      extract_cmds = [
+          'ffmpeg',
+          '-ss', str(start_time),
+          '-i', video_file_path,
+          '-t', str(duration),
+      ]
+
+      if effective_mode == 'segment' and has_audio:
+        # Keep both video and audio from each segment
+        extract_cmds.extend([
+            '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '5.2',
+            '-preset', 'fast', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-movflags', '+faststart',
+            segment_path,
+        ])
+      elif effective_mode == 'segment':
+        # No audio - video only
+        extract_cmds.extend([
+            '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '5.2',
+            '-preset', 'fast', '-crf', '23',
+            '-an',
+            '-movflags', '+faststart',
+            segment_path,
+        ])
+      else:
+        # For continuous/music modes, extract video only from segments
+        # (audio will be handled separately after concat)
+        extract_cmds.extend([
+            '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '5.2',
+            '-preset', 'fast', '-crf', '23',
+            '-an',
+            '-movflags', '+faststart',
+            segment_path,
+        ])
+
+      Utils.execute_subprocess_commands(
+          cmds=extract_cmds,
+          description=f'extract segment {idx} with -ss seeking',
+      )
+      segment_files.append(segment_path)
+
+    # Step 2: Concatenate segments
+    concat_file_path = os.path.join(segments_dir, 'concat_list.txt')
+    with open(concat_file_path, 'w') as f:
+      for seg_file in segment_files:
+        f.write(f"file '{seg_file}'\n")
+
+    if effective_mode == 'segment':
+      # Simple concat with copy (segments already have correct audio)
+      Utils.execute_subprocess_commands(
+          cmds=[
+              'ffmpeg',
+              '-f', 'concat', '-safe', '0',
+              '-i', concat_file_path,
+              '-c', 'copy',
+              '-movflags', '+faststart',
+              output_path,
+          ],
+          description='concatenate segments (segment audio mode)',
+      )
+
+    elif effective_mode == 'continuous':
+      # Concat video segments, then add continuous audio from original
+      video_only_path = os.path.join(segments_dir, 'video_only.mp4')
+      Utils.execute_subprocess_commands(
+          cmds=[
+              'ffmpeg',
+              '-f', 'concat', '-safe', '0',
+              '-i', concat_file_path,
+              '-c', 'copy',
+              '-movflags', '+faststart',
+              video_only_path,
+          ],
+          description='concatenate video segments for continuous audio',
+      )
+
+      # Extract continuous audio section from original video
+      # -ss/-t before second -i to do input seeking on the audio source
+      cont_cmds = [
+          'ffmpeg',
+          '-i', video_only_path,
+          '-ss', str(overlay_start), '-t', str(total_duration),
+          '-i', video_file_path,
+          '-map', '0:v', '-map', '1:a',
+          '-c:v', 'copy',
+          '-c:a', 'aac', '-b:a', '192k',
+          '-shortest',
+      ]
+      if render_settings.fade_out:
+        fade_out_duration = float(ConfigService.CONFIG_DEFAULT_FADE_OUT_DURATION)
+        fade_out_buffer = float(ConfigService.CONFIG_DEFAULT_FADE_OUT_BUFFER)
+        fade_out_start = total_duration - fade_out_duration - fade_out_buffer
+        cont_cmds.extend([
+            '-af', f'afade=t=out:st={fade_out_start}:d={fade_out_duration}',
+        ])
+      cont_cmds.extend(['-movflags', '+faststart', output_path])
+      Utils.execute_subprocess_commands(
+          cmds=cont_cmds,
+          description='merge video with continuous audio',
+      )
+
+    elif effective_mode == 'music':
+      # Concat video segments, then merge speech + music overlay
+      video_only_path = os.path.join(segments_dir, 'video_only.mp4')
+      Utils.execute_subprocess_commands(
+          cmds=[
+              'ffmpeg',
+              '-f', 'concat', '-safe', '0',
+              '-i', concat_file_path,
+              '-c', 'copy',
+              '-movflags', '+faststart',
+              video_only_path,
+          ],
+          description='concatenate video segments for music overlay',
+      )
+
+      # Extract speech from the speech track using segment timestamps
+      # and music from the music track at overlay_start
+      # -ss/-t before each audio input for input seeking
+      music_cmds = [
+          'ffmpeg',
+          '-i', video_only_path,
+          '-ss', str(overlay_start), '-t', str(total_duration),
+          '-i', speech_track_path,
+          '-ss', str(overlay_start), '-t', str(total_duration),
+          '-i', music_track_path,
+          '-filter_complex',
+          '[1:a]asetpts=N/SR/TB[speech];'
+          '[2:a]asetpts=N/SR/TB[music];'
+          '[speech][music]amerge=inputs=2[outa]',
+          '-map', '0:v', '-map', '[outa]',
+          '-c:v', 'copy',
+          '-ac', '2',
+      ]
+      if render_settings.fade_out:
+        fade_out_duration = float(ConfigService.CONFIG_DEFAULT_FADE_OUT_DURATION)
+        fade_out_buffer = float(ConfigService.CONFIG_DEFAULT_FADE_OUT_BUFFER)
+        fade_out_start = total_duration - fade_out_duration - fade_out_buffer
+        # Need to add fade to the merged audio
+        music_cmds = [
+            'ffmpeg',
+            '-i', video_only_path,
+            '-ss', str(overlay_start), '-t', str(total_duration),
+            '-i', speech_track_path,
+            '-ss', str(overlay_start), '-t', str(total_duration),
+            '-i', music_track_path,
+            '-filter_complex',
+            '[1:a]asetpts=N/SR/TB[speech];'
+            '[2:a]asetpts=N/SR/TB[music];'
+            '[speech][music]amerge=inputs=2[tempa];'
+            f'[tempa]afade=t=out:st={fade_out_start}:d={fade_out_duration}[outa]',
+            '-map', '0:v', '-map', '[outa]',
+            '-c:v', 'copy',
+            '-ac', '2',
+        ]
+      music_cmds.extend(['-movflags', '+faststart', output_path])
+      Utils.execute_subprocess_commands(
+          cmds=music_cmds,
+          description='merge video with speech + music overlay',
+      )
+
+    logging.info('RENDERING - Segment extraction and concat complete: %s', output_path)
+
+  finally:
+    shutil.rmtree(segments_dir, ignore_errors=True)
+
+
 def _render_video_variant(
     output_dir: str,
     gcs_folder_path: str,
@@ -881,7 +1144,6 @@ def _render_video_variant(
       video_variant.render_settings.use_blanking_fill
   )
   _, video_ext = os.path.splitext(video_file_path)
-  # ... (rest of the function is the same as before)
   shot_groups = _group_consecutive_segments(
       list(video_variant.av_segments.keys())
   )
@@ -895,16 +1157,6 @@ def _render_video_variant(
       )
   )
   video_duration = Utils.get_media_duration(video_file_path)
-  (
-      full_av_select_filter,
-      music_overlay_select_filter,
-      continuous_audio_select_filter,
-  ) = _build_ffmpeg_filters(
-      shot_timestamps,
-      has_audio,
-      video_variant.render_settings,
-      video_duration,
-  )
 
   # Log audio track availability for debugging
   logging.info(
@@ -915,18 +1167,6 @@ def _render_video_variant(
       'available' if music_track_path else 'None',
       video_variant.render_settings.use_music_overlay,
       video_variant.render_settings.use_continuous_audio,
-  )
-
-  ffmpeg_cmds = _get_variant_ffmpeg_commands(
-      video_file_path=video_file_path,
-      speech_track_path=speech_track_path,
-      music_track_path=music_track_path,
-      has_audio=has_audio,
-      music_overlay=video_variant.render_settings.use_music_overlay,
-      continuous_audio=video_variant.render_settings.use_continuous_audio,
-      full_av_select_filter=full_av_select_filter,
-      music_overlay_select_filter=music_overlay_select_filter,
-      continuous_audio_select_filter=continuous_audio_select_filter,
   )
 
   # Get input video dimensions to determine original format BEFORE rendering
@@ -942,7 +1182,6 @@ def _render_video_variant(
   video_codec = Utils.get_video_codec(video_file_path)
   if is_hevc_4k and 'hevc' in video_codec.lower():
     logging.info('RENDERING - Detected 4K HEVC video, using segment extraction method')
-    # Use two-pass approach for 4K HEVC: extract segments then concatenate
     return _render_video_variant_hevc_4k(
         output_dir=output_dir,
         gcs_folder_path=gcs_folder_path,
@@ -968,8 +1207,6 @@ def _render_video_variant(
       break
 
   # Determine the base combo filename based on original format
-  # Use appropriate suffix: h=horizontal(16:9), v=vertical(9:16),
-  # s=square(1:1), etc.
   if original_format:
     if original_format == VideoFormat.HORIZONTAL:
       combo_suffix = 'h'
@@ -990,17 +1227,24 @@ def _render_video_variant(
       f'combo_{video_variant.variant_id}_{combo_suffix}{video_ext}'
   )
   base_combo_path = str(pathlib.Path(output_dir, base_combo_name))
-  ffmpeg_cmds.append(base_combo_path)
 
+  # Use fast -ss segment extraction instead of select='between(...)' filter
   format_desc = (
       original_format.aspect_ratio_str if original_format else 'base'
   )
-  Utils.execute_subprocess_commands(
-      cmds=ffmpeg_cmds,
-      description=(
-          f'render {format_desc} variant with id '
-          f'{video_variant.variant_id} using ffmpeg'
-      ),
+  logging.info(
+      'RENDERING - Using -ss segment extraction for %s variant %s',
+      format_desc, video_variant.variant_id,
+  )
+  _extract_segments_and_concat(
+      video_file_path=video_file_path,
+      shot_timestamps=shot_timestamps,
+      has_audio=has_audio,
+      speech_track_path=speech_track_path,
+      music_track_path=music_track_path,
+      render_settings=video_variant.render_settings,
+      output_path=base_combo_path,
+      video_duration=video_duration,
   )
 
   rendered_paths = {}
@@ -1078,39 +1322,64 @@ def _render_video_variant(
         'crop_file_path': crop_file_path
     }
 
-  for vf_member, format_instructions in formats_to_render.items():
-    format_ffmpeg_cmds = None
-    # Determine which video to use as input
-    # Use crop file if available, otherwise use base_combo_path
-    # (which has segments/audio and may have blanking fill applied)
-    input_for_format = format_instructions['crop_file_path'] or base_combo_path
-
+  def _render_single_format(vf_member, format_instructions):
+    """Renders a single format — designed to be called from a thread."""
     if format_instructions['crop_file_path']:
-      format_ffmpeg_cmds = _get_variant_ffmpeg_commands(
+      format_type_str = vf_member.type_name
+      format_name = f'combo_{video_variant.variant_id}_{format_type_str[0]}{video_ext}'
+      crop_combo_path = str(pathlib.Path(output_dir, format_name))
+      logging.info(
+          'RENDERING - %s: Extracting segments from crop file with -ss seeking',
+          format_type_str,
+      )
+      _extract_segments_and_concat(
           video_file_path=format_instructions['crop_file_path'],
+          shot_timestamps=shot_timestamps,
+          has_audio=has_audio,
           speech_track_path=speech_track_path,
           music_track_path=music_track_path,
-          has_audio=has_audio,
-          music_overlay=video_variant.render_settings.use_music_overlay,
-          continuous_audio=video_variant.render_settings.use_continuous_audio,
-          full_av_select_filter=full_av_select_filter,
-          music_overlay_select_filter=music_overlay_select_filter,
-          continuous_audio_select_filter=continuous_audio_select_filter,
+          render_settings=video_variant.render_settings,
+          output_path=crop_combo_path,
+          video_duration=video_duration,
       )
-    rendered_paths[vf_member] = _render_format(
-        vision_model_name=vision_model_name,
-        input_video_path=input_for_format,
-        output_path=output_dir,
-        gcs_bucket_name=gcs_bucket_name,
-        gcs_folder_path=gcs_folder_path,
-        variant_id=video_variant.variant_id,
-        video_format=vf_member,
-        generate_image_assets=(
-            video_variant.render_settings.generate_image_assets
-        ),
-        video_filter=format_instructions['blur_filter'],
-        ffmpeg_cmds=format_ffmpeg_cmds,
+      return vf_member, {'path': format_name}
+    else:
+      result = _render_format(
+          vision_model_name=vision_model_name,
+          input_video_path=base_combo_path,
+          output_path=output_dir,
+          gcs_bucket_name=gcs_bucket_name,
+          gcs_folder_path=gcs_folder_path,
+          variant_id=video_variant.variant_id,
+          video_format=vf_member,
+          generate_image_assets=(
+              video_variant.render_settings.generate_image_assets
+          ),
+          video_filter=format_instructions['blur_filter'],
+          ffmpeg_cmds=None,
+      )
+      return vf_member, result
+
+  if len(formats_to_render) <= 1:
+    # Single format: no threading overhead
+    for vf_member, format_instructions in formats_to_render.items():
+      vf, result = _render_single_format(vf_member, format_instructions)
+      rendered_paths[vf] = result
+  else:
+    # Multiple formats: render in parallel (max 2 concurrent ffmpeg processes)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    logging.info(
+        'RENDERING - Rendering %d formats in parallel (max_workers=2)',
+        len(formats_to_render),
     )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+      futures = {
+          executor.submit(_render_single_format, vf, instr): vf
+          for vf, instr in formats_to_render.items()
+      }
+      for future in as_completed(futures):
+        vf, result = future.result()
+        rendered_paths[vf] = result
 
   # Always ensure the original format is included in the final rendering
   if original_format and original_format not in rendered_paths:
