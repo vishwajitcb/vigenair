@@ -177,6 +177,7 @@ class ParallelUploadInitiateResponse(BaseModel):
     objectKey: str
     totalSize: int
     numParts: int
+    maxConcurrentParts: int
     parts: List[PartUploadInfo]
 
 

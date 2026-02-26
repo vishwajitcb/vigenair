@@ -14,6 +14,7 @@
 
 """Video render endpoints."""
 
+import asyncio
 import json
 import logging
 import os
@@ -348,8 +349,11 @@ async def render_variants(
             "settings": request.settings or {},
         }
 
-        # Start background render task
-        background_tasks.add_task(_render_variants_background, folder, render_data)
+        # Start background render task in a thread pool so it doesn't block
+        # the main event loop (ffmpeg calls are long-running and sync).
+        # This allows run_coroutine_threadsafe calls in job_service to work.
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _render_variants_background, folder, render_data)
 
         return RenderResponse(
             folder=folder,

@@ -14,6 +14,7 @@
 
 """Video segments endpoints."""
 
+import asyncio
 import json
 import logging
 import os
@@ -343,8 +344,9 @@ async def split_segment(
                 status_code=404, detail="Segments not found. Run extraction first."
             )
 
-        # Start background split task
-        background_tasks.add_task(_split_segment_background, folder, request)
+        # Run in thread pool so long-running sync work doesn't block the event loop
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _split_segment_background, folder, request)
 
         return SplitSegmentResponse(
             status="processing",

@@ -45,36 +45,43 @@ def process_video(
   size = len(video_chunks)
   logging.info('EXTRACTOR - processing video with %d chunks...', size)
 
-  # Only upload video chunk files, not the entire directory
-  # to avoid race conditions with audio processing
-  for chunk_path in video_chunks:
-    chunk_basename = os.path.basename(chunk_path)
-    StorageService.upload_gcs_file(
-        file_path=chunk_path,
-        bucket_name=gcs_bucket_name,
-        destination_file_name=f"{media_file.gcs_folder}/{ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR}/{chunk_basename}",
-    )
-
-  # Process all video chunks immediately (not just single-chunk videos)
   if size == 1:
-    logging.info('EXTRACTOR - analyzing single video chunk...')
-    extract_video(media_file, gcs_bucket_name)
+    # Single chunk: upload then analyze directly
+    _upload_and_analyze(video_chunks[0], media_file, gcs_bucket_name)
   else:
-    # Process chunks in parallel (I/O-heavy: S3 download, API call, S3 upload)
-    logging.info('EXTRACTOR - analyzing %d video chunks...', size)
+    # Upload and analyze each chunk in parallel — as soon as a chunk is
+    # uploaded to GCS its Gemini analysis starts immediately, overlapping
+    # with uploads of remaining chunks.
+    logging.info('EXTRACTOR - uploading and analyzing %d video chunks in parallel...', size)
     with concurrent.futures.ThreadPoolExecutor(max_workers=ConfigService.CONFIG_MAX_CONCURRENCY) as executor:
       futures = {}
       for i, chunk_path in enumerate(video_chunks, start=1):
-        chunk_basename = os.path.basename(chunk_path)
-        chunk_file = Utils.TriggerFile(
-            f"{media_file.gcs_folder}/{ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR}/{chunk_basename}"
-        )
-        logging.info('EXTRACTOR - submitting video chunk %d/%d: %s', i, size, chunk_basename)
-        futures[executor.submit(extract_video, chunk_file, gcs_bucket_name)] = i
+        logging.info('EXTRACTOR - submitting chunk %d/%d for upload+analysis', i, size)
+        futures[executor.submit(_upload_and_analyze, chunk_path, media_file, gcs_bucket_name)] = i
       for future in concurrent.futures.as_completed(futures):
         idx = futures[future]
         future.result()  # propagate exceptions
-        logging.info('EXTRACTOR - finished video chunk %d/%d', idx, size)
+        logging.info('EXTRACTOR - finished chunk %d/%d', idx, size)
+
+
+def _upload_and_analyze(
+    chunk_path: str,
+    media_file: Utils.TriggerFile,
+    gcs_bucket_name: str,
+):
+  """Uploads a single chunk to GCS, then immediately runs Gemini analysis."""
+  chunk_basename = os.path.basename(chunk_path)
+  destination = (
+      f"{media_file.gcs_folder}/"
+      f"{ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR}/{chunk_basename}"
+  )
+  StorageService.upload_gcs_file(
+      file_path=chunk_path,
+      bucket_name=gcs_bucket_name,
+      destination_file_name=destination,
+  )
+  chunk_file = Utils.TriggerFile(destination)
+  extract_video(chunk_file, gcs_bucket_name)
 
 
 def extract_video(

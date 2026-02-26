@@ -20,7 +20,6 @@ let activeUpload = null;
 
 const MULTIPART_THRESHOLD = 100 * 1024 * 1024; // 100 MB
 const PARALLEL_PART_TARGET_SIZE = 256 * 1024 * 1024; // 256 MB per part
-const MAX_CONCURRENT_PARTS = 6;
 
 // Elements
 const jobsGrid = $('#jobsGrid');
@@ -358,7 +357,7 @@ async function handleParallelUpload() {
             numParts,
         );
 
-        const { folder, objectKey, parts } = initResponse;
+        const { folder, objectKey, parts, maxConcurrentParts = 6 } = initResponse;
         const actualNumParts = parts.length;
 
         const abortControllers = [];
@@ -437,7 +436,7 @@ async function handleParallelUpload() {
             }
         }
 
-        for (let i = 0; i < Math.min(MAX_CONCURRENT_PARTS, actualNumParts); i++) {
+        for (let i = 0; i < Math.min(maxConcurrentParts, actualNumParts); i++) {
             workers.push(worker());
         }
 

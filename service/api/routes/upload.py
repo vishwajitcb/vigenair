@@ -14,6 +14,7 @@
 
 """Video upload endpoint."""
 
+import asyncio
 import logging
 import math
 import os
@@ -23,6 +24,7 @@ from typing import List
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 
+import config as ConfigService
 import storage as StorageService
 import utils as Utils
 from api.models.responses import (
@@ -250,9 +252,10 @@ async def complete_resumable_upload(
         except Exception as db_error:
             logger.warning(f"Failed to update job status: {db_error}")
 
-        # Trigger background processing (empty string for local_video_path)
-        background_tasks.add_task(
-            _process_video_background, request.folder, "", request.objectKey
+        # Run in thread pool so long-running sync work doesn't block the event loop
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(
+            None, _process_video_background, request.folder, "", request.objectKey
         )
 
         return ResumableUploadCompleteResponse(
@@ -385,6 +388,7 @@ async def initiate_parallel_upload(request: ParallelUploadInitiateRequest):
             objectKey=object_key,
             totalSize=request.fileSize,
             numParts=num_parts,
+            maxConcurrentParts=ConfigService.CONFIG_MAX_UPLOAD_CONCURRENCY,
             parts=parts,
         )
 
@@ -439,9 +443,10 @@ async def complete_parallel_upload(
         except Exception as db_error:
             logger.warning(f"Failed to update job status: {db_error}")
 
-        # Trigger background processing
-        background_tasks.add_task(
-            _process_video_background, request.folder, "", request.objectKey
+        # Run in thread pool so long-running sync work doesn't block the event loop
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(
+            None, _process_video_background, request.folder, "", request.objectKey
         )
 
         return ResumableUploadCompleteResponse(
@@ -520,9 +525,10 @@ async def upload_video(
         except Exception as db_error:
             logger.warning(f"Failed to create MongoDB job (continuing anyway): {db_error}")
 
-        # Start background processing
-        background_tasks.add_task(
-            _process_video_background, folder, tmp_path, gcs_key
+        # Run in thread pool so long-running sync work doesn't block the event loop
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(
+            None, _process_video_background, folder, tmp_path, gcs_key
         )
 
         return UploadResponse(
