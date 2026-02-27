@@ -58,19 +58,6 @@ async def _generate_presigned_urls_for_job(job_data: Dict[str, Any]) -> Dict[str
             logger.warning(f"Failed to generate presigned URL for thumbnail: {e}")
             job_data["thumbnailUrl"] = None
 
-    # Segment URLs
-    folder = job_data.get("folder", "")
-    for segment in job_data.get("segments", []):
-        segment_id = segment.get("id")
-        if segment_id:
-            try:
-                video_key = f"{folder}/av_segments_cuts/{segment_id}.mp4"
-                thumb_key = f"{folder}/av_segments_cuts/{segment_id}.jpg"
-                segment["videoUrl"] = get_presigned_url(video_key)
-                segment["thumbnailUrl"] = get_presigned_url(thumb_key)
-            except Exception as e:
-                logger.warning(f"Failed to generate presigned URLs for segment {segment_id}: {e}")
-
     # Render URLs
     for render in job_data.get("renders", []):
         formats = render.get("formats", {})
