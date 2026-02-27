@@ -135,7 +135,6 @@ function showMainContent() {
     errorState.classList.add('hidden');
 
     renderVideoPlayer();
-    renderSegments();
     configureAudioModeOptions();
 
     if (job.variants && job.variants.length > 0) {
@@ -226,47 +225,6 @@ function renderVideoPlayer() {
     }
 }
 
-function renderSegments() {
-    const strip = $('#segmentsStrip');
-    const segments = job.segments || [];
-
-    if (segments.length === 0) {
-        strip.innerHTML = '<p class="text-gray-500 text-sm">No segments available</p>';
-        return;
-    }
-
-    strip.innerHTML = segments.map((seg, idx) => `
-        <div class="segment-thumb flex-shrink-0 cursor-pointer group" data-id="${seg.id}">
-            <div class="w-24 h-16 rounded-lg overflow-hidden bg-gray-200 relative">
-                ${seg.thumbnailUrl
-                    ? `<img src="${seg.thumbnailUrl}" class="w-full h-full object-cover" alt="Segment ${idx + 1}">`
-                    : `<div class="w-full h-full bg-gradient-to-br from-primary/20 to-secondary/20 flex items-center justify-center">
-                        <span class="text-gray-400 text-xs font-medium">${idx + 1}</span>
-                    </div>`
-                }
-                <div class="absolute bottom-0 left-0 right-0 bg-black/60 text-white text-xs px-1 py-0.5">
-                    ${formatDuration(seg.duration || 0)}
-                </div>
-            </div>
-            <p class="text-xs text-gray-500 mt-1 truncate w-24" title="${seg.description || `Segment ${idx + 1}`}">
-                ${seg.description || `Segment ${idx + 1}`}
-            </p>
-        </div>
-    `).join('');
-
-    // Click to play segment
-    $$('.segment-thumb').forEach(thumb => {
-        thumb.addEventListener('click', () => {
-            const segId = thumb.dataset.id;
-            const segment = segments.find(s => s.id === segId);
-            if (segment && segment.videoUrl) {
-                const video = $('#videoPlayer');
-                video.src = segment.videoUrl;
-                video.play();
-            }
-        });
-    });
-}
 
 async function handleGenerateVariants() {
     const btn = $('#generateBtn');
