@@ -207,6 +207,14 @@ class Extractor:
     """Extracts all the available data from the input video."""
     logging.info('EXTRACTOR - Starting extraction...')
     tmp_dir = tempfile.mkdtemp()
+    try:
+      self._run_initial_extract(tmp_dir)
+    finally:
+      shutil.rmtree(tmp_dir, ignore_errors=True)
+      logging.info('EXTRACTOR - Cleaned up temp dir: %s', tmp_dir)
+
+  def _run_initial_extract(self, tmp_dir: str):
+    """Internal implementation of initial_extract."""
     input_video_file_path = StorageService.download_gcs_file(
         file_path=self.media_file,
         output_dir=tmp_dir,
@@ -561,47 +569,51 @@ class Extractor:
     """Combines all analysis outpus and creates the optimised segments."""
     logging.info('EXTRACTOR - Finalising extraction...')
     tmp_dir = tempfile.mkdtemp()
-    video_file_name = next(
-        iter(
-            StorageService.filter_video_files(
-                prefix=(
-                    f'{self.media_file.gcs_root_folder}/'
-                    f'{ConfigService.INPUT_FILENAME}'
-                ),
-                bucket_name=self.gcs_bucket_name,
-                first_only=True,
-            )
-        ), None
-    )
-    input_video_file_path = StorageService.download_gcs_file(
-        file_path=Utils.TriggerFile(video_file_name),
-        output_dir=tmp_dir,
-        bucket_name=self.gcs_bucket_name,
-    )
+    try:
+      video_file_name = next(
+          iter(
+              StorageService.filter_video_files(
+                  prefix=(
+                      f'{self.media_file.gcs_root_folder}/'
+                      f'{ConfigService.INPUT_FILENAME}'
+                  ),
+                  bucket_name=self.gcs_bucket_name,
+                  first_only=True,
+              )
+          ), None
+      )
+      input_video_file_path = StorageService.download_gcs_file(
+          file_path=Utils.TriggerFile(video_file_name),
+          output_dir=tmp_dir,
+          bucket_name=self.gcs_bucket_name,
+      )
 
-    # Get video duration to clamp segment times
-    video_duration = Utils.get_media_duration(input_video_file_path)
-    logging.info('EXTRACTOR - Video duration: %.2f seconds', video_duration)
+      # Get video duration to clamp segment times
+      video_duration = Utils.get_media_duration(input_video_file_path)
+      logging.info('EXTRACTOR - Video duration: %.2f seconds', video_duration)
 
-    annotation_results = self.extract_video_finalise(tmp_dir)
-    transcription_dataframe = self.extract_audio_finalise(tmp_dir)
+      annotation_results = self.extract_video_finalise(tmp_dir)
+      transcription_dataframe = self.extract_audio_finalise(tmp_dir)
 
-    optimised_av_segments = _create_optimised_segments(
-        annotation_results,
-        transcription_dataframe,
-        video_duration=video_duration,
-    )
-    logging.info(
-        'SEGMENTS - Optimised segments: %r',
-        optimised_av_segments.to_json(orient='records')
-    )
-    self.finalise_av_segments(
-        tmp_dir,
-        input_video_file_path,
-        video_file_name,
-        optimised_av_segments,
-    )
-    logging.info('EXTRACTOR - Extraction completed successfully!')
+      optimised_av_segments = _create_optimised_segments(
+          annotation_results,
+          transcription_dataframe,
+          video_duration=video_duration,
+      )
+      logging.info(
+          'SEGMENTS - Optimised segments: %r',
+          optimised_av_segments.to_json(orient='records')
+      )
+      self.finalise_av_segments(
+          tmp_dir,
+          input_video_file_path,
+          video_file_name,
+          optimised_av_segments,
+      )
+      logging.info('EXTRACTOR - Extraction completed successfully!')
+    finally:
+      shutil.rmtree(tmp_dir, ignore_errors=True)
+      logging.info('EXTRACTOR - Cleaned up temp dir: %s', tmp_dir)
 
   def finalise_av_segments(
       self,
@@ -823,76 +835,80 @@ class Extractor:
         self.media_file.full_gcs_path
     )
     tmp_dir = tempfile.mkdtemp()
-    video_file_name = next(
-        iter(
-            StorageService.filter_video_files(
-                prefix=(
-                    f'{self.media_file.gcs_root_folder}/'
-                    f'{ConfigService.INPUT_FILENAME}'
-                ),
-                bucket_name=self.gcs_bucket_name,
-                first_only=True,
-            )
-        ), None
-    )
-    input_video_file_path = StorageService.download_gcs_file(
-        file_path=Utils.TriggerFile(video_file_name),
-        output_dir=tmp_dir,
-        bucket_name=self.gcs_bucket_name,
-    )
+    try:
+      video_file_name = next(
+          iter(
+              StorageService.filter_video_files(
+                  prefix=(
+                      f'{self.media_file.gcs_root_folder}/'
+                      f'{ConfigService.INPUT_FILENAME}'
+                  ),
+                  bucket_name=self.gcs_bucket_name,
+                  first_only=True,
+              )
+          ), None
+      )
+      input_video_file_path = StorageService.download_gcs_file(
+          file_path=Utils.TriggerFile(video_file_name),
+          output_dir=tmp_dir,
+          bucket_name=self.gcs_bucket_name,
+      )
 
-    av_segments_file_path = StorageService.download_gcs_file(
-        file_path=Utils.TriggerFile(
-            str(
-                pathlib.Path(
-                    self.media_file.gcs_root_folder,
-                    ConfigService.OUTPUT_PRESPLIT_DATA_FILE
-                )
-            )
-        ),
-        output_dir=tmp_dir,
-        bucket_name=self.gcs_bucket_name,
-    )
-    av_segments = pd.read_json(
-        av_segments_file_path,
-        orient='records',
-    )
-    av_segments['av_segment_id'] = av_segments['av_segment_id'].astype(
-        str
-    ).str.replace(r'\.0', '')
-    logging.info(
-        'SPLITTING - Current segments: %r',
-        av_segments.to_json(orient='records')
-    )
+      av_segments_file_path = StorageService.download_gcs_file(
+          file_path=Utils.TriggerFile(
+              str(
+                  pathlib.Path(
+                      self.media_file.gcs_root_folder,
+                      ConfigService.OUTPUT_PRESPLIT_DATA_FILE
+                  )
+              )
+          ),
+          output_dir=tmp_dir,
+          bucket_name=self.gcs_bucket_name,
+      )
+      av_segments = pd.read_json(
+          av_segments_file_path,
+          orient='records',
+      )
+      av_segments['av_segment_id'] = av_segments['av_segment_id'].astype(
+          str
+      ).str.replace(r'\.0', '')
+      logging.info(
+          'SPLITTING - Current segments: %r',
+          av_segments.to_json(orient='records')
+      )
 
-    split_file_contents = StorageService.download_gcs_file(
-        file_path=self.media_file,
-        bucket_name=self.gcs_bucket_name,
-        fetch_contents=True,
-    )
-    av_segment_markers = [
-        AvSegmentSplitMarker(**segment_marker)
-        for segment_marker in json.loads(split_file_contents.decode('utf-8'))
-    ]
-    av_segments = _finalise_split(av_segments, av_segment_markers)
-    self.finalise_av_segments(
-        tmp_dir,
-        input_video_file_path,
-        video_file_name,
-        av_segments,
-    )
-    StorageService.delete_gcs_file(
-        file_path=Utils.TriggerFile(
-            str(
-                pathlib.Path(
-                    self.media_file.gcs_root_folder,
-                    ConfigService.OUTPUT_PRESPLIT_DATA_FILE
-                )
-            )
-        ),
-        bucket_name=self.gcs_bucket_name,
-    )
-    logging.info('SPLITTING - Split operation completed successfully!')
+      split_file_contents = StorageService.download_gcs_file(
+          file_path=self.media_file,
+          bucket_name=self.gcs_bucket_name,
+          fetch_contents=True,
+      )
+      av_segment_markers = [
+          AvSegmentSplitMarker(**segment_marker)
+          for segment_marker in json.loads(split_file_contents.decode('utf-8'))
+      ]
+      av_segments = _finalise_split(av_segments, av_segment_markers)
+      self.finalise_av_segments(
+          tmp_dir,
+          input_video_file_path,
+          video_file_name,
+          av_segments,
+      )
+      StorageService.delete_gcs_file(
+          file_path=Utils.TriggerFile(
+              str(
+                  pathlib.Path(
+                      self.media_file.gcs_root_folder,
+                      ConfigService.OUTPUT_PRESPLIT_DATA_FILE
+                  )
+              )
+          ),
+          bucket_name=self.gcs_bucket_name,
+      )
+      logging.info('SPLITTING - Split operation completed successfully!')
+    finally:
+      shutil.rmtree(tmp_dir, ignore_errors=True)
+      logging.info('SPLITTING - Cleaned up temp dir: %s', tmp_dir)
 
 
 def _finalise_split(

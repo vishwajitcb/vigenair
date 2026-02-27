@@ -178,9 +178,10 @@ async def wipe_all_jobs():
 
     logger.info(f"Wipe all: soft-deleted {len(folders)} jobs")
 
-    # Delete GCS files in background
+    # Delete GCS files and temp files in parallel background threads
     loop = asyncio.get_running_loop()
     loop.run_in_executor(None, _wipe_all_gcs_background, folders)
+    loop.run_in_executor(None, _cleanup_temp_files)
 
     return {"message": f"Wiped {len(folders)} jobs", "jobsDeleted": len(folders)}
 
@@ -314,7 +315,7 @@ def _delete_gcs_files_background(folder: str):
 
 
 def _wipe_all_gcs_background(folders: List[str]):
-    """Delete all GCS files for multiple folders (runs in thread pool)."""
+    """Delete all GCS files for multiple folders and temp files (runs in thread pool)."""
     from storage.storage import delete_folder
     total = 0
     for folder in folders:
@@ -324,6 +325,28 @@ def _wipe_all_gcs_background(folders: List[str]):
         except Exception as e:
             logger.error(f"Wipe GCS cleanup failed for {folder}: {e}")
     logger.info(f"Wipe all: deleted {total} GCS files across {len(folders)} folders")
+
+
+def _cleanup_temp_files():
+    """Remove leftover temp files from /tmp created during video processing."""
+    import os
+    import shutil
+    tmp_dir = "/tmp"
+    removed = 0
+    for entry in os.listdir(tmp_dir):
+        path = os.path.join(tmp_dir, entry)
+        # Skip system directories and the vigenair config dir
+        if entry.startswith("systemd-") or entry == "vigenair":
+            continue
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.unlink(path)
+            removed += 1
+        except Exception as e:
+            logger.warning(f"Failed to remove temp file {path}: {e}")
+    logger.info(f"Temp cleanup: removed {removed} entries from /tmp")
 
 
 # Specialized update endpoints

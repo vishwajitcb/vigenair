@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import pathlib
+import shutil
 import tempfile
 from typing import Sequence, Tuple
 
@@ -139,75 +140,79 @@ def _process_video_without_audio(
 def extract_audio(media_file: Utils.TriggerFile, gcs_bucket_name: str):
   """Extracts audio information from the input video."""
   tmp_dir = tempfile.mkdtemp()
-  is_chunk = (
-      ConfigService.INPUT_EXTRACTION_AUDIO_FILENAME_SUFFIX
-      in media_file.full_gcs_path
-  )
-  audio_id = media_file.file_name.replace(
-      ConfigService.INPUT_EXTRACTION_AUDIO_FILENAME_SUFFIX, ''
-  )
-  audio_output_dir = str(
-      pathlib.Path(tmp_dir, ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR)
-  )
-  output_dir = audio_output_dir if is_chunk else tmp_dir
-  os.makedirs(output_dir, exist_ok=True)
-  audio_file_path = StorageService.download_gcs_file(
-      file_path=media_file,
-      output_dir=output_dir,
-      bucket_name=gcs_bucket_name,
-  )
-  (
-      _,
-      _,
-      audio_transcription_dataframe,
-      video_language,
-      language_probability,
-  ) = _analyse_audio(
-      root_dir=tmp_dir,
-      output_dir=output_dir,
-      file_id=audio_id,
-      audio_file_path=audio_file_path,
-      transcription_service=media_file.video_metadata.transcription_service,
-      gcs_folder=media_file.gcs_root_folder,
-      gcs_bucket_name=gcs_bucket_name,
-  )
-  os.makedirs(audio_output_dir, exist_ok=True)
-  language_info = {
-      VIDEO_LANGUAGE_KEY: video_language,
-      LANGUAGE_PROBABILITY_KEY: language_probability,
-  }
-  language_info_file_path = os.path.join(
-      audio_output_dir,
-      (f'{audio_id}_{ConfigService.OUTPUT_LANGUAGE_INFO_FILE}')
-  )
-  with open(language_info_file_path, 'w', encoding='utf8') as f:
-    json.dump(language_info, f, indent=2)
+  try:
+    is_chunk = (
+        ConfigService.INPUT_EXTRACTION_AUDIO_FILENAME_SUFFIX
+        in media_file.full_gcs_path
+    )
+    audio_id = media_file.file_name.replace(
+        ConfigService.INPUT_EXTRACTION_AUDIO_FILENAME_SUFFIX, ''
+    )
+    audio_output_dir = str(
+        pathlib.Path(tmp_dir, ConfigService.OUTPUT_ANALYSIS_CHUNKS_DIR)
+    )
+    output_dir = audio_output_dir if is_chunk else tmp_dir
+    os.makedirs(output_dir, exist_ok=True)
+    audio_file_path = StorageService.download_gcs_file(
+        file_path=media_file,
+        output_dir=output_dir,
+        bucket_name=gcs_bucket_name,
+    )
+    (
+        _,
+        _,
+        audio_transcription_dataframe,
+        video_language,
+        language_probability,
+    ) = _analyse_audio(
+        root_dir=tmp_dir,
+        output_dir=output_dir,
+        file_id=audio_id,
+        audio_file_path=audio_file_path,
+        transcription_service=media_file.video_metadata.transcription_service,
+        gcs_folder=media_file.gcs_root_folder,
+        gcs_bucket_name=gcs_bucket_name,
+    )
+    os.makedirs(audio_output_dir, exist_ok=True)
+    language_info = {
+        VIDEO_LANGUAGE_KEY: video_language,
+        LANGUAGE_PROBABILITY_KEY: language_probability,
+    }
+    language_info_file_path = os.path.join(
+        audio_output_dir,
+        (f'{audio_id}_{ConfigService.OUTPUT_LANGUAGE_INFO_FILE}')
+    )
+    with open(language_info_file_path, 'w', encoding='utf8') as f:
+      json.dump(language_info, f, indent=2)
 
-  transcript_file_path = os.path.join(
-      audio_output_dir,
-      f'{audio_id}_{ConfigService.OUTPUT_TRANSCRIPT_FILE}',
-  )
-  audio_transcription_dataframe.to_json(
-      transcript_file_path,
-      orient='records',
-  )
-  logging.info(
-      'THREADING - analyse_audio finished for chunk#%s!',
-      audio_id,
-  )
-  StorageService.upload_gcs_dir(
-      source_directory=tmp_dir,
-      bucket_name=gcs_bucket_name,
-      target_dir=media_file.gcs_root_folder,
-  )
-  _check_finalise_extract_audio(
-      total_count=(
-          1 if audio_id == ConfigService.INPUT_FILENAME else
-          int(audio_id.split('-')[1])
-      ),
-      gcs_bucket_name=gcs_bucket_name,
-      gcs_folder=media_file.gcs_folder,
-  )
+    transcript_file_path = os.path.join(
+        audio_output_dir,
+        f'{audio_id}_{ConfigService.OUTPUT_TRANSCRIPT_FILE}',
+    )
+    audio_transcription_dataframe.to_json(
+        transcript_file_path,
+        orient='records',
+    )
+    logging.info(
+        'THREADING - analyse_audio finished for chunk#%s!',
+        audio_id,
+    )
+    StorageService.upload_gcs_dir(
+        source_directory=tmp_dir,
+        bucket_name=gcs_bucket_name,
+        target_dir=media_file.gcs_root_folder,
+    )
+    _check_finalise_extract_audio(
+        total_count=(
+            1 if audio_id == ConfigService.INPUT_FILENAME else
+            int(audio_id.split('-')[1])
+        ),
+        gcs_bucket_name=gcs_bucket_name,
+        gcs_folder=media_file.gcs_folder,
+    )
+  finally:
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    logging.info('AUDIO - Cleaned up temp dir: %s', tmp_dir)
 
 
 def _analyse_audio(
