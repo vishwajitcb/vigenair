@@ -1,5 +1,6 @@
 """Job management API routes."""
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -97,8 +98,8 @@ async def list_jobs(
     """List all jobs with pagination and filtering."""
     db = await get_database()
 
-    # Build query
-    query: Dict[str, Any] = {}
+    # Build query - exclude soft-deleted jobs
+    query: Dict[str, Any] = {"deleted": {"$ne": True}}
 
     if status:
         query["status"] = status
@@ -146,12 +147,50 @@ async def list_jobs(
     )
 
 
+@router.get("/storage/usage")
+async def get_storage_usage():
+    """Get GCS bucket storage usage."""
+    try:
+        from storage.storage import get_bucket_usage
+        usage = get_bucket_usage()
+        return usage
+    except Exception as e:
+        logger.error(f"Failed to get storage usage: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/wipe/all")
+async def wipe_all_jobs():
+    """Nuclear wipe: soft-delete all jobs and delete all GCS files in background."""
+    db = await get_database()
+
+    # Get all non-deleted job folders
+    cursor = db.jobs.find({"deleted": {"$ne": True}}, {"folder": 1})
+    folders = []
+    async for doc in cursor:
+        folders.append(doc["folder"])
+
+    # Soft-delete all jobs
+    await db.jobs.update_many(
+        {"deleted": {"$ne": True}},
+        {"$set": {"deleted": True, "updatedAt": datetime.utcnow()}}
+    )
+
+    logger.info(f"Wipe all: soft-deleted {len(folders)} jobs")
+
+    # Delete GCS files in background
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _wipe_all_gcs_background, folders)
+
+    return {"message": f"Wiped {len(folders)} jobs", "jobsDeleted": len(folders)}
+
+
 @router.get("/{folder}", response_model=JobResponse)
 async def get_job(folder: str):
     """Get a single job by folder name."""
     job_doc = await _get_job_by_folder(folder)
 
-    if not job_doc:
+    if not job_doc or job_doc.get("deleted"):
         raise HTTPException(status_code=404, detail=f"Job not found: {folder}")
 
     # Remove MongoDB _id
@@ -239,8 +278,8 @@ async def update_job(folder: str, job_update: JobUpdate):
 
 
 @router.delete("/{folder}")
-async def delete_job(folder: str, delete_s3_files: bool = Query(True)):
-    """Delete a job and optionally its S3 files."""
+async def delete_job(folder: str, delete_gcs_files: bool = Query(True)):
+    """Soft-delete a job: sets deleted=True immediately, then removes GCS files in background."""
     db = await get_database()
 
     # Check if job exists
@@ -248,23 +287,43 @@ async def delete_job(folder: str, delete_s3_files: bool = Query(True)):
     if not existing:
         raise HTTPException(status_code=404, detail=f"Job not found: {folder}")
 
-    # Delete S3 files if requested
-    if delete_s3_files:
-        try:
-            from storage.storage import list_files, delete_file
-            files = list_files(prefix=folder)
-            for file_key in files:
-                delete_file(file_key)
-            logger.info(f"Deleted {len(files)} S3 files for job: {folder}")
-        except Exception as e:
-            logger.error(f"Failed to delete S3 files for job {folder}: {e}")
+    # Soft delete first - respond fast
+    await db.jobs.update_one(
+        {"folder": folder},
+        {"$set": {"deleted": True, "updatedAt": datetime.utcnow()}}
+    )
 
-    # Delete from database
-    await db.jobs.delete_one({"folder": folder})
+    logger.info(f"Soft-deleted job: {folder}")
 
-    logger.info(f"Deleted job: {folder}")
+    # Delete GCS files in background
+    if delete_gcs_files:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _delete_gcs_files_background, folder)
 
     return {"message": f"Job deleted: {folder}"}
+
+
+def _delete_gcs_files_background(folder: str):
+    """Delete all GCS files for a job folder (runs in thread pool)."""
+    try:
+        from storage.storage import delete_folder
+        count = delete_folder(prefix=f"{folder}/")
+        logger.info(f"Background GCS cleanup: deleted {count} files for {folder}")
+    except Exception as e:
+        logger.error(f"Background GCS cleanup failed for {folder}: {e}")
+
+
+def _wipe_all_gcs_background(folders: List[str]):
+    """Delete all GCS files for multiple folders (runs in thread pool)."""
+    from storage.storage import delete_folder
+    total = 0
+    for folder in folders:
+        try:
+            count = delete_folder(prefix=f"{folder}/")
+            total += count
+        except Exception as e:
+            logger.error(f"Wipe GCS cleanup failed for {folder}: {e}")
+    logger.info(f"Wipe all: deleted {total} GCS files across {len(folders)} folders")
 
 
 # Specialized update endpoints

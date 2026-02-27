@@ -319,6 +319,40 @@ mat-divider {
 /* Utility Classes - Sizing */
 .width-full { width: 100%; }
 .width-300 { width: 300px; }
+.run-option-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+.delete-run-btn {
+  font-size: 18px;
+  color: #999;
+  cursor: pointer;
+  margin-left: 8px;
+}
+.delete-run-btn:hover {
+  color: #f44336;
+}
+.storage-info {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  opacity: 0.85;
+  margin-right: 4px;
+}
+.storage-icon {
+  font-size: 18px;
+  height: 18px;
+  width: 18px;
+}
+.storage-text {
+  font-weight: 500;
+}
+.wipe-btn {
+  margin-right: 8px;
+}
 .top-64 { top: 64px; }
 .height-minus-header { height: calc(100% - 68px); }
 .sidenav-width { width: 35rem; }

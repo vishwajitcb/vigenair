@@ -146,6 +146,50 @@ export class ApiCallsService implements ApiCalls {
   }
 
   /**
+   * Soft-delete a job: clears GCS files and marks as deleted in MongoDB
+   */
+  deleteJob(folder: string): Observable<any> {
+    return this.httpClient
+      .delete(`${API_BASE_URL}/jobs/${folder}`)
+      .pipe(
+        catchError(error => {
+          console.error('Delete job failed:', error);
+          return throwError(() => error);
+        })
+      );
+  }
+
+  /**
+   * Get GCS bucket storage usage
+   */
+  getStorageUsage(): Observable<{ totalBytes: number; totalFiles: number; humanReadable: string }> {
+    return this.httpClient
+      .get<{ totalBytes: number; totalFiles: number; humanReadable: string }>(
+        `${API_BASE_URL}/jobs/storage/usage`
+      )
+      .pipe(
+        catchError(error => {
+          console.error('Get storage usage failed:', error);
+          return throwError(() => error);
+        })
+      );
+  }
+
+  /**
+   * Nuclear wipe: soft-delete all jobs and clear all GCS files
+   */
+  wipeAllJobs(): Observable<any> {
+    return this.httpClient
+      .delete(`${API_BASE_URL}/jobs/wipe/all`)
+      .pipe(
+        catchError(error => {
+          console.error('Wipe all failed:', error);
+          return throwError(() => error);
+        })
+      );
+  }
+
+  /**
    * Get file content from storage
    */
   getFromGcs(url: string, retryDelay = 0, maxRetries = 0): Observable<string> {

@@ -32,6 +32,19 @@ limitations under the License.
     ></span
   >
   <span class="margin-left-auto"></span>
+  <span class="storage-info" matTooltip="GCS bucket usage">
+    <mat-icon class="storage-icon">cloud</mat-icon>
+    <span class="storage-text">{{ storageLoading ? '...' : storageUsage }}</span>
+  </span>
+  <button
+    mat-icon-button
+    matTooltip="Wipe all jobs and storage"
+    color="warn"
+    (click)="wipeAllJobs()"
+    class="wipe-btn"
+  >
+    <mat-icon>delete_forever</mat-icon>
+  </button>
   <span #renderQueueButtonSpan>
     <button
       mat-icon-button
@@ -102,14 +115,21 @@ limitations under the License.
             (click)="getPreviousRuns()"
           >
             @for (run of previousRuns; track $index) {
-              <mat-option *ngIf="isCurrentUserRun(run)" [value]="run"
-                >{{ run.split('--')[0]
-                }}{{
-                  run.split('--').length === 4 && run.split('--')[1] === 'n'
-                    ? ' (no voice-over)'
-                    : ''
-                }}</mat-option
-              >
+              <mat-option *ngIf="isCurrentUserRun(run)" [value]="run">
+                <span class="run-option-row">
+                  <span>{{ run.split('--')[0]
+                    }}{{
+                      run.split('--').length === 4 && run.split('--')[1] === 'n'
+                        ? ' (no voice-over)'
+                        : ''
+                    }}</span>
+                  <mat-icon
+                    class="delete-run-btn"
+                    (click)="deleteJob($event, run)"
+                    matTooltip="Delete this job"
+                  >delete</mat-icon>
+                </span>
+              </mat-option>
             }
           </mat-select>
         </mat-form-field>

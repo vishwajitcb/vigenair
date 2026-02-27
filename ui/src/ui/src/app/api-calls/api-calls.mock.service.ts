@@ -67,6 +67,15 @@ export class ApiCallsService implements ApiCalls {
     });
   }
   deleteGcsFolder(folder: string): void {}
+  deleteJob(folder: string): Observable<any> {
+    return of({ message: `Job deleted: ${folder}` });
+  }
+  getStorageUsage(): Observable<{ totalBytes: number; totalFiles: number; humanReadable: string }> {
+    return of({ totalBytes: 0, totalFiles: 0, humanReadable: '0 B' });
+  }
+  wipeAllJobs(): Observable<any> {
+    return of({ message: 'Wiped all jobs' });
+  }
   getFromGcs(url: string): Observable<string> {
     return new Observable(subscriber => {
       setTimeout(() => {

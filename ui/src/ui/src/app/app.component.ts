@@ -248,6 +248,8 @@ export class AppComponent {
   previousRuns: string[] | undefined;
   previousRenders: PreviousRender[] | undefined;
   encodedUserId: string | undefined;
+  storageUsage: string = '';
+  storageLoading = false;
   folder = '';
   folderGcsPath = '';
   transcriptionText = '';
@@ -320,6 +322,7 @@ export class AppComponent {
   ) {
     this.getPreviousRuns();
     this.getWebAppUrl();
+    this.refreshStorageUsage();
 
     // Allow locally served app to process query params.
     // Production env (Apps Script) is handled via ngAfterViewInit()
@@ -818,6 +821,58 @@ export class AppComponent {
     this.loading = true;
     const response = this.apiCallsService.loadPreviousRun(folder);
     this.processVideo(response[0], response[1]);
+  }
+
+  deleteJob(event: MouseEvent, folder: string) {
+    event.stopPropagation();
+    const name = folder.split('--')[0];
+    if (!confirm(`Delete "${name}"? This will remove all files from storage.`)) {
+      return;
+    }
+    this.apiCallsService.deleteJob(folder).subscribe({
+      next: () => {
+        this.previousRuns = this.previousRuns?.filter(r => r !== folder);
+        this.refreshStorageUsage();
+        this.snackBar.open('Job deleted', 'OK', { duration: 3000 });
+      },
+      error: (err) => {
+        console.error('Failed to delete job:', err);
+        this.snackBar.open('Failed to delete job', 'OK', { duration: 3000 });
+      },
+    });
+  }
+
+  refreshStorageUsage() {
+    this.storageLoading = true;
+    this.apiCallsService.getStorageUsage().subscribe({
+      next: (usage) => {
+        this.storageUsage = usage.humanReadable;
+        this.storageLoading = false;
+      },
+      error: () => {
+        this.storageUsage = '?';
+        this.storageLoading = false;
+      },
+    });
+  }
+
+  wipeAllJobs() {
+    if (!confirm('WIPE ALL JOBS? This will delete ALL files from cloud storage and remove all jobs. This cannot be undone.')) {
+      return;
+    }
+    if (!confirm('Are you absolutely sure? This is irreversible.')) {
+      return;
+    }
+    this.apiCallsService.wipeAllJobs().subscribe({
+      next: () => {
+        this.previousRuns = [];
+        this.refreshStorageUsage();
+        this.snackBar.open('All jobs wiped', 'OK', { duration: 3000 });
+      },
+      error: () => {
+        this.snackBar.open('Failed to wipe jobs', 'OK', { duration: 3000 });
+      },
+    });
   }
 
   loadPreviousRender(folder: string) {

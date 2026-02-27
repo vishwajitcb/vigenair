@@ -465,6 +465,62 @@ def delete_files(keys: Sequence[str]) -> None:
             logging.warning('DELETE - Failed to delete "%s": %s', key, e)
 
 
+def delete_folder(prefix: str) -> int:
+    """Batch-deletes all files under a prefix using GCS batch API.
+
+    Chunks into batches of 100 (GCS batch API limit).
+
+    Args:
+        prefix: The folder prefix (e.g. "job-folder/").
+
+    Returns:
+        The number of files deleted.
+    """
+    bucket = _get_bucket()
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    if not blobs:
+        return 0
+    BATCH_SIZE = 100
+    for i in range(0, len(blobs), BATCH_SIZE):
+        chunk = blobs[i:i + BATCH_SIZE]
+        bucket.delete_blobs(chunk, on_error=lambda blob: logging.warning(
+            'DELETE - Failed to delete "%s".', blob.name
+        ))
+    logging.info('DELETE - Batch-deleted %d files under "%s".', len(blobs), prefix)
+    return len(blobs)
+
+
+def get_bucket_usage() -> dict:
+    """Get total size of all objects in the bucket.
+
+    Returns:
+        Dict with totalBytes, totalFiles, and humanReadable size.
+    """
+    client = _get_gcs_client()
+    bucket_name = _get_bucket_name()
+    total_bytes = 0
+    total_files = 0
+    for blob in client.list_blobs(bucket_name):
+        total_bytes += blob.size or 0
+        total_files += 1
+
+    # Human-readable
+    if total_bytes < 1024:
+        human = f"{total_bytes} B"
+    elif total_bytes < 1024 ** 2:
+        human = f"{total_bytes / 1024:.1f} KB"
+    elif total_bytes < 1024 ** 3:
+        human = f"{total_bytes / 1024 ** 2:.1f} MB"
+    else:
+        human = f"{total_bytes / 1024 ** 3:.2f} GB"
+
+    return {
+        "totalBytes": total_bytes,
+        "totalFiles": total_files,
+        "humanReadable": human,
+    }
+
+
 # Backward compatibility aliases
 download_gcs_file = download_file
 upload_gcs_file = upload_file

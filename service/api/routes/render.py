@@ -30,6 +30,7 @@ import utils as Utils
 from api.models.responses import RenderRequest, RenderResponse, RendersResponse
 from db.job_service import update_job_status_sync, update_job_error_sync
 from db.models import JobStatus, JobStage
+from db.mongodb import get_database
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -474,7 +475,7 @@ async def get_renders(folder: str):
 
 @router.delete("/{folder}")
 async def delete_video(folder: str):
-    """Delete a video and all its associated files.
+    """Soft-delete a video: marks as deleted immediately, removes GCS files in background.
 
     Args:
         folder: The video folder name.
@@ -483,18 +484,16 @@ async def delete_video(folder: str):
         Success message.
     """
     try:
-        # List all files in folder
-        prefix = f"{folder}/"
-        files = StorageService.list_files(prefix=prefix)
+        # Soft delete in MongoDB first - respond fast
+        db = await get_database()
+        await db.jobs.update_one(
+            {"folder": folder},
+            {"$set": {"deleted": True, "updatedAt": datetime.utcnow()}}
+        )
 
-        if not files:
-            raise HTTPException(status_code=404, detail=f"Video not found: {folder}")
-
-        # Delete all files
-        for file_key in files:
-            StorageService.delete_file(file_key)
-
-        logger.info(f"Deleted video folder: {folder} ({len(files)} files)")
+        # Delete GCS files in background
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _delete_gcs_files_bg, folder)
 
         return {"status": "success", "message": f"Deleted {folder}"}
 
@@ -505,3 +504,13 @@ async def delete_video(folder: str):
         raise HTTPException(
             status_code=500, detail=f"Failed to delete video: {str(e)}"
         )
+
+
+def _delete_gcs_files_bg(folder: str):
+    """Delete all GCS files for a folder (runs in thread pool)."""
+    try:
+        from storage.storage import delete_folder
+        count = delete_folder(prefix=f"{folder}/")
+        logger.info(f"Background GCS cleanup: deleted {count} files for {folder}")
+    except Exception as e:
+        logger.error(f"Background GCS cleanup failed for {folder}: {e}")

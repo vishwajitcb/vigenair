@@ -557,6 +557,13 @@ async def list_videos():
         if not bucket:
             raise HTTPException(status_code=500, detail="GCS_BUCKET not configured")
 
+        # Get deleted job folders from MongoDB to exclude them
+        db = await get_database()
+        deleted_cursor = db.jobs.find({"deleted": True}, {"folder": 1})
+        deleted_folders = set()
+        async for doc in deleted_cursor:
+            deleted_folders.add(doc["folder"])
+
         # List top-level folders in GCS
         all_objects = StorageService.list_files(prefix="")
 
@@ -568,7 +575,7 @@ async def list_videos():
             parts = key.split("/")
             if len(parts) > 1:
                 folder = parts[0]
-                if folder not in folders_seen:
+                if folder not in folders_seen and folder not in deleted_folders:
                     folders_seen.add(folder)
 
                     try:

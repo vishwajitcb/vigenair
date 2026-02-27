@@ -214,6 +214,12 @@ export interface ApiCalls {
   loadPreviousRun(folder: string): string[];
   /** Deletes a GCS folder. */
   deleteGcsFolder(folder: string): void;
+  /** Soft-deletes a job: clears GCS files and marks as deleted. */
+  deleteJob(folder: string): Observable<any>;
+  /** Get GCS bucket storage usage. */
+  getStorageUsage(): Observable<{ totalBytes: number; totalFiles: number; humanReadable: string }>;
+  /** Nuclear wipe: soft-delete all jobs and clear all GCS files. */
+  wipeAllJobs(): Observable<any>;
   /** Fetches a file from GCS. */
   getFromGcs(
     url: string,

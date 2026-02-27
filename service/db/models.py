@@ -153,6 +153,9 @@ class Job(BaseModel):
     # UI state
     ui: UIState = Field(default_factory=UIState)
 
+    # Soft delete
+    deleted: bool = False
+
     class Config:
         use_enum_values = True
 
