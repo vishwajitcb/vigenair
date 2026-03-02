@@ -959,6 +959,7 @@ def _extract_segments_and_concat(
       extract_cmds = [
           'ffmpeg',
           '-ss', str(start_time),
+          '-accurate_seek',
           '-i', video_file_path,
           '-t', str(duration),
       ]
@@ -1381,8 +1382,10 @@ def _render_video_variant(
         vf, result = future.result()
         rendered_paths[vf] = result
 
-  # Always ensure the original format is included in the final rendering
-  if original_format and original_format not in rendered_paths:
+  # Ensure the original format is included only if it was requested
+  if (original_format
+      and original_format not in rendered_paths
+      and original_format in video_variant.render_settings.formats):
     logging.info(
         'RENDERING - Adding original format %s to rendered paths',
         original_format.aspect_ratio_str
