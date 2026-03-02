@@ -1020,7 +1020,7 @@ def _extract_segments_and_concat(
       )
 
     elif effective_mode == 'continuous':
-      # Concat video segments, then add continuous audio from original
+      # Concat video segments, then add per-segment audio from original
       video_only_path = os.path.join(segments_dir, 'video_only.mp4')
       Utils.execute_subprocess_commands(
           cmds=[
@@ -1034,13 +1034,48 @@ def _extract_segments_and_concat(
           description='concatenate video segments for continuous audio',
       )
 
-      # Extract continuous audio section from original video
-      # -ss/-t before second -i to do input seeking on the audio source
+      # Extract audio per segment (same timestamps as video) so audio
+      # stays aligned with each segment rather than drifting from a
+      # single continuous slice starting at the first segment's offset.
+      audio_segment_files = []
+      for idx, (start_time, end_time) in enumerate(shot_timestamps):
+        duration = end_time - start_time
+        audio_seg_path = os.path.join(segments_dir, f'audio_segment_{idx}.aac')
+        Utils.execute_subprocess_commands(
+            cmds=[
+                'ffmpeg',
+                '-ss', str(start_time),
+                '-accurate_seek',
+                '-i', video_file_path,
+                '-t', str(duration),
+                '-vn',
+                '-c:a', 'aac', '-b:a', '192k',
+                audio_seg_path,
+            ],
+            description=f'extract audio segment {idx}',
+        )
+        audio_segment_files.append(audio_seg_path)
+
+      audio_concat_file = os.path.join(segments_dir, 'audio_concat_list.txt')
+      with open(audio_concat_file, 'w') as f:
+        for af in audio_segment_files:
+          f.write(f"file '{af}'\n")
+      audio_only_path = os.path.join(segments_dir, 'audio_only.aac')
+      Utils.execute_subprocess_commands(
+          cmds=[
+              'ffmpeg',
+              '-f', 'concat', '-safe', '0',
+              '-i', audio_concat_file,
+              '-c', 'copy',
+              audio_only_path,
+          ],
+          description='concatenate audio segments',
+      )
+
       cont_cmds = [
           'ffmpeg',
           '-i', video_only_path,
-          '-ss', str(overlay_start), '-t', str(total_duration),
-          '-i', video_file_path,
+          '-i', audio_only_path,
           '-map', '0:v', '-map', '1:a',
           '-c:v', 'copy',
           '-c:a', 'aac', '-b:a', '192k',
@@ -1060,7 +1095,7 @@ def _extract_segments_and_concat(
       )
 
     elif effective_mode == 'music':
-      # Concat video segments, then merge speech + music overlay
+      # Concat video segments, then merge speech (per-segment) + music overlay
       video_only_path = os.path.join(segments_dir, 'video_only.mp4')
       Utils.execute_subprocess_commands(
           cmds=[
@@ -1074,46 +1109,80 @@ def _extract_segments_and_concat(
           description='concatenate video segments for music overlay',
       )
 
-      # Extract speech from the speech track using segment timestamps
-      # and music from the music track at overlay_start
-      # -ss/-t before each audio input for input seeking
-      music_cmds = [
-          'ffmpeg',
-          '-i', video_only_path,
-          '-ss', str(overlay_start), '-t', str(total_duration),
-          '-i', speech_track_path,
-          '-ss', str(overlay_start), '-t', str(total_duration),
-          '-i', music_track_path,
-          '-filter_complex',
-          '[1:a]asetpts=N/SR/TB[speech];'
-          '[2:a]asetpts=N/SR/TB[music];'
-          '[speech][music]amerge=inputs=2[outa]',
-          '-map', '0:v', '-map', '[outa]',
-          '-c:v', 'copy',
-          '-ac', '2',
-      ]
+      # Extract speech per segment so it stays aligned with the video.
+      # Music is background so a continuous slice is fine.
+      speech_segment_files = []
+      for idx, (start_time, end_time) in enumerate(shot_timestamps):
+        duration = end_time - start_time
+        speech_seg_path = os.path.join(segments_dir, f'speech_segment_{idx}.aac')
+        Utils.execute_subprocess_commands(
+            cmds=[
+                'ffmpeg',
+                '-ss', str(start_time),
+                '-accurate_seek',
+                '-i', speech_track_path,
+                '-t', str(duration),
+                '-vn',
+                '-c:a', 'aac', '-b:a', '192k',
+                speech_seg_path,
+            ],
+            description=f'extract speech segment {idx}',
+        )
+        speech_segment_files.append(speech_seg_path)
+
+      speech_concat_file = os.path.join(segments_dir, 'speech_concat_list.txt')
+      with open(speech_concat_file, 'w') as f:
+        for sf in speech_segment_files:
+          f.write(f"file '{sf}'\n")
+      speech_only_path = os.path.join(segments_dir, 'speech_only.aac')
+      Utils.execute_subprocess_commands(
+          cmds=[
+              'ffmpeg',
+              '-f', 'concat', '-safe', '0',
+              '-i', speech_concat_file,
+              '-c', 'copy',
+              speech_only_path,
+          ],
+          description='concatenate speech segments',
+      )
+
+      fade_filter = ''
       if render_settings.fade_out:
         fade_out_duration = float(ConfigService.CONFIG_DEFAULT_FADE_OUT_DURATION)
         fade_out_buffer = float(ConfigService.CONFIG_DEFAULT_FADE_OUT_BUFFER)
         fade_out_start = total_duration - fade_out_duration - fade_out_buffer
-        # Need to add fade to the merged audio
-        music_cmds = [
-            'ffmpeg',
-            '-i', video_only_path,
-            '-ss', str(overlay_start), '-t', str(total_duration),
-            '-i', speech_track_path,
-            '-ss', str(overlay_start), '-t', str(total_duration),
-            '-i', music_track_path,
-            '-filter_complex',
+        fade_filter = f'[tempa]afade=t=out:st={fade_out_start}:d={fade_out_duration}[outa]'
+
+      if fade_filter:
+        filter_complex = (
             '[1:a]asetpts=N/SR/TB[speech];'
             '[2:a]asetpts=N/SR/TB[music];'
             '[speech][music]amerge=inputs=2[tempa];'
-            f'[tempa]afade=t=out:st={fade_out_start}:d={fade_out_duration}[outa]',
-            '-map', '0:v', '-map', '[outa]',
-            '-c:v', 'copy',
-            '-ac', '2',
-        ]
-      music_cmds.extend(['-movflags', '+faststart', output_path])
+            + fade_filter
+        )
+        audio_map = '[outa]'
+      else:
+        filter_complex = (
+            '[1:a]asetpts=N/SR/TB[speech];'
+            '[2:a]asetpts=N/SR/TB[music];'
+            '[speech][music]amerge=inputs=2[outa]'
+        )
+        audio_map = '[outa]'
+
+      music_cmds = [
+          'ffmpeg',
+          '-i', video_only_path,
+          '-i', speech_only_path,
+          '-ss', str(overlay_start), '-t', str(total_duration),
+          '-accurate_seek',
+          '-i', music_track_path,
+          '-filter_complex', filter_complex,
+          '-map', '0:v', '-map', audio_map,
+          '-c:v', 'copy',
+          '-ac', '2',
+          '-movflags', '+faststart',
+          output_path,
+      ]
       Utils.execute_subprocess_commands(
           cmds=music_cmds,
           description='merge video with speech + music overlay',
