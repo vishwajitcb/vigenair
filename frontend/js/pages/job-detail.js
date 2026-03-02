@@ -80,6 +80,16 @@ async function loadJob() {
         const response = await api.getJob(folder);
         job = response.job;
 
+        // Load segments for display in variant chips
+        try {
+            const segResponse = await api.getSegments(folder);
+            job.segments = (segResponse.data && Array.isArray(segResponse.data))
+                ? segResponse.data
+                : (segResponse.data?.av_segments || []);
+        } catch (_) {
+            job.segments = [];
+        }
+
         $('#jobName').textContent = job.name;
         $('#statusBadge').innerHTML = createStatusBadge(job.status);
 
@@ -373,10 +383,14 @@ function renderVariants() {
                 <h4 class="text-sm font-medium text-gray-700 mb-2">Selected Segments</h4>
                 <div class="flex flex-wrap gap-2">
                     ${variant.segments.map(segId => {
-                        const seg = (job.segments || []).find(s => s.id === segId);
+                        const idx = parseInt(segId, 10) - 1;
+                        const seg = (job.segments || [])[idx];
+                        const label = seg
+                            ? (seg.description || seg.av_segment_id || `Segment ${segId}`).substring(0, 30) + '...'
+                            : `Segment ${segId}`;
                         return `
                             <span class="px-2 py-1 bg-primary/10 text-primary rounded text-sm">
-                                ${seg ? seg.description?.substring(0, 30) + '...' : `Segment ${segId}`}
+                                ${label}
                             </span>
                         `;
                     }).join('')}

@@ -966,9 +966,11 @@ def _extract_segments_and_concat(
 
       if effective_mode == 'segment' and has_audio:
         # Keep both video and audio from each segment
+        # -vsync cfr ensures constant frame rate to prevent duration drift
         extract_cmds.extend([
             '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '5.2',
             '-preset', 'fast', '-crf', '23',
+            '-vsync', 'cfr',
             '-c:a', 'aac', '-b:a', '192k',
             '-movflags', '+faststart',
             segment_path,
@@ -978,6 +980,7 @@ def _extract_segments_and_concat(
         extract_cmds.extend([
             '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '5.2',
             '-preset', 'fast', '-crf', '23',
+            '-vsync', 'cfr',
             '-an',
             '-movflags', '+faststart',
             segment_path,
@@ -988,6 +991,7 @@ def _extract_segments_and_concat(
         extract_cmds.extend([
             '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '5.2',
             '-preset', 'fast', '-crf', '23',
+            '-vsync', 'cfr',
             '-an',
             '-movflags', '+faststart',
             segment_path,
@@ -1465,6 +1469,7 @@ def _render_video_variant(
       source_directory=output_dir,
       bucket_name=gcs_bucket_name,
       target_dir=gcs_folder_path,
+      overwrite=True,
   )
   result = {'variants': {}}
 

@@ -316,15 +316,16 @@ def _render_variants_background(folder: str, render_data: dict):
                 existing_renders = job_doc.get("renders", []) if job_doc else []
 
                 logger.info(f"Found {len(existing_renders)} existing renders in database")
-                logger.info(f"Adding {len(renders)} new renders")
 
-                # Simply append new renders to existing ones
-                # Each render has a unique ID with timestamp, so no duplicates
-                all_renders = existing_renders + renders
+                # Upsert by variantId — one entry per variant since GCS has one slot per variant
+                renders_by_variant = {r["variantId"]: r for r in existing_renders}
+                for r in renders:
+                    renders_by_variant[r["variantId"]] = r
+                all_renders = list(renders_by_variant.values())
 
-                logger.info(f"Total renders after merge: {len(all_renders)}")
+                logger.info(f"Total renders after upsert: {len(all_renders)}")
 
-                # Update with combined list
+                # Update with upserted list
                 await db.jobs.update_one(
                     {"folder": folder},
                     {"$set": {"renders": all_renders}}
@@ -336,7 +337,7 @@ def _render_variants_background(folder: str, render_data: dict):
             if main_loop:
                 future = asyncio.run_coroutine_threadsafe(save_renders(), main_loop)
                 future.result(timeout=10)
-                logger.info(f"Saved {len(renders)} render results to MongoDB (preserving existing renders)")
+                logger.info(f"Saved {len(renders)} render results to MongoDB (upserted by variantId)")
             else:
                 logger.error("Could not save renders: main event loop not available")
 

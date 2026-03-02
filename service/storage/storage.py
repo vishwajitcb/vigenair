@@ -145,6 +145,7 @@ def upload_dir(
     source_directory: str,
     bucket_name: str,
     target_dir: str,
+    overwrite: bool = False,
 ) -> None:
     """Uploads all files in a directory to GCS.
 
@@ -152,6 +153,7 @@ def upload_dir(
         source_directory: The directory to upload.
         bucket_name: The name of the bucket to upload to.
         target_dir: The directory/prefix within the bucket to upload to.
+        overwrite: Whether to overwrite existing files.
     """
     bucket = _get_bucket(bucket_name)
 
@@ -164,7 +166,7 @@ def upload_dir(
             gcs_key = f'{target_dir}/{relative_path}'
             blob = bucket.blob(gcs_key)
 
-            if blob.exists():
+            if not overwrite and blob.exists():
                 logging.info('UPLOAD - File "%s" exists, skipping.', gcs_key)
             else:
                 try:
