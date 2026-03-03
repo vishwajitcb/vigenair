@@ -118,17 +118,31 @@ async def generate_variants(folder: str, request: GenerateVariantsRequest):
         if not segments:
             raise HTTPException(status_code=400, detail="No segments found in data")
 
-        # Build segment descriptions for the prompt
-        segment_descriptions = []
-        for i, seg in enumerate(segments):
-            desc = seg.get("description", "No description")
-            duration = seg.get("duration_s", 0)
-            segment_descriptions.append(
-                f"Segment {i + 1} ({duration:.1f}s): {desc}"
+        # Pre-filter segments that exceed the per-segment duration cap
+        max_seg_dur = ConfigService.CONFIG_MAX_VARIANT_SEGMENT_DURATION
+        eligible_segments = [
+            s for s in segments if s.get("duration_s", 0) <= max_seg_dur
+        ]
+        filtered_count = len(segments) - len(eligible_segments)
+        if filtered_count:
+            logger.info(
+                f"VARIANT_PREFILTER: Excluded {filtered_count} segments exceeding {max_seg_dur:.1f}s cap"
             )
 
+        # Build segment descriptions for the prompt (eligible segments only, preserving original 1-based index)
+        segment_descriptions = []
+        eligible_indices = []
+        for i, seg in enumerate(segments):
+            if seg.get("duration_s", 0) <= max_seg_dur:
+                desc = seg.get("description", "No description")
+                duration = seg.get("duration_s", 0)
+                segment_descriptions.append(
+                    f"Segment {i + 1} ({duration:.1f}s): {desc}"
+                )
+                eligible_indices.append(i + 1)
+
         segments_text = "\n".join(segment_descriptions)
-        total_duration = sum(s.get("duration_s", 0) for s in segments)
+        total_duration = sum(s.get("duration_s", 0) for s in eligible_segments)
 
         # Create variant generation prompt
         target_duration = request.target_duration or total_duration * 0.3

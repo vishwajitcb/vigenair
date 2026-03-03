@@ -61,6 +61,9 @@ CONFIG_DEFAULT_FADE_OUT_DURATION = os.environ.get(
     'CONFIG_DEFAULT_FADE_OUT_DURATION',
     '1'  # seconds
 )
+CONFIG_MAX_VARIANT_SEGMENT_DURATION = float(
+    os.environ.get('CONFIG_MAX_VARIANT_SEGMENT_DURATION', '6')  # seconds
+)
 
 CONFIG_BACKEND_VERSION = os.environ.get('CONFIG_BACKEND_VERSION', 'v1')
 
