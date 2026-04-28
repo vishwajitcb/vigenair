@@ -775,6 +775,46 @@ limitations under the License.
         </span>
       </div>
     </mat-expansion-panel>
+
+    <mat-expansion-panel
+      *ngIf="xmlRenders.length > 0"
+      [expanded]="true"
+    >
+      <mat-expansion-panel-header>
+        <mat-panel-title class="panel-title">
+          <mat-icon class="panel-icon">description</mat-icon>
+          Premiere Pro XML exports
+        </mat-panel-title>
+      </mat-expansion-panel-header>
+      <div class="row flex-direction-column">
+        <span class="notice-text" style="margin-bottom: 12px;">
+          Open the XML in Premiere Pro &rarr; File &rarr; Import. Premiere will
+          prompt to relink the source clip once &mdash; point it at the
+          downloaded master video.
+        </span>
+        <div *ngFor="let r of xmlRenders" class="row" style="gap: 8px; margin-bottom: 8px;">
+          <strong>{{ r.title }}</strong>
+          <a
+            mat-raised-button
+            color="primary"
+            [href]="r.xmlUrl"
+            download
+            target="_blank"
+          >
+            <mat-icon>download</mat-icon>Premiere XML
+          </a>
+          <a
+            *ngIf="r.sourceUrl"
+            mat-stroked-button
+            [href]="r.sourceUrl"
+            download
+            target="_blank"
+          >
+            <mat-icon>movie</mat-icon>Source master
+          </a>
+        </div>
+      </div>
+    </mat-expansion-panel>
   </mat-sidenav-content>
   <mat-sidenav #renderQueueSidenav position="end" class="sidenav-width">
     <div class="margin-bottom-auto">
@@ -896,6 +936,14 @@ limitations under the License.
         />
       </mat-form-field>
 
+      <mat-checkbox
+        [(ngModel)]="exportAsXml"
+        color="primary"
+        matTooltip="Skip the MP4 render and output a Premiere Pro XML timeline instead."
+      >
+        Export as Premiere Pro XML
+      </mat-checkbox>
+
       <button
         type="button"
         mat-raised-button
@@ -903,7 +951,7 @@ limitations under the License.
         (click)="renderVariants()"
         [disabled]="loading"
       >
-        <mat-icon>rocket_launch</mat-icon>Render
+        <mat-icon>rocket_launch</mat-icon>{{ exportAsXml ? 'Export XML' : 'Render' }}
       </button>
       <br />
       <span class="notice-text"

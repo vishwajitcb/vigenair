@@ -2209,3 +2209,48 @@ def _get_video_dimensions(video_file_path: str) -> Tuple[int, int]:
   except Exception:  # pylint: disable=broad-exception-caught
     logging.exception('Error probing video dimensions!')
     return 0, 0
+
+
+def _probe_video_full_metadata(video_file_path: str) -> Dict[str, Any]:
+  """Probes width, height, fps, duration, and audio presence in one call."""
+  result = {
+      'width': 0,
+      'height': 0,
+      'fps': 0.0,
+      'duration_s': 0.0,
+      'has_audio': False,
+  }
+  try:
+    output = subprocess.check_output([
+        'ffprobe', '-v', 'error', '-show_entries',
+        'stream=codec_type,width,height,r_frame_rate,duration:format=duration',
+        '-of', 'json', video_file_path
+    ])
+    data = json.loads(output.decode('utf-8'))
+    for stream in data.get('streams', []):
+      ctype = stream.get('codec_type')
+      if ctype == 'video' and not result['width']:
+        result['width'] = int(stream.get('width') or 0)
+        result['height'] = int(stream.get('height') or 0)
+        rfr = stream.get('r_frame_rate', '0/1')
+        if '/' in rfr:
+          num, den = rfr.split('/', 1)
+          try:
+            result['fps'] = float(num) / float(den) if float(den) else 0.0
+          except ValueError:
+            result['fps'] = 0.0
+        if not result['duration_s'] and stream.get('duration'):
+          try:
+            result['duration_s'] = float(stream['duration'])
+          except ValueError:
+            pass
+      elif ctype == 'audio':
+        result['has_audio'] = True
+    if not result['duration_s']:
+      try:
+        result['duration_s'] = float(data.get('format', {}).get('duration', 0))
+      except (TypeError, ValueError):
+        pass
+  except Exception:  # pylint: disable=broad-exception-caught
+    logging.exception('Error probing video metadata!')
+  return result

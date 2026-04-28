@@ -179,6 +179,12 @@ export class ApiCallsService implements ApiCalls {
       }, 1000);
     });
   }
+  getRendersArray(gcsFolder: string): Observable<any[]> {
+    return of([]);
+  }
+  getDownloadUrl(gcsKey: string): string {
+    return `/api/v1/files/download/${gcsKey}`;
+  }
   getGcsFolderPath(folder: string): Observable<string> {
     return of(folder);
   }

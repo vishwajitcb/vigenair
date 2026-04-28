@@ -298,6 +298,13 @@ export class ApiCallsService implements ApiCalls {
   /**
    * Get rendered variants for a video
    */
+  /**
+   * Build a downloadable URL for a GCS object key.
+   */
+  getDownloadUrl(gcsKey: string): string {
+    return `${API_BASE_URL}/files/download/${gcsKey}`;
+  }
+
   getRendersFromGcs(gcsFolder: string): Observable<string[]> {
     return this.httpClient
       .get<{ folder: string; combos: any }>(`${API_BASE_URL}/videos/${gcsFolder}/renders`)
@@ -318,20 +325,65 @@ export class ApiCallsService implements ApiCalls {
   }
 
   /**
+   * Fetch the structured renders array (covers XML and video entries).
+   * Polls until at least one entry exists or retries are exhausted.
+   */
+  getRendersArray(gcsFolder: string): Observable<any[]> {
+    return this.httpClient
+      .get<{ folder: string; combos: any; renders: any[] | null; error?: string }>(
+        `${API_BASE_URL}/videos/${gcsFolder}/renders`
+      )
+      .pipe(
+        map(response => {
+          if (response.error) {
+            throw new Error(response.error);
+          }
+          if (!response.renders || response.renders.length === 0) {
+            throw new Error('renders not yet available');
+          }
+          return response.renders;
+        }),
+        retry({ count: 80, delay: 6000 }),
+        catchError(error => {
+          console.error('Error getting renders array:', error);
+          return throwError(() => error);
+        })
+      );
+  }
+
+  /**
    * Submit render request for variants
    */
   renderVariants(
     gcsFolder: string,
     renderQueue: RenderQueue
   ): Observable<string> {
+    const variants = renderQueue.queue.map((v, idx) => ({
+      id: v.original_variant_id ?? idx,
+      title: v.title,
+      description: v.description,
+      score: v.score,
+      reasoning: v.score_reasoning,
+      segments: (v.av_segments || []).map((seg: any) => seg.av_segment_id),
+      formats: v.render_settings?.formats ?? ['16:9'],
+      audioMode: v.render_settings?.use_continuous_audio
+        ? 'continuous'
+        : v.render_settings?.use_music_overlay
+          ? 'music'
+          : 'segment',
+      outputType: renderQueue.outputType ?? 'video',
+    }));
     return this.httpClient
       .post<{ folder: string; status: string; message: string }>(
         `${API_BASE_URL}/videos/${gcsFolder}/render`,
         {
-          queue: renderQueue.queue,
-          queue_name: renderQueue.queueName,
-          preview_analyses: renderQueue.previewAnalyses,
-          source_dimensions: renderQueue.sourceDimensions,
+          variants,
+          settings: {
+            queue_name: renderQueue.queueName,
+            preview_analyses: renderQueue.previewAnalyses,
+            source_dimensions: renderQueue.sourceDimensions,
+          },
+          output_type: renderQueue.outputType ?? 'video',
         }
       )
       .pipe(

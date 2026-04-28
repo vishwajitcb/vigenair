@@ -36,13 +36,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _transform_variants_for_combiner(folder: str, variants: list, settings: dict) -> list:
+def _transform_variants_for_combiner(
+    folder: str,
+    variants: list,
+    settings: dict,
+    output_type: str = "video",
+) -> list:
     """Transform frontend variant format to combiner format.
 
     Args:
         folder: The video folder name.
         variants: List of variants from frontend.
         settings: Global render settings.
+        output_type: Top-level output type ("video" or "xml"); applied to any
+            variant that does not specify `outputType` itself.
 
     Returns:
         List of variants in combiner format.
@@ -99,6 +106,7 @@ def _transform_variants_for_combiner(folder: str, variants: list, settings: dict
             "use_blanking_fill": False,
         }
 
+        variant_output_type = variant.get("outputType") or output_type or "video"
         combiner_variant = {
             "variant_id": variant.get("id", idx),
             "av_segments": av_segments,
@@ -107,10 +115,170 @@ def _transform_variants_for_combiner(folder: str, variants: list, settings: dict
             "score": variant.get("score", 0),
             "score_reasoning": variant.get("reasoning", ""),
             "render_settings": render_settings,
+            "output_type": variant_output_type,
         }
         combiner_variants.append(combiner_variant)
 
     return combiner_variants
+
+
+def _render_variant_as_xml(
+    folder: str,
+    bucket: str,
+    variant: dict,
+    num_variants: int,
+    cached_video_path: str,
+    source_video_key: str,
+):
+    """Build a Premiere Pro bundle (zip with timeline.xml + media/ + audio/) for one variant.
+
+    For each selected segment, ffmpeg-extracts:
+      - media/clip_NNN.mp4   (video + stereo AAC, frame-accurate H.264 CRF 18)
+      - audio/clip_NNN.wav   (audio-only, PCM s16 stereo 48kHz)
+    Then writes timeline.xml referencing those files and zips everything up.
+    The zip is uploaded to GCS and surfaced as the variant's render artifact.
+    """
+    import shutil
+    import zipfile
+    from combiner.combiner import _probe_video_full_metadata
+    from combiner.premiere_xml import generate_premiere_xml
+
+    variant_id = variant.get("variant_id", 0)
+    av_segments = variant.get("av_segments", [])
+    if not av_segments:
+        raise ValueError(f"Variant {variant_id} has no segments")
+    if not cached_video_path or not os.path.exists(cached_video_path):
+        raise FileNotFoundError(
+            f"Source video not cached locally for XML export of variant {variant_id}"
+        )
+
+    # ---- video metadata (width/height/fps) ----
+    metadata_key = f"{folder}/metadata.json"
+    metadata = {}
+    try:
+        existing = StorageService.download_file(metadata_key, fetch_contents=True)
+        if existing:
+            metadata = json.loads(existing.decode("utf-8"))
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning("Could not read metadata.json; will probe")
+
+    needs_probe = not all(
+        metadata.get(k) for k in ("width", "height", "fps")
+    )
+    if needs_probe:
+        probed = _probe_video_full_metadata(cached_video_path)
+        for key, value in probed.items():
+            if value or key == "has_audio":
+                metadata[key] = value
+        with tempfile.NamedTemporaryFile(
+            mode="w", delete=False, suffix=".json"
+        ) as mf:
+            json.dump(metadata, mf)
+            tmp_meta = mf.name
+        try:
+            StorageService.upload_file(tmp_meta, metadata_key, overwrite=True)
+        finally:
+            os.unlink(tmp_meta)
+
+    width = int(metadata.get("width") or 1920)
+    height = int(metadata.get("height") or 1080)
+    fps = float(metadata.get("fps") or 30.0)
+
+    # ---- per-segment extraction ----
+    work_dir = tempfile.mkdtemp(prefix=f"xml_variant_{variant_id}_")
+    media_dir = os.path.join(work_dir, "media")
+    audio_dir = os.path.join(work_dir, "audio")
+    os.makedirs(media_dir, exist_ok=True)
+    os.makedirs(audio_dir, exist_ok=True)
+
+    clips_for_xml = []
+    try:
+        for idx, seg in enumerate(av_segments, start=1):
+            seg_id = seg.get("av_segment_id", idx)
+            start_s = float(seg["start_s"])
+            end_s = float(seg["end_s"])
+            duration_s = max(end_s - start_s, 0.0)
+            if duration_s <= 0:
+                continue
+
+            clip_basename = f"clip_{idx:03d}"
+            video_out = os.path.join(media_dir, f"{clip_basename}.mp4")
+            audio_out = os.path.join(audio_dir, f"{clip_basename}.wav")
+
+            # Frame-accurate extraction: -ss/-to AFTER -i forces decoding from
+            # the nearest keyframe so the cut lands exactly on the requested
+            # timestamp. CRF 18 is visually lossless H.264.
+            Utils.execute_subprocess_commands(
+                cmds=[
+                    "ffmpeg", "-y", "-i", cached_video_path,
+                    "-ss", f"{start_s}", "-to", f"{end_s}",
+                    "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+                    "-movflags", "+faststart",
+                    video_out,
+                ],
+                description=f"extract clip {idx} (video+audio) for variant {variant_id}",
+            )
+            Utils.execute_subprocess_commands(
+                cmds=[
+                    "ffmpeg", "-y", "-i", cached_video_path,
+                    "-ss", f"{start_s}", "-to", f"{end_s}",
+                    "-vn",
+                    "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2",
+                    audio_out,
+                ],
+                description=f"extract clip {idx} (audio-only) for variant {variant_id}",
+            )
+
+            clips_for_xml.append({
+                "video_rel_path": f"media/{clip_basename}.mp4",
+                "audio_rel_path": f"audio/{clip_basename}.wav",
+                "duration_s": duration_s,
+                "name": f"Segment {seg_id}",
+            })
+
+        if not clips_for_xml:
+            raise ValueError(f"No valid clips extracted for variant {variant_id}")
+
+        # ---- build XML ----
+        xml_string = generate_premiere_xml(
+            variant_id=variant_id,
+            title=variant.get("title", f"Variant {variant_id}"),
+            clips=clips_for_xml,
+            width=width,
+            height=height,
+            fps=fps,
+        )
+        xml_path = os.path.join(work_dir, "timeline.xml")
+        with open(xml_path, "w", encoding="utf-8") as xf:
+            xf.write(xml_string)
+
+        # ---- zip the bundle ----
+        zip_path = os.path.join(
+            tempfile.gettempdir(),
+            f"variant_{variant_id}_{int(datetime.utcnow().timestamp())}.zip",
+        )
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(xml_path, arcname="timeline.xml")
+            for sub in ("media", "audio"):
+                sub_dir = os.path.join(work_dir, sub)
+                for fname in sorted(os.listdir(sub_dir)):
+                    zf.write(
+                        os.path.join(sub_dir, fname),
+                        arcname=f"{sub}/{fname}",
+                    )
+
+        # ---- upload ----
+        zip_key = f"{folder}/{variant_id}-{num_variants}_premiere.zip"
+        try:
+            StorageService.upload_file(zip_path, zip_key, overwrite=True)
+        finally:
+            if os.path.exists(zip_path):
+                os.unlink(zip_path)
+
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _render_variants_background(folder: str, render_data: dict):
@@ -134,7 +302,14 @@ def _render_variants_background(folder: str, render_data: dict):
         # Transform variants to combiner format
         variants = render_data.get("variants", [])
         settings = render_data.get("settings", {})
-        combiner_variants = _transform_variants_for_combiner(folder, variants, settings)
+        output_type = render_data.get("output_type") or "video"
+        combiner_variants = _transform_variants_for_combiner(
+            folder, variants, settings, output_type
+        )
+
+        all_xml = bool(combiner_variants) and all(
+            v.get("output_type") == "xml" for v in combiner_variants
+        )
 
         logger.info(f"Transformed {len(combiner_variants)} variants for combiner")
 
@@ -194,17 +369,18 @@ def _render_variants_background(folder: str, render_data: dict):
             progress=10
         )
 
-        # Create trigger file and run combiner initial phase
-        trigger_file = Utils.TriggerFile(render_key)
-        combiner_instance = CombinerService.Combiner(
-            gcs_bucket_name=bucket, render_file=trigger_file
-        )
-        combiner_instance.initial_render(cached_video_path=cached_video_path)
-
-        logger.info(f"Initial render completed for: {folder}")
-
-        # Update progress after initial render (20%)
-        update_job_status_sync(folder, progress=20)
+        if all_xml:
+            logger.info("All variants are XML exports; skipping combiner initial render.")
+            update_job_status_sync(folder, progress=20)
+        else:
+            # Create trigger file and run combiner initial phase
+            trigger_file = Utils.TriggerFile(render_key)
+            combiner_instance = CombinerService.Combiner(
+                gcs_bucket_name=bucket, render_file=trigger_file
+            )
+            combiner_instance.initial_render(cached_video_path=cached_video_path)
+            logger.info(f"Initial render completed for: {folder}")
+            update_job_status_sync(folder, progress=20)
 
         # Calculate progress per variant (75% remaining / num_variants)
         num_variants = len(combiner_variants)
@@ -213,6 +389,20 @@ def _render_variants_background(folder: str, render_data: dict):
         # Render variants — parallel if multiple, sequential if single
         def _render_single_variant(idx, variant):
             variant_id = variant.get("variant_id", idx)
+
+            if variant.get("output_type") == "xml":
+                logger.info(f"Generating Premiere XML for variant {variant_id}")
+                _render_variant_as_xml(
+                    folder=folder,
+                    bucket=bucket,
+                    variant=variant,
+                    num_variants=num_variants,
+                    cached_video_path=cached_video_path,
+                    source_video_key=video_file_name,
+                )
+                logger.info(f"Variant {variant_id} XML export completed")
+                return idx
+
             variant_render_key = f"{folder}/{variant_id}-{num_variants}_{ConfigService.INPUT_RENDERING_FILE}"
             logger.info(f"Rendering variant {variant_id} from {variant_render_key}")
 
@@ -257,10 +447,29 @@ def _render_variants_background(folder: str, render_data: dict):
             progress=95
         )
 
-        # Collect render results from combos.json files
+        # Collect render results from combos.json files (or XML manifest)
         renders = []
         for idx, variant in enumerate(combiner_variants):
             variant_id = variant.get("variant_id", idx)
+
+            if variant.get("output_type") == "xml":
+                zip_key = f"{folder}/{variant_id}-{num_variants}_premiere.zip"
+                render_id = f"{variant_id}_{int(datetime.utcnow().timestamp() * 1000)}"
+                render_entry = {
+                    "id": render_id,
+                    "variantId": variant_id,
+                    "title": variant.get("title", f"Variant {variant_id}"),
+                    "description": variant.get("description", ""),
+                    "outputType": "xml",
+                    "formats": {
+                        "zip": {"key": zip_key},
+                    },
+                    "createdAt": datetime.utcnow().isoformat(),
+                }
+                renders.append(render_entry)
+                logger.info(f"Added XML render entry {render_id} for variant {variant_id}")
+                continue
+
             combos_key = f"{folder}/{variant_id}-{num_variants}_combos.json"
 
             try:
@@ -404,6 +613,7 @@ async def render_variants(
         render_data = {
             "variants": request.variants,
             "settings": request.settings or {},
+            "output_type": request.output_type or "video",
         }
 
         # Start background render task in a thread pool so it doesn't block
@@ -438,12 +648,19 @@ async def get_renders(folder: str):
         RendersResponse with combos.json contents.
     """
     try:
-        # Try to get combos.json
+        # Pull MongoDB-tracked render entries (covers both video and XML)
+        db = await get_database()
+        job_doc = await db.jobs.find_one({"folder": folder})
+        renders_array = (job_doc or {}).get("renders") or None
+
+        # Try to get combos.json (legacy/video-only consumers may rely on it)
         combos_key = f"{folder}/{ConfigService.OUTPUT_COMBINATIONS_FILE}"
         combos_content = StorageService.download_file(combos_key, fetch_contents=True)
+        combos = None
+        if combos_content:
+            combos = json.loads(combos_content.decode("utf-8"))
 
-        if not combos_content:
-            # Check for error
+        if not combos and not renders_array:
             error_key = f"{folder}/render_error.txt"
             error_content = StorageService.download_file(error_key, fetch_contents=True)
 
@@ -458,9 +675,7 @@ async def get_renders(folder: str):
                 detail="Renders not found. Submit a render request first.",
             )
 
-        combos = json.loads(combos_content.decode("utf-8"))
-
-        return RendersResponse(folder=folder, combos=combos)
+        return RendersResponse(folder=folder, combos=combos, renders=renders_array)
 
     except HTTPException:
         raise
