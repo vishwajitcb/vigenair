@@ -130,11 +130,11 @@ def _render_variant_as_xml(
     cached_video_path: str,
     source_video_key: str,
 ):
-    """Build a Premiere Pro bundle (zip with timeline.xml + media/ + audio/) for one variant.
+    """Build a Premiere Pro bundle (zip with timeline.xml + media/ + music/) for one variant.
 
     For each selected segment, ffmpeg-extracts:
       - media/clip_NNN.mp4   (video + stereo AAC, frame-accurate H.264 CRF 18)
-      - audio/clip_NNN.wav   (audio-only, PCM s16 stereo 48kHz)
+      - music/clip_NNN.wav   (audio-only, PCM s16 stereo 48kHz)
     Then writes timeline.xml referencing those files and zips everything up.
     The zip is uploaded to GCS and surfaced as the variant's render artifact.
     """
@@ -187,7 +187,7 @@ def _render_variant_as_xml(
     # ---- per-segment extraction ----
     work_dir = tempfile.mkdtemp(prefix=f"xml_variant_{variant_id}_")
     media_dir = os.path.join(work_dir, "media")
-    audio_dir = os.path.join(work_dir, "audio")
+    audio_dir = os.path.join(work_dir, "music")
     os.makedirs(media_dir, exist_ok=True)
     os.makedirs(audio_dir, exist_ok=True)
 
@@ -233,7 +233,7 @@ def _render_variant_as_xml(
 
             clips_for_xml.append({
                 "video_rel_path": f"media/{clip_basename}.mp4",
-                "audio_rel_path": f"audio/{clip_basename}.wav",
+                "audio_rel_path": f"music/{clip_basename}.wav",
                 "duration_s": duration_s,
                 "name": f"Segment {seg_id}",
             })
@@ -261,7 +261,7 @@ def _render_variant_as_xml(
         )
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(xml_path, arcname="timeline.xml")
-            for sub in ("media", "audio"):
+            for sub in ("media", "music"):
                 sub_dir = os.path.join(work_dir, sub)
                 for fname in sorted(os.listdir(sub_dir)):
                     zf.write(

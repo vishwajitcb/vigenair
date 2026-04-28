@@ -6,12 +6,12 @@ The output references **per-segment** clip files arranged in a bundle:
     media/clip_001.mp4   (video + audio, H.264)
     media/clip_002.mp4
     ...
-    audio/clip_001.wav   (audio-only, PCM)
-    audio/clip_002.wav
+    music/clip_001.wav   (audio-only, PCM)
+    music/clip_002.wav
     ...
 
 The XML's video track points at `media/clip_NNN.mp4` and the audio track
-points at `audio/clip_NNN.wav` for each segment, linked together so they
+points at `music/clip_NNN.wav` for each segment, linked together so they
 move as one in Premiere. Each clipitem starts at the file's frame 0 (in=0,
 out=<clip duration>) — no relinking dance needed for the editor.
 """
@@ -168,7 +168,7 @@ def generate_premiere_xml(
         clips: ordered list of dicts, each:
             {
                 "video_rel_path": "media/clip_001.mp4",
-                "audio_rel_path": "audio/clip_001.wav",
+                "audio_rel_path": "music/clip_001.wav",
                 "duration_s": 2.5,
                 "name": "Segment 4",   # display name in Premiere
             }
