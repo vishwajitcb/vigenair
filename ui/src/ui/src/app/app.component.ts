@@ -262,6 +262,14 @@ export class AppComponent {
   renderQueue: RenderQueueVariant[] = [];
   renderQueueJsonArray: string[] = [];
   renderQueueName = '';
+  exportAsXml = false;
+  xmlRenders: Array<{
+    id: string;
+    title: string;
+    description: string;
+    xmlUrl: string;
+    sourceUrl: string;
+  }> = [];
   displayObjectTracking = true;
   moveCropArea = false;
   weightsTextIndex = 3;
@@ -1721,6 +1729,7 @@ export class AppComponent {
   renderVariants() {
     this.loading = true;
     this.rendering = true;
+    const isXml = this.exportAsXml;
     this.apiCallsService
       .renderVariants(this.folder, {
         queue: this.renderQueue,
@@ -1730,6 +1739,7 @@ export class AppComponent {
           w: this.previewVideoElem.nativeElement.videoWidth,
           h: this.previewVideoElem.nativeElement.videoHeight,
         },
+        outputType: isXml ? 'xml' : 'video',
       })
       .subscribe({
         next: combosFolder => {
@@ -1737,10 +1747,38 @@ export class AppComponent {
           this.renderQueue = [];
           this.renderQueueJsonArray = [];
           this.closeRenderQueueSidenav();
-          this.getRenderedCombos(combosFolder);
+          if (isXml) {
+            this.pollXmlRenders();
+          } else {
+            this.getRenderedCombos(combosFolder);
+          }
         },
         error: err => this.failHandler(err),
       });
+  }
+
+  pollXmlRenders() {
+    this.loading = true;
+    this.apiCallsService.getRendersArray(this.folder).subscribe({
+      next: entries => {
+        this.loading = false;
+        const xmlEntries = (entries || []).filter(
+          (e: any) => e?.outputType === 'xml'
+        );
+        this.xmlRenders = xmlEntries.map((e: any) => ({
+          id: e.id,
+          title: e.title || 'Variant',
+          description: e.description || '',
+          xmlUrl: this.apiCallsService.getDownloadUrl(
+            e.formats?.xml?.key || ''
+          ),
+          sourceUrl: e.sourceKey
+            ? this.apiCallsService.getDownloadUrl(e.sourceKey)
+            : '',
+        }));
+      },
+      error: err => this.failHandler(err),
+    });
   }
 
   setCombos() {

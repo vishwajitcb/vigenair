@@ -407,10 +407,11 @@ async function handleStartRender() {
     btn.innerHTML = '<span class="animate-spin inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full mr-2"></span>Starting render...';
 
     try {
+        const exportAsXml = $('#exportAsXml')?.checked === true;
         const formats = Array.from($$('input[name="format"]:checked')).map(cb => cb.value);
         const audioMode = $('#audioMode').value;
 
-        if (formats.length === 0) {
+        if (!exportAsXml && formats.length === 0) {
             showToast('Please select at least one format', 'warning');
             return;
         }
@@ -421,24 +422,27 @@ async function handleStartRender() {
             return;
         }
 
-        // Validate audio mode selection
-        if (audioMode === 'music' && !checkAudioSeparationAvailable()) {
+        // Validate audio mode selection (only for video output)
+        if (!exportAsXml && audioMode === 'music' && !checkAudioSeparationAvailable()) {
             showToast('Music overlay requires voice-over analysis. Please select a different audio mode.', 'warning');
             // Auto-switch to continuous audio
             $('#audioMode').value = 'continuous';
             return;
         }
 
+        const outputType = exportAsXml ? 'xml' : 'video';
         await api.startRender(folder, {
             variants: [{
                 ...variant,
                 formats,
                 audioMode,
+                outputType,
             }],
             settings: {
                 formats,
                 audioMode,
             },
+            output_type: outputType,
         });
 
         showToast('Render started!', 'success');
@@ -464,7 +468,37 @@ function renderRenderedVideos() {
         return;
     }
 
-    list.innerHTML = renders.map((render, renderIdx) => `
+    list.innerHTML = renders.map((render, renderIdx) => {
+        if (render.outputType === 'xml') {
+            const zipUrl = render.formats?.zip?.url || '';
+            const baseName = (render.title || 'variant').replace(/[^A-Za-z0-9_-]+/g, '_');
+            return `
+        <div class="border border-gray-200 rounded-lg overflow-hidden bg-white">
+            <div class="p-4 border-b border-gray-100">
+                <div class="flex items-center gap-2">
+                    <span class="inline-block px-2 py-0.5 text-xs font-semibold bg-indigo-100 text-indigo-700 rounded">Premiere bundle</span>
+                    <h4 class="font-medium text-gray-900">${render.title || `Render ${renderIdx + 1}`}</h4>
+                </div>
+                ${render.description ? `<p class="text-sm text-gray-500 mt-1">${render.description}</p>` : ''}
+                <p class="text-xs text-gray-400 mt-1">${formatDate(render.createdAt)}</p>
+            </div>
+            <div class="p-4 space-y-3">
+                <p class="text-sm text-gray-600">
+                    Unzip the bundle, then in Adobe Premiere Pro: File &rarr; Import &rarr; <code>timeline.xml</code>.
+                    The <code>media/</code> and <code>audio/</code> folders next to it contain pre-cut clips per segment.
+                </p>
+                <div class="flex flex-wrap gap-2">
+                    <a href="${zipUrl}" download="${baseName}.zip"
+                       class="inline-flex items-center gap-1 bg-primary hover:bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-medium">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                        Download Premiere bundle (.zip)
+                    </a>
+                </div>
+            </div>
+        </div>
+            `;
+        }
+        return `
         <div class="border border-gray-200 rounded-lg overflow-hidden bg-white">
             <div class="p-4 border-b border-gray-100">
                 <h4 class="font-medium text-gray-900">${render.title || `Render ${renderIdx + 1}`}</h4>
@@ -496,7 +530,8 @@ function renderRenderedVideos() {
                 </div>
             </div>
         </div>
-    `).join('');
+        `;
+    }).join('');
 }
 
 // Polling

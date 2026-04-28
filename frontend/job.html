@@ -192,6 +192,16 @@
                     </select>
                 </div>
             </div>
+            <div class="mb-4">
+                <label class="flex items-center gap-2 cursor-pointer">
+                    <input id="exportAsXml" type="checkbox" class="w-4 h-4 text-primary">
+                    <span class="text-sm font-medium text-gray-700">Export as Premiere Pro XML</span>
+                </label>
+                <p class="text-xs text-gray-500 mt-1 ml-6">
+                    Skip the MP4 render and output an XML timeline that opens in Adobe Premiere Pro.
+                    Editors can re-cut from the original source.
+                </p>
+            </div>
             <button id="renderBtn" class="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded-lg font-medium transition-colors">
                 Start Render
             </button>

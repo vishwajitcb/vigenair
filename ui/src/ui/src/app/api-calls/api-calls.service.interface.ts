@@ -102,6 +102,7 @@ export interface RenderQueue {
   queueName: string;
   previewAnalyses: Record<string, unknown>;
   sourceDimensions: { w: number; h: number };
+  outputType?: 'video' | 'xml';
 }
 
 /** Represents a variant in the render queue. */
@@ -242,6 +243,10 @@ export interface ApiCalls {
   getRunsFromGcs(): Observable<PreviousRunsResponse>;
   /** Gets the list of renders from a GCS folder. */
   getRendersFromGcs(gcsFolder: string): Observable<string[]>;
+  /** Gets the structured renders array (video + XML entries). */
+  getRendersArray(gcsFolder: string): Observable<any[]>;
+  /** Builds a downloadable URL for a GCS object key. */
+  getDownloadUrl(gcsKey: string): string;
   /** Renders the variants in the queue. */
   renderVariants(
     gcsFolder: string,

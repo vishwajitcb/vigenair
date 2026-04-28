@@ -18,3 +18,4 @@ __pycache__/
 *.tfstate.*
 *.tfvars
 terraform/*.zip
+chai-shots-465914-24cab0e5f9b5.json

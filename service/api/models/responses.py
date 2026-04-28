@@ -67,6 +67,7 @@ class RenderRequest(BaseModel):
     """Request for rendering variants."""
     variants: List[Dict[str, Any]]
     settings: Optional[Dict[str, Any]] = None
+    output_type: Optional[str] = "video"
 
 
 class RenderResponse(BaseModel):
@@ -80,6 +81,7 @@ class RendersResponse(BaseModel):
     """Response from get renders endpoint."""
     folder: str
     combos: Optional[Dict[str, Any]] = None
+    renders: Optional[List[Dict[str, Any]]] = None
     error: Optional[str] = None
 
 
