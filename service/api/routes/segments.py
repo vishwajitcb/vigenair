@@ -33,9 +33,23 @@ from api.models.responses import (
     SplitSegmentRequest,
     SplitSegmentResponse,
 )
+from config import variant_prompts
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _load_video_language(folder: str) -> str:
+    """Load video language code from {folder}/language.txt, default 'en'."""
+    try:
+        key = f"{folder}/language.txt"
+        content = StorageService.download_file(key, fetch_contents=True)
+        if not content:
+            return "en"
+        lang = content.decode("utf-8").strip()
+        return lang or "en"
+    except Exception:
+        return "en"
 
 
 @router.get("/{folder}/segments", response_model=SegmentsResponse)
@@ -148,40 +162,32 @@ async def generate_variants(folder: str, request: GenerateVariantsRequest):
         target_duration = request.target_duration or total_duration * 0.3
         num_variants = request.num_variants
 
-        generation_prompt = f"""You are an expert video ad editor. Given the following video segments from a longer ad,
-create {num_variants} different shorter variant scripts that tell a compelling story.
+        prompt_option = request.prompt_option or "default"
+        custom_prompt = request.custom_prompt or ""
+        # Backward compat: if no prompt_option but legacy request.prompt is non-default text, treat as custom.
+        if prompt_option == "default" and request.prompt and request.prompt not in variant_prompts.PROMPT_DIRECTIVES.values():
+            prompt_option = "custom"
+            custom_prompt = request.prompt
 
-Original Video Segments:
-{segments_text}
+        video_language = request.video_language or _load_video_language(folder)
+        expected_range = variant_prompts.calculate_expected_duration_range(target_duration)
 
-Total Original Duration: {total_duration:.1f} seconds
-Target Duration for Each Variant: ~{target_duration:.1f} seconds
+        generation_prompt = variant_prompts.assemble_prompt(
+            prompt_option=prompt_option,
+            custom_prompt=custom_prompt,
+            business_objective=request.business_objective,
+            shorten_video=request.shorten_video,
+            segments_text=segments_text,
+            desired_duration=target_duration,
+            expected_duration_range=expected_range,
+            video_language=video_language,
+            num_variants=num_variants,
+        )
 
-User's Request: {request.prompt}
-
-For each variant, output in this JSON format (no comments allowed):
-{{
-  "variants": [
-    {{
-      "title": "Short Title (2-4 words)",
-      "segments": [1, 3, 5],
-      "description": "One sentence description",
-      "estimated_duration": 15.0,
-      "score": 85
-    }}
-  ]
-}}
-
-CRITICAL RULES:
-- "segments" should contain 1-indexed segment numbers
-- "estimated_duration" MUST be the actual SUM of the selected segment durations - ADD THEM UP!
-- The total duration of selected segments MUST be close to the target duration (~{target_duration:.1f}s)
-- Do NOT select segments that would make the total exceed {target_duration * 1.5:.1f} seconds
-- "score" should be a quality score from 1-100 based on narrative coherence
-- Keep title and description very short to avoid truncation
-
-Create {num_variants} distinct variants. Output ONLY valid JSON.
-"""
+        logger.info(
+            f"VARIANT_PROMPT: option={prompt_option} objective={request.business_objective} "
+            f"shorten={request.shorten_video} lang={video_language} range={expected_range}"
+        )
 
         # Helper function to calculate actual duration of a variant
         def calculate_variant_duration(variant_segments: list) -> float:
@@ -196,25 +202,55 @@ Create {num_variants} distinct variants. Output ONLY valid JSON.
 
         # Helper function to validate and filter variants
         def validate_variants(variants_list: list, max_duration: float) -> list:
-            """Filter variants that exceed the maximum allowed duration."""
-            valid = []
+            """Filter variants by duration cap, then dedupe by angle and hook_scene."""
+            duration_ok = []
             for v in variants_list:
                 seg_ids = v.get("segments", [])
                 actual_duration = calculate_variant_duration(seg_ids)
-                # Update the estimated_duration with actual calculated value
                 v["actual_duration"] = actual_duration
-                v["estimated_duration"] = actual_duration  # Correct the estimate
+                v["estimated_duration"] = actual_duration
+
+                # Backfill hook_scene if Gemini omitted it: use first segment.
+                if not v.get("hook_scene") and seg_ids:
+                    try:
+                        v["hook_scene"] = int(seg_ids[0])
+                    except (TypeError, ValueError):
+                        v["hook_scene"] = None
 
                 if actual_duration <= max_duration:
-                    valid.append(v)
+                    duration_ok.append(v)
                     logger.info(
-                        f"VARIANT_VALID: '{v.get('title')}' - segments {seg_ids} = {actual_duration:.1f}s (<= {max_duration:.1f}s)"
+                        f"VARIANT_VALID: '{v.get('title')}' angle={v.get('angle')!r} "
+                        f"hook={v.get('hook_scene')} segs={seg_ids} dur={actual_duration:.1f}s"
                     )
                 else:
                     logger.warning(
-                        f"VARIANT_REJECTED: '{v.get('title')}' - segments {seg_ids} = {actual_duration:.1f}s (exceeds {max_duration:.1f}s)"
+                        f"VARIANT_REJECTED: '{v.get('title')}' segs={seg_ids} "
+                        f"dur={actual_duration:.1f}s exceeds {max_duration:.1f}s"
                     )
-            return valid
+
+            seen_angles: set[str] = set()
+            seen_hooks: set[int] = set()
+            unique = []
+            for v in duration_ok:
+                angle_key = " ".join((v.get("angle") or "").lower().split())
+                hook = v.get("hook_scene")
+                if angle_key and angle_key in seen_angles:
+                    logger.warning(
+                        f"VARIANT_DROPPED_DUP_ANGLE: '{v.get('title')}' angle={angle_key!r}"
+                    )
+                    continue
+                if hook is not None and hook in seen_hooks:
+                    logger.warning(
+                        f"VARIANT_DROPPED_DUP_HOOK: '{v.get('title')}' hook={hook}"
+                    )
+                    continue
+                if angle_key:
+                    seen_angles.add(angle_key)
+                if hook is not None:
+                    seen_hooks.add(hook)
+                unique.append(v)
+            return unique
 
         # Call Gemini with retry logic
         client = ConfigService.get_genai_client()
@@ -234,13 +270,32 @@ Create {num_variants} distinct variants. Output ONLY valid JSON.
                     model=ConfigService.CONFIG_TEXT_MODEL,
                     contents=generation_prompt,
                     config=types.GenerateContentConfig(
-                        max_output_tokens=8192,
+                        max_output_tokens=65536,
                         temperature=0.7,
                     ),
                 )
 
-                # Parse response
-                response_text = response.text.strip()
+                # Parse response — response.text can be None if the model
+                # spent its budget on thought tokens and emitted no text parts.
+                raw_text = getattr(response, "text", None)
+                if not raw_text:
+                    finish = None
+                    try:
+                        finish = response.candidates[0].finish_reason
+                    except Exception:
+                        pass
+                    last_error = (
+                        f"Empty response from Gemini (finish_reason={finish}). "
+                        f"Likely token budget exhausted before text emission."
+                    )
+                    logger.warning(f"Attempt {attempt + 1} failed - {last_error}")
+                    if attempt < max_retries - 1:
+                        sleep_time = retry_delay * (2 ** attempt)
+                        logger.info(f"Waiting {sleep_time}s before retry...")
+                        time.sleep(sleep_time)
+                    continue
+
+                response_text = raw_text.strip()
                 logger.info(f"Gemini raw response: {response_text[:500]}")
 
                 # Handle markdown code blocks
@@ -283,6 +338,11 @@ Create {num_variants} distinct variants. Output ONLY valid JSON.
         if not validated_variants:
             logger.error(f"All {max_retries} attempts failed to produce valid variants. Last error: {last_error}")
             # Return empty list rather than failing - let frontend handle it
+
+        # Stamp the rubric ceiling so the frontend can normalize correctly.
+        score_max = variant_prompts.get_score_max(request.business_objective)
+        for v in validated_variants:
+            v["score_max"] = score_max
 
         return GenerateVariantsResponse(variants=validated_variants)
 
