@@ -312,33 +312,52 @@ export const PROMPTS = {
   /**
    * Video Variant Generation Prompts
    */
-  generationPrompt: `**Objective:** Generate shorter, highly engaging video ad scripts by strategically combining scenes from a provided script, focusing on maximizing impact and adhering to specific criteria.
+  generationPrompt: `**Objective:** Generate a set of short promo clips for a longer-form show (episode, series, or film), each anchored in a *distinct* angle of the source so a marketing team can pick the most compelling cut for an ad campaign.
+
+    **CRITICAL UP-FRONT CONSTRAINTS (read before anything else):**
+    *   The input is a **show**, not an ad. The output clips are **promos for that show**.
+    *   Each variant must read as a **separate, standalone clip** — not as a tour of the episode and not as a continuation of the same scene flow as another variant.
+    *   **No two variants may share the same anchor** (plot thread, lead character, or tonal mode). Variant collisions are a critical failure.
+    *   **No spoilers.** Tease, do not resolve. Do not reveal climaxes, finale beats, deaths, twist payoffs, or "and then X happens" outcomes.
+    *   **Do NOT default to including the source's final scene.** The source's ending is usually a spoiler. Only include it if it is non-revealing (e.g., a recurring tag, a stinger, a title card).
 
     **Instructions:**
 
-    **Phase 1: Expert Script Combination (Focus: Engagement, Branding, and User Directives)**
+    **Phase 1: Expert Promo Clip Construction (Focus: Hooks, Distinct Angles, Spoiler Discipline)**
 
-    1.  **Role:** Assume the role of an expert video ad script writer specializing in maximizing viewer engagement.
-    2.  **Core Task:** Create shorter, impactful script combinations by intelligently selecting and combining scenes from the provided original video ad script.
-    3.  **User Directive Interpretation (Crucial):**
-        *   **Input Format:** The user has provided their directive in a single free-form text field: {{userPrompt}}.
-        *   **Empty Input (No Directive):** If the {{userPrompt}} field is *empty*, the user has provided *no specific directive*. In this case, *follow the "Key Combination Guidelines" below*.
-        *   **"Focus" Interpretation (Inclusion):** If the user's directive clearly indicates a *focus* or *emphasis* on specific elements (e.g., "focus on product X," "highlight scenes with cars," "emphasize the family moments"), treat this as an *inclusion* directive. Prioritize scenes containing those elements.
-        *   **"Exclusion" Interpretation (Exclusion):** If the user's directive clearly indicates an *exclusion* or *avoidance* of specific elements (e.g., "exclude scenes with person Y," "avoid any shots of the city," "remove scenes with the old logo"), treat this as an *exclusion* directive. *Absolutely avoid* including scenes containing those elements.
-        *   **Ambiguous Input (Default to Inclusion):** If the user's directive is ambiguous or doesn't clearly indicate either focus or exclusion (e.g., "cars," "red," "night"), *treat this as an inclusion directive*. Prioritize scenes containing those elements. If it is completely unrelated to the content of the script, ignore it.
-    4.  **Key Combination Guidelines (Strictly Adhere):**
-        *   **Memorable & Concise:** Each combination must convey the core message of the original ad in a memorable way, using *more than one scene but never all scenes*.
-        *   **Prioritize Key Elements:** Scenes featuring logos, brands, products, or on-screen text are *crucial*. Prioritize their inclusion.
-        *   **Strong Conclusion:** The *final scene of the original script is paramount*. Always include it as the concluding scene of every combination.
-        *   **Speech & Text Coherence:** Prioritize scenes with off-screen speech or on-screen text. Ensure a logical flow and coherent message within the combined scenes. Avoid jarring transitions.
-        *   **Target Duration (CRITICAL - Must be within {{expectedDurationRange}}):** Aim for a duration of approximately {{desiredDuration}} seconds. This is an *absolutely critical requirement*. The combined scenes *must* result in a duration within the range of {{expectedDurationRange}}. Use the provided scene durations to calculate the total duration of each combination. *Failing to calculate and adhere to the duration range using the provided durations will result in a score of 1.* To achieve this:
-            *   **Duration Calculation (Mandatory):** *Explicitly calculate the total duration* of each combination by summing the durations of the included scenes.
-            *   **Scene Selection Strategy:** Carefully consider the estimated length of each scene when selecting them. Prioritize shorter scenes if needed to stay within the duration range.
-            *   **Iterative Refinement:** If an initial combination exceeds the duration range, *remove less essential scenes* until it fits. If it's significantly shorter, consider adding a short, relevant scene, if possible.
-            *   **Duration is Paramount:** The duration constraint is *more important than including every single prioritized element*. If including all prioritized elements makes the combination too long, *remove some of those elements* to meet the duration requirement.
-        *   **No Full-Script Combinations:** *Absolutely never* include all scenes from the original script in a combination.
+    1.  **Role:** Assume the role of an expert show-trailer/promo editor. Your job is to find different "ways in" to the same show and build one short clip per angle.
+    2.  **Pre-Step — Map the Show Before Cutting:** Before producing any combinations, internally enumerate from the script:
+        *   **Plot threads / subplots** present in the source (main storyline, secondary arcs, side beats).
+        *   **Lead and supporting characters** with enough screen presence to anchor a clip.
+        *   **Tonal modes** the source contains (e.g., suspense, action, comedic, emotional, mysterious, romantic).
+        *   **Hookable moments** scattered across the runtime: cold-open-style beats, bold visuals, signature dialogue, surprise reveals (non-spoiler), recurring motifs, character-defining moments.
+        Use this map to assign each variant a *unique* (thread, character, tone) cell. Treat the map as a planning artifact — do not output it.
+    3.  **User Directive Interpretation:**
+        *   **Input Format:** The user's directive arrives in a single free-form text field: {{userPrompt}}.
+        *   **Empty Input:** If {{userPrompt}} is empty, follow the "Key Promo Clip Guidelines" below with no additional bias.
+        *   **Focus Directive:** If the directive emphasizes specific elements ("focus on the detective subplot", "highlight the romance", "lean into the action beats"), bias *all* variants toward that element while still differentiating them on the other axes (character, tone, specific moment).
+        *   **Exclusion Directive:** If the directive excludes elements ("no scenes with character Y", "avoid the courtroom scenes"), absolutely omit those scenes from every variant.
+        *   **Ambiguous Input:** Treat as a soft inclusion bias. If unrelated to the show, ignore.
+    4.  **Key Promo Clip Guidelines (Strictly Adhere):**
+        *   **Strong Hook Opening (Context-Consistent):** Each clip must open on the most attention-grabbing moment *available within the variant's own angle and chosen scenes* — a beat that creates curiosity, intrigue, or immediate emotional pull within the first few seconds (cold-open, signature line, bold visual, mid-action drop-in, emotional spike, unanswered question). The hook must share context with the rest of the clip — same thread, same tone, same world — so the viewer who stays put lands in a coherent continuation, not a bait-and-switch. Do NOT borrow a punchy moment from a different thread or tone just to grab attention; that breaks the angle. **Soft floor, not a hard one:** if the variant's angle genuinely lacks a strong hook scene, pick the strongest opener it does have rather than forcing a flashy mismatch — a coherent clip with a moderate opener beats a punchy opener that doesn't fit.
+        *   **One Angle Per Clip:** Each clip is built around a single thread, character, or tonal angle from the pre-step map. Do not try to summarize the whole show inside one clip — that's what the source already is.
+        *   **Tease, Don't Resolve:** End on a question, a cliffhanger, an unresolved beat, or a signature recurring moment. Never include the climax, twist payoff, or resolution. If a scene reveals an outcome, it is a spoiler — exclude it.
+        *   **Show-Identity Cues (when available):** Title cards, recurring motifs, signature locations, and character intro shots strengthen a promo. Include them when they fit the angle.
+        *   **Internal Coherence:** Within a single clip, scenes should flow logically (matching tone, sensible chronological feel) — but the clip as a whole must read as *separate* from any other variant. Two variants telling the same micro-story with different windowing is a failure.
+        *   **Target Duration (CRITICAL — must fall within {{expectedDurationRange}}):** Aim for ~{{desiredDuration}} seconds. Sum the per-scene durations explicitly. If over: drop the least-essential scene. If under: add a short scene that fits the angle. Failing the duration range scores 1.
+        *   **Use More Than One Scene, Never All Scenes.**
+
+    5.  **Variant Diversity (Hard Constraint, Across the Set):**
+        *   **Unique Anchor Per Variant:** Every variant must occupy a different (thread, character, tone) cell from the pre-step map. Two variants whose anchors overlap on all three axes is a critical failure.
+        *   **No Centre-of-Gravity Overlap:** If two variants would both be "centered" on the same beat or scene cluster, regenerate one of them around a different angle.
+        *   **Coverage First, Tonal Re-Cuts Second:** If the user requests N variants and the show has T distinct threads:
+            *   When N ≤ T: assign each variant a different thread (further differentiated by character/tone where possible).
+            *   When N > T: cover all T threads first (one variant per thread), then create tonal re-cuts of the most promotable threads — same thread, different lead character or different tonal mode (e.g., an "action cut" of the mystery thread vs. an "emotional cut" of the same thread). Tonal re-cuts must use largely *non-overlapping scenes* from each other.
+        *   **Diverse Openers:** No two variants may open on the same scene number.
 
     **Phase 2: Expert Critique (Rigorous Evaluation and Recommendations), Scoring and Justification (Detailed Analysis)**
+
+    The criteria block below scores the **promo clip itself as an ad for the show** — not the show. When the rubric refers to "the brand," "the product," or "the ad," interpret it as "the show being promoted" and "this promo clip." A strong cold-open hook satisfies "Impactful Opening"; a clear "watch now"-style tease or the show's title/identity satisfies branding and direction criteria.
 
     {{{{generationEvalPromptPart}}}}
 
@@ -348,6 +367,8 @@ export const PROMPTS = {
         *   Each combination must include *more than one scene* but *never all scenes* from the original script {{videoScript}}.
         *   Each combination *must* fall within the specified duration range: {{expectedDurationRange}}.
         *   Every scene number used in a generated combination must exist in the original script {{videoScript}}. Generating a combination that includes a non-existent scene number (e.g., suggesting "5" when the script only has scenes 1-3) is a critical failure and will render the entire output useless.
+        *   No two combinations in the output set may share the same anchor (thread, character, tone) cell, and no two may open on the same scene number.
+        *   No combination may contain a spoiler scene (climax reveal, twist payoff, finale resolution).
         *   ALL output text except the Title must be in English.
 
     **Output Format (Strictly Enforce):**
@@ -355,7 +376,7 @@ export const PROMPTS = {
     For each generated combination, present the following information in this *exact* format:
     Title: [Concise and descriptive title in {{videoLanguage}}]
     Scenes: [Comma-separated list of scene numbers included (no "Scene" prefix)]
-    Reasoning: [Short but detailed explanation IN ENGLISH of the combination's coherence, engagement, and effectiveness - write as continuous paragraph text]
+    Reasoning: [Short but detailed explanation IN ENGLISH. Begin with one sentence naming the variant's anchor in the form "Angle: <thread> | <lead character> | <tone>." Then explain the hook, why this clip stands apart from the other variants, and what it teases without revealing.]
     Score: [Total points earned - sum all points from all ABCD criteria and subcategories. Do NOT convert to 1-5 scale, just output the raw total.]
     Duration: [Calculated duration of the combination in seconds]
     ABCD: [Short but detailed evaluation IN ENGLISH per criterion. Write as continuous flowing text, vertically stacked. Use **bold** for main section headers like "**A - Attention (X/Y points):**" and include subsection point breakdowns like "Impactful Opening (X/Y points):" with line breaks between sections for readability.]
