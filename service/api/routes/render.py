@@ -130,12 +130,12 @@ def _render_variant_as_xml(
     cached_video_path: str,
     source_video_key: str,
 ):
-    """Build a Premiere Pro bundle (zip with timeline.xml + media/ + music/) for one variant.
+    """Build a Premiere/Resolve bundle (zip with <title>_timeline.xml + media/ + music/) for one variant.
 
     For each selected segment, ffmpeg-extracts:
       - media/clip_NNN.mp4   (video + stereo AAC, frame-accurate H.264 CRF 18)
       - music/clip_NNN.wav   (audio-only, PCM s16 stereo 48kHz)
-    Then writes timeline.xml referencing those files and zips everything up.
+    Then writes <safe_title>_timeline.xml referencing those files and zips everything up.
     The zip is uploaded to GCS and surfaced as the variant's render artifact.
     """
     import shutil
@@ -242,15 +242,22 @@ def _render_variant_as_xml(
             raise ValueError(f"No valid clips extracted for variant {variant_id}")
 
         # ---- build XML ----
+        title = variant.get("title", f"Variant {variant_id}")
         xml_string = generate_premiere_xml(
             variant_id=variant_id,
-            title=variant.get("title", f"Variant {variant_id}"),
+            title=title,
             clips=clips_for_xml,
             width=width,
             height=height,
             fps=fps,
         )
-        xml_path = os.path.join(work_dir, "timeline.xml")
+        # Filename: "<safe_title>_timeline.xml" — keep alphanumerics, dashes,
+        # and underscores; collapse everything else to underscore so the file
+        # can be selected in Resolve/Premiere file pickers without escaping.
+        import re
+        safe_title = re.sub(r"[^A-Za-z0-9_-]+", "_", title).strip("_") or f"variant_{variant_id}"
+        xml_filename = f"{safe_title}_timeline.xml"
+        xml_path = os.path.join(work_dir, xml_filename)
         with open(xml_path, "w", encoding="utf-8") as xf:
             xf.write(xml_string)
 
@@ -260,7 +267,7 @@ def _render_variant_as_xml(
             f"variant_{variant_id}_{int(datetime.utcnow().timestamp())}.zip",
         )
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(xml_path, arcname="timeline.xml")
+            zf.write(xml_path, arcname=xml_filename)
             for sub in ("media", "music"):
                 sub_dir = os.path.join(work_dir, sub)
                 for fname in sorted(os.listdir(sub_dir)):
@@ -454,6 +461,11 @@ def _render_variants_background(folder: str, render_data: dict):
 
             if variant.get("output_type") == "xml":
                 zip_key = f"{folder}/{variant_id}-{num_variants}_premiere.zip"
+                # Source-video stem from the folder name (format:
+                # "<sanitized_name>--<svc>--<ts>--<user>") — used as the zip's
+                # download filename so editors save it as <source>.zip.
+                source_stem = folder.split("--", 1)[0] or "variant"
+                download_name = f"{source_stem}.zip"
                 render_id = f"{variant_id}_{int(datetime.utcnow().timestamp() * 1000)}"
                 render_entry = {
                     "id": render_id,
@@ -462,7 +474,7 @@ def _render_variants_background(folder: str, render_data: dict):
                     "description": variant.get("description", ""),
                     "outputType": "xml",
                     "formats": {
-                        "zip": {"key": zip_key},
+                        "zip": {"key": zip_key, "downloadName": download_name},
                     },
                     "createdAt": datetime.utcnow().isoformat(),
                 }
