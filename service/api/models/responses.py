@@ -90,6 +90,11 @@ class GenerateVariantsRequest(BaseModel):
     prompt: str
     target_duration: Optional[float] = None
     num_variants: int = 5
+    prompt_option: Optional[str] = "default"
+    custom_prompt: Optional[str] = ""
+    business_objective: Optional[str] = None
+    shorten_video: bool = True
+    video_language: Optional[str] = None
 
 
 class GenerateVariantsResponse(BaseModel):

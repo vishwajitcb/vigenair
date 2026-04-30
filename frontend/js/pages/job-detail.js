@@ -10,6 +10,23 @@ import {
     STAGE_LABELS, scoreToStars
 } from '../utils.js';
 
+// Stable id for a variant based on its content (title + sorted segments).
+// Same content -> same id, different content -> different id.
+// Using FNV-1a 32-bit so the result fits in a short hex string safe for use
+// in GCS keys and filenames.
+function hashVariantId(title, segments) {
+    const sortedSegs = [...(segments || [])].map(String).sort().join(',');
+    const input = `${title || ''}|${sortedSegs}`;
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i);
+        hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+    }
+    // No underscore: filename parsing in service/combiner/combiner.py:288 splits
+    // on '_' to recover variant_id, and our id must survive that split intact.
+    return 'v' + hash.toString(16).padStart(8, '0');
+}
+
 // State
 let job = null;
 let folder = null;
@@ -256,6 +273,8 @@ async function handleGenerateVariants() {
             prompt,
             target_duration: targetDuration,
             num_variants: numVariants,
+            prompt_option: promptOption,
+            custom_prompt: customPrompt,
             business_objective: businessObjective,
             shorten_video: shortenVideo,
         });
@@ -266,22 +285,33 @@ async function handleGenerateVariants() {
 
         // Convert to our variant format
         const variants = (response.variants || []).map((v, idx) => {
-            // Normalize score to 0-5 range (handle scores out of 100)
-            let normalizedScore = v.score || 3;
-            if (normalizedScore > 5) {
-                normalizedScore = Math.min(5, Math.max(0, (normalizedScore / 100) * 5));
+            // Normalize score to a 0-5 star scale.
+            // Backend stamps `score_max` (17/16/18 for ABCD rubrics, 100 for narrative).
+            // Fall back to 100 for old responses that lacked the field.
+            const rawScore = typeof v.score === 'number' ? v.score : 3;
+            const scoreMax = typeof v.score_max === 'number' && v.score_max > 0 ? v.score_max : 100;
+            let normalizedScore;
+            if (rawScore <= 5 && scoreMax === 100) {
+                // Already on a 0-5 scale (legacy / fallback default).
+                normalizedScore = rawScore;
+            } else {
+                normalizedScore = Math.min(5, Math.max(0, (rawScore / scoreMax) * 5));
             }
-            normalizedScore = Math.round(normalizedScore * 10) / 10; // Round to 1 decimal
+            normalizedScore = Math.round(normalizedScore * 10) / 10;
 
+            const title = v.title || `Variant ${idx + 1}`;
+            const segments = (v.scenes || v.segments || []).map(s => String(s));
             return {
-                id: idx,
-                title: v.title || `Variant ${idx + 1}`,
+                id: hashVariantId(title, segments),
+                title,
                 description: v.description || '',
                 score: normalizedScore,
                 reasoning: v.reasoning || '',
-                segments: (v.scenes || v.segments || []).map(s => String(s)),
+                segments,
                 duration: v.estimated_duration || targetDuration,
                 userModified: false,
+                angle: v.angle || null,
+                hook_scene: typeof v.hook_scene === 'number' ? v.hook_scene : null,
             };
         });
 
@@ -373,12 +403,6 @@ function renderVariants() {
                 </div>
             </div>
             ${variant.description ? `<p class="text-gray-600">${variant.description}</p>` : ''}
-            ${variant.reasoning ? `
-                <div class="bg-gray-50 rounded-lg p-4">
-                    <h4 class="text-sm font-medium text-gray-700 mb-1">AI Reasoning</h4>
-                    <p class="text-sm text-gray-600">${variant.reasoning}</p>
-                </div>
-            ` : ''}
             <div>
                 <h4 class="text-sm font-medium text-gray-700 mb-2">Selected Segments</h4>
                 <div class="flex flex-wrap gap-2">

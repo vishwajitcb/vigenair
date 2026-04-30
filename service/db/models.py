@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -46,7 +46,10 @@ class Segment(BaseModel):
 
 class Variant(BaseModel):
     """Generated variant model."""
-    id: int
+    # Either an int (legacy: positional index) or a str (current: content hash
+    # like "vf352d5e7"). Stable string ids prevent regenerated variants from
+    # overwriting earlier renders that share the same positional slot.
+    id: Union[int, str]
     title: str
     description: Optional[str] = None
     score: float = 0.0
@@ -54,6 +57,8 @@ class Variant(BaseModel):
     segments: List[str] = []  # Segment IDs
     duration: float = 0.0
     userModified: bool = False
+    angle: Optional[str] = None
+    hook_scene: Optional[int] = None
 
 
 class GenerationSettings(BaseModel):
@@ -77,7 +82,7 @@ class RenderSettings(BaseModel):
 
 class RenderQueueItem(BaseModel):
     """Item in render queue."""
-    variantId: int
+    variantId: Union[int, str]
     segments: List[str] = []
     settings: RenderSettings = Field(default_factory=RenderSettings)
 
@@ -90,7 +95,7 @@ class RenderedFormat(BaseModel):
 
 class RenderedVariant(BaseModel):
     """Rendered variant with formats and assets."""
-    variantId: int
+    variantId: Union[int, str]
     formats: Dict[str, RenderedFormat] = {}
     images: List[str] = []
     texts: List[Dict[str, Any]] = []
