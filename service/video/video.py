@@ -451,6 +451,76 @@ def _annotation_results_to_dict(result: VideoAnnotationResults) -> Dict[str, Any
     }
 
 
+def subdivide_shot_boundaries(gs_uri: str, max_duration: float) -> List[Dict[str, float]]:
+    """Second-pass Gemini call: asks for shot boundaries inside a sub-clip.
+
+    Used to split too-long shots returned by the first-pass analysis into
+    smaller pieces aligned to natural visual/scene/topic changes inside the
+    clip itself. Caller is responsible for translating clip-relative times
+    back to source-relative times.
+
+    Args:
+        gs_uri: gs:// URI of the sub-clip in GCS.
+        max_duration: Target maximum shot length, used in the prompt to
+            steer Gemini toward emitting bounded shots.
+
+    Returns:
+        A list of dicts with float `start_seconds` and `end_seconds`,
+        relative to the start of the sub-clip. Empty list on failure.
+    """
+    from google.genai import types
+
+    client = ConfigService.get_genai_client()
+    prompt_text = ConfigService.SHOT_BOUNDARIES_PROMPT % int(max_duration)
+
+    logging.info('SUBDIVIDE - Sending sub-clip to Gemini: %s', gs_uri)
+    video_part = types.Part.from_uri(file_uri=gs_uri, mime_type='video/mp4')
+
+    try:
+        response = client.models.generate_content(
+            model=ConfigService.CONFIG_VISION_MODEL,
+            contents=[video_part, prompt_text],
+            config=types.GenerateContentConfig(**ConfigService.VIDEO_ANALYSIS_CONFIG),
+        )
+    except Exception as e:
+        logging.error('SUBDIVIDE - Gemini call failed: %s', str(e))
+        return []
+
+    if not response.candidates:
+        logging.error('SUBDIVIDE - Gemini returned no candidates for %s', gs_uri)
+        return []
+
+    response_text = response.text or ''
+    if not response_text.strip():
+        logging.error('SUBDIVIDE - Empty response text for %s', gs_uri)
+        return []
+
+    # Reuse the same JSON extraction logic as the first pass.
+    text = response_text.strip()
+    json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+    if json_match:
+        text = json_match.group(1)
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        logging.warning('SUBDIVIDE - JSON parse failed for %s: %s', gs_uri, e)
+        return []
+
+    shots = data.get('shots', [])
+    parsed: List[Dict[str, float]] = []
+    for s in shots:
+        try:
+            start = float(s.get('start_seconds', 0))
+            end = float(s.get('end_seconds', 0))
+        except (TypeError, ValueError):
+            continue
+        if end > start:
+            parsed.append({'start_seconds': start, 'end_seconds': end})
+    logging.info('SUBDIVIDE - Gemini returned %d sub-shots for %s', len(parsed), gs_uri)
+    return parsed
+
+
 def _run_gemini_video_analysis(
     gs_uri: str,
     video_file_path: str,

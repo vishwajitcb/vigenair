@@ -471,7 +471,8 @@ function renderRenderedVideos() {
     list.innerHTML = renders.map((render, renderIdx) => {
         if (render.outputType === 'xml') {
             const zipUrl = render.formats?.zip?.url || '';
-            const baseName = (render.title || 'variant').replace(/[^A-Za-z0-9_-]+/g, '_');
+            const downloadName = render.formats?.zip?.downloadName
+                || ((render.title || 'variant').replace(/[^A-Za-z0-9_-]+/g, '_') + '.zip');
             return `
         <div class="border border-gray-200 rounded-lg overflow-hidden bg-white">
             <div class="p-4 border-b border-gray-100">
@@ -484,11 +485,11 @@ function renderRenderedVideos() {
             </div>
             <div class="p-4 space-y-3">
                 <p class="text-sm text-gray-600">
-                    Unzip the bundle, then in Adobe Premiere Pro: File &rarr; Import &rarr; <code>timeline.xml</code>.
-                    The <code>media/</code> and <code>audio/</code> folders next to it contain pre-cut clips per segment.
+                    Unzip the bundle, then in Adobe Premiere Pro or DaVinci Resolve: File &rarr; Import &rarr; the <code>*_timeline.xml</code> file.
+                    The <code>media/</code> and <code>music/</code> folders next to it contain pre-cut video and audio clips per segment.
                 </p>
                 <div class="flex flex-wrap gap-2">
-                    <a href="${zipUrl}" download="${baseName}.zip"
+                    <a href="${zipUrl}" download="${downloadName}"
                        class="inline-flex items-center gap-1 bg-primary hover:bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-medium">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
                         Download Premiere bundle (.zip)

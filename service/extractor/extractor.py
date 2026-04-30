@@ -23,6 +23,7 @@ import dataclasses
 import gc
 import json
 import logging
+import math
 import os
 import pathlib
 import re
@@ -594,6 +595,14 @@ class Extractor:
 
       annotation_results = self.extract_video_finalise(tmp_dir)
       transcription_dataframe = self.extract_audio_finalise(tmp_dir)
+
+      annotation_results = _subdivide_long_shots(
+          annotation_results,
+          input_video_file_path=input_video_file_path,
+          bucket_name=self.gcs_bucket_name,
+          gcs_folder=self.media_file.gcs_folder,
+          tmp_dir=tmp_dir,
+      )
 
       optimised_av_segments = _create_optimised_segments(
           annotation_results,
@@ -1206,6 +1215,183 @@ def _cut_and_annotate_av_segment(
   return description, keywords
 
 
+def _seconds_to_time_offset(seconds_float: float):
+  """Converts a float seconds value to a video.TimeOffset (seconds + nanos)."""
+  whole = int(seconds_float)
+  nanos = int(round((seconds_float - whole) * 1_000_000_000))
+  if nanos >= 1_000_000_000:
+    whole += 1
+    nanos -= 1_000_000_000
+  return VideoService.TimeOffset(seconds=whole, nanos=max(nanos, 0))
+
+
+def _make_shot_annotation(start_s: float, end_s: float):
+  """Builds a video.ShotAnnotation from float start/end times."""
+  return VideoService.ShotAnnotation(
+      start_time_offset=_seconds_to_time_offset(start_s),
+      end_time_offset=_seconds_to_time_offset(end_s),
+  )
+
+
+def _subdivide_long_shots(
+    annotation_results,
+    input_video_file_path: str,
+    bucket_name: str,
+    gcs_folder: str,
+    tmp_dir: str,
+):
+  """Splits any first-pass shot longer than the variant cap into smaller pieces.
+
+  For each over-long shot, ffmpeg-cuts the corresponding sub-clip from the
+  master video, uploads it to GCS, and asks Gemini for a finer breakdown using
+  SHOT_BOUNDARIES_PROMPT. Sub-shot times come back clip-relative; we translate
+  them to source-relative. Anything still over the cap is fixed-time-sliced
+  as a last-resort backstop.
+
+  Mutates `annotation_results.shot_annotations` in place and returns the
+  same object for convenience. Single second pass only — no recursion.
+
+  Args:
+    annotation_results: First-pass video.VideoAnnotationResults.
+    input_video_file_path: Local path to the downloaded source video.
+    bucket_name: GCS bucket for sub-clip uploads.
+    gcs_folder: Job's GCS folder (sub-clips written under <folder>/_subdivide/).
+    tmp_dir: Local temp dir already created by finalise_extraction.
+
+  Returns:
+    The same annotation_results, with shot_annotations possibly expanded.
+  """
+  max_duration = float(ConfigService.CONFIG_MAX_VARIANT_SEGMENT_DURATION)
+  if not annotation_results.shot_annotations:
+    return annotation_results
+
+  long_shots = sum(
+      1 for s in annotation_results.shot_annotations
+      if (
+          s.end_time_offset.seconds + s.end_time_offset.microseconds / 1e6
+          - s.start_time_offset.seconds - s.start_time_offset.microseconds / 1e6
+      ) > max_duration
+  )
+  if not long_shots:
+    return annotation_results
+
+  logging.info(
+      'SUBDIVIDE: %d shot(s) exceed %.1fs cap; running second-pass Gemini',
+      long_shots, max_duration,
+  )
+
+  new_shots = []
+  for idx, shot in enumerate(annotation_results.shot_annotations):
+    start_s = shot.start_time_offset.seconds + shot.start_time_offset.microseconds / 1e6
+    end_s = shot.end_time_offset.seconds + shot.end_time_offset.microseconds / 1e6
+    duration_s = end_s - start_s
+
+    if duration_s <= max_duration:
+      new_shots.append(shot)
+      continue
+
+    clip_path = os.path.join(tmp_dir, f'subdivide_shot_{idx}.mp4')
+    sub_key = f'{gcs_folder}/_subdivide/shot_{idx}.mp4'
+
+    try:
+      Utils.execute_subprocess_commands(
+          cmds=[
+              'ffmpeg', '-y',
+              '-ss', f'{start_s:.3f}',
+              '-i', input_video_file_path,
+              '-t', f'{duration_s:.3f}',
+              '-c', 'copy',
+              clip_path,
+          ],
+          description=f'subdivide shot {idx} ({duration_s:.1f}s) for second-pass',
+      )
+    except Exception:  # pylint: disable=broad-exception-caught
+      logging.exception(
+          'SUBDIVIDE: ffmpeg cut failed for shot %d; keeping original', idx,
+      )
+      new_shots.append(shot)
+      continue
+
+    sub_shots = []
+    try:
+      StorageService.upload_gcs_file(
+          file_path=clip_path,
+          bucket_name=bucket_name,
+          destination_file_name=sub_key,
+          overwrite=True,
+      )
+      gs_uri = StorageService.get_gs_uri(sub_key)
+      sub_shots = VideoService.subdivide_shot_boundaries(gs_uri, max_duration)
+    except Exception:  # pylint: disable=broad-exception-caught
+      logging.exception(
+          'SUBDIVIDE: second-pass failed for shot %d; falling back to fixed-time slicing',
+          idx,
+      )
+    finally:
+      try:
+        StorageService.delete_gcs_file(sub_key, bucket_name=bucket_name)
+      except Exception:  # pylint: disable=broad-exception-caught
+        logging.warning('SUBDIVIDE: failed to delete temp sub-clip %s', sub_key)
+      if os.path.exists(clip_path):
+        os.unlink(clip_path)
+
+    if not sub_shots:
+      # Gemini returned nothing usable — fall back to fixed-time slicing.
+      num_pieces = max(1, math.ceil(duration_s / max_duration))
+      piece_dur = duration_s / num_pieces
+      for p in range(num_pieces):
+        new_shots.append(_make_shot_annotation(
+            start_s + p * piece_dur,
+            start_s + (p + 1) * piece_dur,
+        ))
+      logging.info(
+          'SUBDIVIDE_FALLBACK: shot %d at %.1fs sliced into %d fixed pieces (no Gemini sub-shots)',
+          idx, start_s, num_pieces,
+      )
+      continue
+
+    # Translate clip-relative times to source-relative; backstop any
+    # individual sub-shot still over the cap with fixed-time slicing.
+    expanded = 0
+    for sub in sub_shots:
+      sub_start = start_s + float(sub['start_seconds'])
+      sub_end = start_s + float(sub['end_seconds'])
+      # Clamp to original shot bounds (Gemini sometimes overshoots by epsilon).
+      sub_start = max(sub_start, start_s)
+      sub_end = min(sub_end, end_s)
+      sub_duration = sub_end - sub_start
+      if sub_duration <= 0:
+        continue
+      if sub_duration <= max_duration:
+        new_shots.append(_make_shot_annotation(sub_start, sub_end))
+        expanded += 1
+      else:
+        num_pieces = max(1, math.ceil(sub_duration / max_duration))
+        piece_dur = sub_duration / num_pieces
+        for p in range(num_pieces):
+          new_shots.append(_make_shot_annotation(
+              sub_start + p * piece_dur,
+              sub_start + (p + 1) * piece_dur,
+          ))
+        expanded += num_pieces
+        logging.info(
+            'SUBDIVIDE_FALLBACK: sub-shot at %.1fs sliced into %d fixed pieces',
+            sub_start, num_pieces,
+        )
+    logging.info(
+        'SUBDIVIDE: shot %d at %.1fs (%.1fs duration) -> %d sub-shots',
+        idx, start_s, duration_s, expanded,
+    )
+
+  original_count = len(annotation_results.shot_annotations)
+  annotation_results.shot_annotations = new_shots
+  logging.info(
+      'SUBDIVIDE: total shot count %d -> %d after second pass',
+      original_count, len(new_shots),
+  )
+  return annotation_results
+
+
 def _create_optimised_segments(
     annotation_results,
     transcription_dataframe: pd.DataFrame,
@@ -1300,10 +1486,24 @@ def _create_optimised_av_segments(
         if current_audio_segment_ids else False
     )
 
+    # Cap merged segment duration at the variant prefilter's cap so the
+    # segmenter and prefilter agree on what's "too long". Without this,
+    # long-form content with continuous audio collapses into one giant segment.
+    max_segment_duration = ConfigService.CONFIG_MAX_VARIANT_SEGMENT_DURATION
+    if current_visual_segments:
+      running_start = min(entry[1] for entry in current_visual_segments)
+      projected_duration = visual_segment['end_s'] - running_start
+      duration_ok = projected_duration <= max_segment_duration
+    else:
+      projected_duration = 0.0
+      duration_ok = True
+
     if (
-        continued_shot or not current_visual_segments or (
-            silent_short_shot and not current_audio_segment_ids
-            and is_last_shot_short
+        duration_ok and (
+            continued_shot or not current_visual_segments or (
+                silent_short_shot and not current_audio_segment_ids
+                and is_last_shot_short
+            )
         )
     ):
       current_visual_segments.append((
@@ -1319,6 +1519,12 @@ def _create_optimised_av_segments(
       start = min([entry[1] for entry in current_visual_segments])
       end = max([entry[2] for entry in current_visual_segments])
       duration = end - start
+      if not duration_ok:
+        logging.info(
+            'SEGMENT_DURATION_CAP: closed segment %d at %.1fs '
+            '(merging shot %s would have made it %.1fs)',
+            index + 1, duration, visual_segment['shot_id'], projected_duration
+        )
       optimised_av_segments.loc[index] = [
           str(index + 1),
           visual_segment_ids,

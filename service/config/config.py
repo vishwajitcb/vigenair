@@ -341,6 +341,27 @@ Analyze the entire video carefully. Identify:
 Return ONLY valid JSON, no other text.
 """
 
+SHOT_BOUNDARIES_PROMPT = """Analyze this video clip and identify every distinct shot/cut/scene boundary inside it. A shot boundary is anywhere the camera angle, framing, subject, or scene changes meaningfully.
+
+Return ONLY valid JSON with this exact structure (no other text, no labels, no objects, no logos):
+
+{
+  "shots": [
+    {"start_seconds": 0.0, "end_seconds": 3.5},
+    {"start_seconds": 3.5, "end_seconds": 7.0}
+  ]
+}
+
+Rules:
+- Cover the entire clip from start to end with no gaps and no overlap.
+- Sub-second precision is encouraged when a cut lands mid-second.
+- Each shot should be a distinct visual unit. For static talking-head footage with no hard camera cuts, subdivide at natural beats: speaker re-framing, gesture changes, sentence/topic shifts, or pauses.
+- Aim for shots no longer than %d seconds where possible. If you cannot find a meaningful change for a stretch longer than this, still emit a boundary at approximately that interval to keep shot lengths bounded.
+- Do not invent times outside the clip's actual duration.
+
+Return ONLY valid JSON, no other text.
+"""
+
 VIDEO_ANALYSIS_CONFIG = {
     'max_output_tokens': 65536,  # Max output for gemini-3-flash (64K)
     'temperature': 0.1,
