@@ -172,6 +172,83 @@ async def generate_variants(folder: str, request: GenerateVariantsRequest):
         video_language = request.video_language or _load_video_language(folder)
         expected_range = variant_prompts.calculate_expected_duration_range(target_duration)
 
+        # ---- Pass 1: Hook & Angle Inventory ----
+        # Only run for shortening mode. Aspect-ratio-only mode and crop-only
+        # don't need hooks because they include all scenes.
+        hook_inventory_block = ""
+        run_hook_pass = request.shorten_video and prompt_option != "crop-only"
+        if run_hook_pass:
+            try:
+                from google.genai import types as _genai_types
+
+                hook_prompt = variant_prompts.assemble_hook_inventory_prompt(
+                    segments_text=segments_text,
+                    num_variants=num_variants,
+                    video_language=video_language,
+                )
+                logger.info(
+                    f"HOOK_PASS: starting Pass 1 hook inventory (model={ConfigService.CONFIG_TEXT_MODEL})"
+                )
+                _client = ConfigService.get_genai_client()
+                _hook_resp = _client.models.generate_content(
+                    model=ConfigService.CONFIG_TEXT_MODEL,
+                    contents=hook_prompt,
+                    config=_genai_types.GenerateContentConfig(
+                        max_output_tokens=32768,
+                        temperature=0.5,
+                    ),
+                )
+                _hook_text = getattr(_hook_resp, "text", None)
+                if not _hook_text:
+                    _finish = None
+                    try:
+                        _finish = _hook_resp.candidates[0].finish_reason
+                    except Exception:
+                        pass
+                    raise ValueError(f"Empty Pass 1 response (finish_reason={_finish})")
+
+                _hook_text = _hook_text.strip()
+                logger.info(f"HOOK_PASS raw: {_hook_text[:400]}")
+                if _hook_text.startswith("```"):
+                    _lines = _hook_text.split("\n")
+                    _hook_text = "\n".join(_lines[1:-1])
+
+                inventory = json.loads(_hook_text)
+                hooks = inventory.get("hooks", [])
+                if not hooks:
+                    raise ValueError("Pass 1 returned no hooks")
+
+                # Filter hooks to scenes that actually exist.
+                valid_hooks = [
+                    h for h in hooks
+                    if isinstance(h.get("scene"), int) and 1 <= h["scene"] <= len(segments)
+                ]
+                # Drop hooks pointing at over-cap scenes the prefilter excluded.
+                valid_hooks = [
+                    h for h in valid_hooks
+                    if h["scene"] in eligible_indices
+                ]
+                if len(valid_hooks) != len(hooks):
+                    logger.warning(
+                        f"HOOK_PASS: filtered {len(hooks) - len(valid_hooks)} hooks pointing at "
+                        f"missing/ineligible scenes"
+                    )
+                if not valid_hooks:
+                    raise ValueError("Pass 1 hooks all pointed at invalid scenes")
+
+                inventory["hooks"] = valid_hooks
+                assignment = variant_prompts.select_hooks_for_assignment(valid_hooks, num_variants)
+                hook_inventory_block = variant_prompts.format_hook_inventory_block(inventory, assignment)
+                logger.info(
+                    f"HOOK_PASS: success — {len(valid_hooks)} hooks, "
+                    f"assigned {len(assignment)} for {num_variants} variants. "
+                    f"Assignment: {[(h.get('id'), h.get('scene'), h.get('hook_type'), h.get('dynamic')) for h in assignment]}"
+                )
+            except Exception as _e:
+                logger.warning(f"HOOK_PASS: failed ({_e}); falling back to single-pass mode")
+                hook_inventory_block = ""
+
+        # ---- Pass 2: Variant Construction ----
         generation_prompt = variant_prompts.assemble_prompt(
             prompt_option=prompt_option,
             custom_prompt=custom_prompt,
@@ -182,11 +259,13 @@ async def generate_variants(folder: str, request: GenerateVariantsRequest):
             expected_duration_range=expected_range,
             video_language=video_language,
             num_variants=num_variants,
+            hook_inventory_block=hook_inventory_block,
         )
 
         logger.info(
             f"VARIANT_PROMPT: option={prompt_option} objective={request.business_objective} "
-            f"shorten={request.shorten_video} lang={video_language} range={expected_range}"
+            f"shorten={request.shorten_video} lang={video_language} range={expected_range} "
+            f"two_pass={'yes' if hook_inventory_block else 'no'}"
         )
 
         # Helper function to calculate actual duration of a variant

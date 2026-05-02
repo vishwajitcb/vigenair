@@ -10,6 +10,27 @@ The output of assemble_prompt() is a single string sent to Gemini.
 from typing import Optional
 
 
+# Hook taxonomy locked to the proven categories from the Chai Shots OTT
+# Creative Intelligence Report (Sep 2025–Mar 2026). Numbers in parentheses
+# are real campaign volume / cost-per-subscription data; they are surfaced
+# to Gemini in the prompt so it grounds hook ranking in actual performance.
+HOOK_TYPES = [
+    "romantic_tension",       # 2647 subs, ₹257 CPS — highest volume
+    "conflict_fight",         # 1294 subs, ₹270 CPS
+    "character_introduction", # 432 subs, ₹229 CPS — cheapest
+    "question_curiosity",     # 580 subs, ₹323 CPS
+    "shocking_reveal",        # weak — use sparingly
+]
+
+EMOTIONS = ["suspense", "curiosity", "betrayal", "sadness"]
+
+CHARACTER_DYNAMICS = [
+    "love_triangle",          # ₹246 CPS
+    "romantic_couple",        # ₹295 CPS
+    "husband_wife_conflict",  # ₹317 CPS
+]
+
+
 SCORE_MAX_BY_OBJECTIVE: dict[str, int] = {
     "awareness": 17,
     "consideration": 16,
@@ -235,63 +256,68 @@ ABCD_BLOCKS: dict[str, str] = {
 }
 
 
-SHOW_TRAILER_PROMPT = """**Objective:** Generate a set of short promo clips for a longer-form show (episode, series, or film), each anchored in a *distinct* angle of the source so a marketing team can pick the most compelling cut for an ad campaign.
+SHOW_TRAILER_PROMPT = """**Objective:** Generate {{numVariants}} short promo clips for a Chai Shots OTT show. You are given a **pre-committed hook inventory** from a senior creative strategist. Your job is to BUILD one variant per assigned hook — you do not get to pick new hooks or invent angles. The hook inventory is the source of truth for diversity.
 
     **CRITICAL UP-FRONT CONSTRAINTS (read before anything else):**
-    *   The input is a **show**, not an ad. The output clips are **promos for that show**.
-    *   Each variant must read as a **separate, standalone clip** — not as a tour of the episode and not as a continuation of the same scene flow as another variant.
-    *   **No two variants may share the same anchor** (plot thread, lead character, or tonal mode). Variant collisions are a critical failure.
-    *   **No spoilers.** Tease, do not resolve. Do not reveal climaxes, finale beats, deaths, twist payoffs, or "and then X happens" outcomes.
-    *   **Do NOT default to including the source's final scene.** The source's ending is usually a spoiler. Only include it if it is non-revealing (e.g., a recurring tag, a stinger, a title card).
+    *   The input is a **show**, not an ad. Each output clip is a **standalone promo for that show**.
+    *   You will produce **exactly one variant per hook in the assignment table below**. The number of variants you output must equal the number of rows in the assignment table.
+    *   For each variant: the variant's `hook_scene` field MUST equal the assigned hook's `scene` number. **Non-negotiable.**
+    *   For each variant: the variant's `angle` field MUST be derived from the assigned hook's tags in the form `{hook_type} | {character_label} | {emotion}`. **Non-negotiable.**
+    *   Every clip must follow the proven Chai Shots structure: **Setup → Conflict → Cliffhanger.** Open loop. Never resolve.
+    *   **No spoilers.** Do not include climaxes, twist payoffs, finale resolutions, or scenes that reveal "what happens next."
+    *   **Do NOT default to the source's final scene.** Source endings are usually spoilers.
 
-    **Instructions:**
+    **Performance reference (real Chai Shots campaign data, Sep 2025–Mar 2026):**
+    The hooks in your assignment table were already chosen against this data. Your job is to honor the structural rules below so the constructed clip *delivers* on the hook's promise:
+    *   Cliffhangers convert. Resolutions don't. End on an unresolved beat.
+    *   Setup → Conflict → Cliffhanger is the *universally* winning narrative shape across the top 100 ads.
+    *   40-90s clips outperform shorter ones because the narrative has room to land emotional investment before the cliffhanger. Aim for the upper end of the duration range when allowed.
+    *   Domestic tension (husband-wife, love triangle) is the dominant converter — when a hook centers on these, lean into it, do not soften it.
 
-    **Phase 1: Expert Promo Clip Construction (Focus: Hooks, Distinct Angles, Spoiler Discipline)**
+    **Phase 1: Variant Construction**
 
-    1.  **Role:** Assume the role of an expert show-trailer/promo editor. Your job is to find different "ways in" to the same show and build one short clip per angle.
-    2.  **Pre-Step — Map the Show Before Cutting:** Before producing any combinations, internally enumerate from the script:
-        *   **Plot threads / subplots** present in the source (main storyline, secondary arcs, side beats).
-        *   **Lead and supporting characters** with enough screen presence to anchor a clip.
-        *   **Tonal modes** the source contains (e.g., suspense, action, comedic, emotional, mysterious, romantic).
-        *   **Hookable moments** scattered across the runtime: cold-open-style beats, bold visuals, signature dialogue, surprise reveals (non-spoiler), recurring motifs, character-defining moments.
-        Use this map to assign each variant a *unique* (thread, character, tone) cell. Treat the map as a planning artifact — do not output it.
-    3.  **User Directive Interpretation:**
-        *   **Input Format:** The user's directive arrives in a single free-form text field: {{userPrompt}}.
-        *   **Empty Input:** If {{userPrompt}} is empty, follow the "Key Promo Clip Guidelines" below with no additional bias.
-        *   **Focus Directive:** If the directive emphasizes specific elements ("focus on the detective subplot", "highlight the romance", "lean into the action beats"), bias *all* variants toward that element while still differentiating them on the other axes (character, tone, specific moment).
-        *   **Exclusion Directive:** If the directive excludes elements ("no scenes with character Y", "avoid the courtroom scenes"), absolutely omit those scenes from every variant.
-        *   **Ambiguous Input:** Treat as a soft inclusion bias. If unrelated to the show, ignore.
-    4.  **Key Promo Clip Guidelines (Strictly Adhere):**
-        *   **Strong Hook Opening (Context-Consistent):** Each clip must open on the most attention-grabbing moment *available within the variant's own angle and chosen scenes* — a beat that creates curiosity, intrigue, or immediate emotional pull within the first few seconds (cold-open, signature line, bold visual, mid-action drop-in, emotional spike, unanswered question). The hook must share context with the rest of the clip — same thread, same tone, same world — so the viewer who stays put lands in a coherent continuation, not a bait-and-switch. Do NOT borrow a punchy moment from a different thread or tone just to grab attention; that breaks the angle. **Soft floor, not a hard one:** if the variant's angle genuinely lacks a strong hook scene, pick the strongest opener it does have rather than forcing a flashy mismatch — a coherent clip with a moderate opener beats a punchy opener that doesn't fit.
-        *   **One Angle Per Clip:** Each clip is built around a single thread, character, or tonal angle from the pre-step map. Do not try to summarize the whole show inside one clip — that's what the source already is.
-        *   **Tease, Don't Resolve:** End on a question, a cliffhanger, an unresolved beat, or a signature recurring moment. Never include the climax, twist payoff, or resolution. If a scene reveals an outcome, it is a spoiler — exclude it.
-        *   **Show-Identity Cues (when available):** Title cards, recurring motifs, signature locations, and character intro shots strengthen a promo. Include them when they fit the angle.
-        *   **Internal Coherence:** Within a single clip, scenes should flow logically (matching tone, sensible chronological feel) — but the clip as a whole must read as *separate* from any other variant. Two variants telling the same micro-story with different windowing is a failure.
-        *   **Target Duration (CRITICAL — must fall within {{expectedDurationRange}}):** Aim for ~{{desiredDuration}} seconds. Sum the per-scene durations explicitly. If over: drop the least-essential scene. If under: add a short scene that fits the angle. Failing the duration range scores 1.
-        *   **Use More Than One Scene, Never All Scenes.**
+    1.  **Role:** Senior promo editor for Chai Shots. You translate hooks into clips. You do not invent hooks.
+    2.  **Read the hook inventory below.** It contains:
+        *   `show_summary` — the show's premise.
+        *   `characters` — character ids and labels.
+        *   `dynamics_present` — which proven character dynamics are in this show.
+        *   `hooks` — the full inventory of hook candidates the strategist found.
+        *   `assignment` — the EXACT subset of hooks you must build variants for. One variant per row, in order.
 
-    5.  **Variant Diversity (Hard Constraint, Across the Set):**
-        *   **Unique Anchor Per Variant:** Every variant must occupy a different (thread, character, tone) cell from the pre-step map. Two variants whose anchors overlap on all three axes is a critical failure.
-        *   **No Centre-of-Gravity Overlap:** If two variants would both be "centered" on the same beat or scene cluster, regenerate one of them around a different angle.
-        *   **Coverage First, Tonal Re-Cuts Second:** If the user requests N variants and the show has T distinct threads:
-            *   When N ≤ T: assign each variant a different thread (further differentiated by character/tone where possible).
-            *   When N > T: cover all T threads first (one variant per thread), then create tonal re-cuts of the most promotable threads — same thread, different lead character or different tonal mode (e.g., an "action cut" of the mystery thread vs. an "emotional cut" of the same thread). Tonal re-cuts must use largely *non-overlapping scenes* from each other.
-        *   **Diverse Openers:** No two variants may open on the same scene number.
+    3.  **For each row of the assignment table, construct one variant:**
+        *   **Hook scene is fixed.** The first segment of the variant MUST be the assigned hook's `scene`.
+        *   **Setup (optional, 0-2 scenes):** Use the assigned hook's `suggested_setup_scenes` as a primary hint. You may swap one out for a different setup scene if it serves the angle better, but no more than 2 setup scenes total. If the hook is strongest as a cold-open, use 0 setup scenes — drop the viewer mid-action. Setup scenes must come BEFORE the hook scene in the variant's segment list.
+            * IMPORTANT EXCEPTION: when the hook is a `cold_open` style mid-conflict beat (`conflict_fight` with `open_loop_potential = high`), prefer 0 setup scenes — the strategist's data shows mid-argument cold-opens are among the highest converters.
+        *   **Conflict body (1-4 scenes):** Scenes that escalate the hook into a deeper conflict, planting stakes and emotional investment. These come after the hook scene.
+        *   **Cliffhanger close (1-2 scenes):** Use the assigned hook's `suggested_cliffhanger_scenes` as a primary hint. The final scene must NOT resolve the conflict — it must leave the viewer with an open loop. If a `suggested_cliffhanger_scene` actually resolves the conflict, swap it for a different non-resolving scene.
+        *   **Total segments:** Aim for 4-8 scenes per variant. More is fine if duration permits.
+    4.  **Tonal re-cut handling:** If the assignment table contains the SAME hook scene more than once (because the user requested more variants than there were distinct hooks), each repetition is a *tonal re-cut*: same hook scene, but you must use a *different emotional framing*, a *different character POV* where possible, and *largely non-overlapping setup/cliffhanger scenes*. Tonal re-cuts must NOT share the same supporting scene cluster as their sibling — that's the entire point.
 
-    **Phase 2: Expert Critique (Rigorous Evaluation and Recommendations), Scoring and Justification (Detailed Analysis)**
+    5.  **User directive (light bias only):** {{userPrompt}}
+        *   This is a soft bias. The hook inventory is locked; do not override it because of the directive.
+        *   If the directive is empty, ignore it.
+        *   If the directive is an *exclusion* ("avoid scenes with character X"), drop the offending scenes from supporting/cliffhanger picks but keep the assigned hook scene.
 
-    The criteria block below scores the **promo clip itself as an ad for the show** — not the show. When the rubric refers to "the brand," "the product," or "the ad," interpret it as "the show being promoted" and "this promo clip." A strong cold-open hook satisfies "Impactful Opening"; a clear "watch now"-style tease or the show's title/identity satisfies branding and direction criteria.
+    **Phase 2: Critique (Scoring and Justification)**
+
+    Score each constructed variant against the rubric below. Interpret the rubric in show-promo terms — see the rubric's own role definition.
 
     {{generationEvalPromptPart}}
 
     **CRITICAL: ALL evaluation text (reasoning, angle, ABCD analysis) MUST be written in English, regardless of the video language ({{videoLanguage}}). Only the title may be in {{videoLanguage}}.**
 
-    **Constraints (Strictly Enforce):**
-        *   Each combination must include *more than one scene* but *never all scenes* from the original script.
-        *   Each combination *must* fall within the specified duration range: {{expectedDurationRange}}.
-        *   Every scene number used must exist in the original script. Generating a non-existent scene number is a critical failure.
-        *   No two combinations in the output set may share the same `angle`, and no two may share the same `hook_scene`.
-        *   No combination may contain a spoiler scene (climax reveal, twist payoff, finale resolution).
+    **Hard Constraints (any violation = critical failure for that variant):**
+        *   `hook_scene` MUST equal the assigned hook's `scene`.
+        *   `angle` MUST be `{hook_type} | {character_label} | {emotion}` from the assigned hook.
+        *   `segments[0]` MUST equal `hook_scene`.
+        *   First scene of each variant must be unique across the variant set, UNLESS the assignment table explicitly has duplicate hook scenes for tonal re-cuts.
+        *   No two variants may share the same `angle` string.
+        *   Every scene number used must exist in the original script.
+        *   Total duration must fall within {{expectedDurationRange}} seconds.
+        *   No spoiler scenes (climax reveal, twist payoff, resolution).
+
+    **Hook Inventory & Assignment Table:**
+{{hookInventory}}
 
     **Original Script:**
 {{videoScript}}
@@ -393,6 +419,130 @@ def calculate_expected_duration_range(desired: float) -> str:
     return f"{lo}-{hi}"
 
 
+_STRENGTH_RANK = {"high": 0, "medium": 1, "low": 2}
+
+# CPS prior from the Creative Intelligence Report (Sep 2025–Mar 2026).
+# Lower value = better historical CPS = preferred when diversity ties.
+# Custom (off-taxonomy) values get a neutral mid-rank — neither penalized
+# nor preferred. Off-taxonomy values are real and may be the next big thing,
+# but absent prior data we don't know.
+_HOOK_TYPE_CPS_RANK = {
+    "character_introduction": 0,  # ₹229 — cheapest
+    "romantic_tension": 1,        # ₹257
+    "conflict_fight": 2,           # ₹270
+    "question_curiosity": 3,       # ₹323
+    "shocking_reveal": 4,          # weakest
+}
+_EMOTION_CPS_RANK = {
+    "betrayal": 0,    # ₹218
+    "curiosity": 1,   # ₹261
+    "suspense": 2,    # ₹312
+    "sadness": 3,     # ₹410
+}
+_DYNAMIC_CPS_RANK = {
+    "love_triangle": 0,           # ₹246
+    "romantic_couple": 1,         # ₹295
+    "husband_wife_conflict": 2,   # ₹317
+}
+_NEUTRAL_RANK = 2  # given to off-taxonomy custom values
+
+
+def _cps_rank(rank_map: dict, value) -> int:
+    """Return CPS rank for a category value. Off-taxonomy / null values get a
+    neutral middling rank so they aren't auto-promoted or auto-penalized."""
+    if not value:
+        return _NEUTRAL_RANK
+    return rank_map.get(value, _NEUTRAL_RANK)
+
+
+def _hook_sort_key(h: dict, dynamic_seen: set, hook_type_seen: set, emotion_seen: set) -> tuple:
+    """Sort hooks for assignment.
+
+    Priority order (lower = better at every position):
+      1. Brings a new dynamic (vs. already-seen)
+      2. Brings a new hook_type
+      3. Brings a new emotion
+      4. open_loop_potential (high > medium > low) — cliffhanger-anchorable
+      5. strength (high > medium > low)
+      6. CPS prior on hook_type — cheapest converter wins ties
+      7. CPS prior on dynamic
+      8. CPS prior on emotion
+
+    The CPS prior tiebreaks ensure that when two hooks bring equal diversity
+    and equal model-judged strength, the historically better-performing
+    category wins. Off-taxonomy custom values get a neutral rank — neither
+    auto-promoted nor auto-penalized.
+    """
+    return (
+        0 if h.get("dynamic") and h["dynamic"] not in dynamic_seen else 1,
+        0 if h.get("hook_type") and h["hook_type"] not in hook_type_seen else 1,
+        0 if h.get("emotion") and h["emotion"] not in emotion_seen else 1,
+        _STRENGTH_RANK.get(h.get("open_loop_potential", "low"), 3),
+        _STRENGTH_RANK.get(h.get("strength", "low"), 3),
+        _cps_rank(_HOOK_TYPE_CPS_RANK, h.get("hook_type")),
+        _cps_rank(_DYNAMIC_CPS_RANK, h.get("dynamic")),
+        _cps_rank(_EMOTION_CPS_RANK, h.get("emotion")),
+    )
+
+
+def select_hooks_for_assignment(hooks: list[dict], n: int) -> list[dict]:
+    """Pick `n` hooks for assignment, prioritizing diversity across dynamic →
+    hook_type → emotion, then strength. If `n > len(hooks)`, pad by tonal re-cuts:
+    repeat the strongest hooks (the model is told to vary emotion/POV/scenes for repeats).
+    """
+    if not hooks:
+        return []
+    pool = list(hooks)
+    chosen: list[dict] = []
+    dynamic_seen: set[str] = set()
+    hook_type_seen: set[str] = set()
+    emotion_seen: set[str] = set()
+
+    while pool and len(chosen) < n:
+        pool.sort(key=lambda h: _hook_sort_key(h, dynamic_seen, hook_type_seen, emotion_seen))
+        pick = pool.pop(0)
+        chosen.append(pick)
+        if pick.get("dynamic"):
+            dynamic_seen.add(pick["dynamic"])
+        if pick.get("hook_type"):
+            hook_type_seen.add(pick["hook_type"])
+        if pick.get("emotion"):
+            emotion_seen.add(pick["emotion"])
+
+    # Tonal re-cut padding when N > T.
+    if len(chosen) < n:
+        # Sort original hooks by strength desc; reuse the strongest first.
+        ranked = sorted(
+            hooks,
+            key=lambda h: (
+                _STRENGTH_RANK.get(h.get("open_loop_potential", "low"), 3),
+                _STRENGTH_RANK.get(h.get("strength", "low"), 3),
+            ),
+        )
+        i = 0
+        while len(chosen) < n and ranked:
+            chosen.append(ranked[i % len(ranked)])
+            i += 1
+    return chosen
+
+
+def format_hook_inventory_block(inventory: dict, assignment: list[dict]) -> str:
+    """Render the Pass-1 inventory + assignment table into the text block that
+    will be substituted into Pass 2's {{hookInventory}} placeholder."""
+    import json as _json
+    return _json.dumps(
+        {
+            "show_summary": inventory.get("show_summary", ""),
+            "characters": inventory.get("characters", []),
+            "dynamics_present": inventory.get("dynamics_present", []),
+            "hooks": inventory.get("hooks", []),
+            "assignment": assignment,
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
 def assemble_prompt(
     *,
     prompt_option: str,
@@ -404,11 +554,15 @@ def assemble_prompt(
     expected_duration_range: str,
     video_language: str,
     num_variants: int,
+    hook_inventory_block: str = "",
 ) -> str:
-    """Build the full Gemini prompt.
+    """Build the Pass-2 (variant construction) Gemini prompt.
 
-    Mirrors ui/src/generation.ts:83-89 + the directive-resolution logic in
-    frontend/js/pages/job-detail.js getPromptTemplate().
+    Pass 1 (assemble_hook_inventory_prompt) emits a hook inventory which the
+    caller formats and threads in here as `hook_inventory_block`. When
+    `hook_inventory_block` is empty (Pass 1 fell back / failed), the SHOW_TRAILER
+    template will see an empty hook inventory section — the model is then in
+    legacy single-pass mode. This is intentional graceful degradation.
     """
     if prompt_option == "custom":
         directive = (custom_prompt or "").strip()
@@ -433,4 +587,115 @@ def assemble_prompt(
         .replace("{{videoLanguage}}", video_language)
         .replace("{{numVariants}}", str(num_variants))
         .replace("{{maxDuration}}", max_duration)
+        .replace("{{hookInventory}}", hook_inventory_block or "(none — operate in single-pass mode: pick your own hooks per the constraints above, ensuring every variant uses a unique hook scene and unique angle)")
+    )
+
+
+HOOK_INVENTORY_PROMPT = """**Role:** You are a senior creative strategist for Chai Shots OTT, a vertical-format Indian streaming platform. Your job is to scan a long-form show and extract every distinct hook moment that could anchor a high-performing promo clip.
+
+**Your knowledge base (real campaign data, do not deviate):**
+
+The following hook taxonomy is the **strong prior** — these are the patterns proven to convert across our top 100 ads. Default to these when the hook fits. Performance numbers are from real Meta ad campaigns Sep 2025–Mar 2026 (₹ = INR cost per subscription, lower = better):
+
+*   **romantic_tension** — 2647 subscriptions, ₹257 CPS. Highest absolute volume. Forbidden intimacy, charged glances, unrequited longing, jealousy, "almost-kiss" moments.
+*   **conflict_fight** — 1294 subscriptions, ₹270 CPS. Mid-argument cold-opens, physical confrontation, loud emotional escalation. Especially powerful when the conflict is domestic.
+*   **character_introduction** — 432 subscriptions, ₹229 CPS. **Cheapest converter.** A character revealed in a way that makes the viewer immediately want to know more — a defining gesture, a loaded entrance, a quiet moment of intensity.
+*   **question_curiosity** — 580 subscriptions, ₹323 CPS. A specific unanswered question planted in the viewer's mind ("what is on that phone?", "why is she hiding?"). Must be specific — vague mystery does not work.
+*   **shocking_reveal** — Weakest performer. Use only when the reveal is genuinely strong; usually outperformed by the four above.
+
+The following emotions are the **strong prior** for emotion tagging (real campaign data):
+*   **suspense** — 2342 subs, ₹312 CPS
+*   **curiosity** — 2301 subs, ₹261 CPS
+*   **betrayal** — 459 subs, ₹218 CPS (cheap; underused)
+*   **sadness** — 174 subs, ₹410 CPS (expensive; use sparingly)
+
+The following character dynamics are the **strong prior** for dynamic tagging (real campaign data):
+*   **love_triangle** — 1554 subs, ₹246 CPS
+*   **romantic_couple** — 1433 subs, ₹295 CPS
+*   **husband_wife_conflict** — 1298 subs, ₹317 CPS
+
+**Custom-category escape hatch (use sparingly):** This taxonomy is the prior, not a cage. Our data covers the patterns that converted in the *past* — a future hit could be a category we haven't seen. If a hook in this show genuinely doesn't fit any proven category, you MAY emit a custom value for `hook_type`, `emotion`, or `dynamic` — but ONLY if it is a real distinct category, not a synonym. Do NOT invent `argument` when `conflict_fight` fits. Do NOT invent `mystery` when `question_curiosity` fits. When you DO use a custom value, you must explain in the hook's `rationale` field exactly why none of the proven categories fit. **Default behavior: use the proven categories.** The escape hatch exists for genuinely novel hooks, not for variety's sake.
+
+**Universal narrative rule the report enforces:** Every winning ad follows **Setup → Conflict → Cliffhanger**. The ad establishes a premise, plants a high-stakes domestic/romantic conflict, and cuts BEFORE resolution. This "open loop" is what drives the subscription. Hooks you identify must therefore be ones that can anchor that structure — not climaxes, not resolutions.
+
+**Task:**
+
+You will be given a scene-by-scene script of a Chai Shots show. Produce a JSON inventory of:
+
+1.  A 1-sentence show summary (premise only, no spoilers).
+2.  The lead and supporting characters who have enough screen presence to anchor a promo clip. Give each a stable id (`C1`, `C2`, ...) and a short label.
+3.  Which of the proven character dynamics (`love_triangle`, `romantic_couple`, `husband_wife_conflict`) are present in the source. Only list ones that are genuinely there.
+4.  An exhaustive list of **distinct hook candidates** scattered across the runtime. Each hook is anchored on ONE specific scene number. Two hooks may NOT share the same scene number. Aim for as many *genuinely distinct* hooks as the show contains, with a soft floor of {{numVariants}} and a hard cap of 12. If the show truly has fewer than {{numVariants}} distinct hooks, return what's actually there — do not invent.
+
+**For each hook, you must commit to:**
+
+*   `id`: stable label `H1`, `H2`, ...
+*   `scene`: 1-indexed scene number from the source script. Must exist in the script.
+*   `hook_type`: prefer one of the 5 proven values above. Custom values allowed only when no proven category genuinely fits — see escape hatch.
+*   `emotion`: prefer one of the 4 proven values above. Custom values allowed only when no proven emotion fits — see escape hatch.
+*   `dynamic`: prefer one of the 3 proven values above. Use `null` if the hook scene does not center on any character dynamic (e.g., a solo character_introduction). Custom dynamic values allowed when no proven dynamic fits — see escape hatch.
+*   `character_ids`: array of character ids from the character list whose presence anchors this hook.
+*   `label`: 1-line plain-English description ("wife confronts husband at door over phone call", "young woman caught in stolen-glance moment with someone she shouldn't").
+*   `strength`: `"high"` | `"medium"` | `"low"`. High means this hook is genuinely scroll-stopping in the first 1.5 seconds. Be honest — do not inflate.
+*   `open_loop_potential`: `"high"` | `"medium"` | `"low"`. Can this anchor a Setup → Conflict → Cliffhanger structure? A scene that resolves a conflict has low open-loop potential. A scene that opens or escalates a conflict has high.
+*   `suggested_setup_scenes`: up to 2 scene numbers that would play BEFORE the hook to set it up. Empty array if cold-open is stronger.
+*   `suggested_cliffhanger_scenes`: up to 2 scene numbers that would close the clip on an unresolved beat. Must NOT include scenes that resolve the conflict.
+*   `rationale`: 1 sentence explaining why this hook works against the report's data — reference which winning pattern it matches.
+
+**CRITICAL constraints (any violation invalidates the inventory):**
+
+*   No hook may use a scene number that does not exist in the source script.
+*   No two hooks may share the same `scene` number.
+*   No hook may be a climax, twist payoff, or finale resolution — those are spoilers and have low open_loop_potential.
+*   `hook_type`, `emotion`, `dynamic` should be drawn from the proven taxonomies above whenever they fit. Custom values are allowed only when justified per the escape-hatch rule.
+*   Output ONLY the JSON object below. No markdown fences, no commentary, no preamble.
+
+**Output JSON shape:**
+
+```json
+{
+  "show_summary": "1-sentence premise.",
+  "characters": [
+    {"id": "C1", "label": "young wife", "scenes": [3, 4, 11, 12], "role": "lead"}
+  ],
+  "dynamics_present": ["husband_wife_conflict", "love_triangle"],
+  "hooks": [
+    {
+      "id": "H1",
+      "scene": 7,
+      "hook_type": "conflict_fight",
+      "emotion": "suspense",
+      "dynamic": "husband_wife_conflict",
+      "character_ids": ["C1", "C2"],
+      "label": "wife confronts husband at door about phone call",
+      "strength": "high",
+      "open_loop_potential": "high",
+      "suggested_setup_scenes": [3, 5],
+      "suggested_cliffhanger_scenes": [12],
+      "rationale": "Mid-argument cold-open with phone evidence — matches the 'Husband Betryal' pattern (452 subs, ₹266 CPS)."
+    }
+  ]
+}
+```
+
+**Source Script:**
+{{videoScript}}
+
+**Number of Variants Requested:** {{numVariants}}
+**Video Language:** {{videoLanguage}}
+"""
+
+
+def assemble_hook_inventory_prompt(
+    *,
+    segments_text: str,
+    num_variants: int,
+    video_language: str,
+) -> str:
+    """Build the Pass 1 prompt that asks Gemini to enumerate hook candidates."""
+    return (
+        HOOK_INVENTORY_PROMPT
+        .replace("{{videoScript}}", segments_text)
+        .replace("{{numVariants}}", str(num_variants))
+        .replace("{{videoLanguage}}", video_language)
     )

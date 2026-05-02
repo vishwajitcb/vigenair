@@ -65,7 +65,7 @@ class GenerationSettings(BaseModel):
     """Variant generation settings."""
     promptOption: str = "default"
     customPrompt: str = ""
-    targetDuration: float = 30.0
+    targetDuration: float = 60.0
     shortenVideo: bool = True
     businessObjective: Optional[str] = None
 
