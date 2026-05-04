@@ -31,6 +31,11 @@ from api.models.responses import RenderRequest, RenderResponse, RendersResponse
 from db.job_service import update_job_status_sync, update_job_error_sync
 from db.models import JobStatus, JobStage
 from db.mongodb import get_database
+from utils.variant_segments import (
+    DEFAULT_STRUCTURE,
+    VALID_STRUCTURES,
+    normalize_variant_segments,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -80,7 +85,41 @@ def _transform_variants_for_combiner(
         # Get segment IDs from variant
         segment_ids = variant.get("segments", [])
 
-        # Build av_segments with full data
+        # Apply the same dedupe + reorder pipeline used at variant-gen time.
+        # Idempotent — already-normalized variants come through unchanged.
+        # Covers old / manually-edited / userModified variants too.
+        structure = variant.get("structure")
+        if structure not in VALID_STRUCTURES:
+            if structure is not None:
+                logger.warning(
+                    f"RENDER_NORM_INVALID_STRUCTURE variant_id={variant.get('id')!r} "
+                    f"got={structure!r}, defaulting to {DEFAULT_STRUCTURE}"
+                )
+            structure = DEFAULT_STRUCTURE
+
+        hook_scene_raw = variant.get("hook_scene")
+        try:
+            hook_scene_int = int(hook_scene_raw) if hook_scene_raw is not None else None
+        except (TypeError, ValueError):
+            hook_scene_int = None
+
+        try:
+            ordered_ids, _true_dur, _norm_debug = normalize_variant_segments(
+                segment_ids=segment_ids,
+                segments_by_id=segments_by_id,
+                hook_scene=hook_scene_int,
+                structure=structure,
+                variant_label=f"render:{variant.get('title') or variant.get('id') or idx}",
+            )
+            segment_ids = ordered_ids
+        except Exception as norm_err:  # noqa: BLE001
+            logger.exception(
+                f"RENDER_NORM_FAIL variant_id={variant.get('id')!r} "
+                f"error={norm_err} — falling back to raw segment list"
+            )
+            # Leave segment_ids as-is; better to render imperfect than to fail.
+
+        # Build av_segments with full data (now in normalized order)
         av_segments = []
         for seg_id in segment_ids:
             seg_id_str = str(seg_id)

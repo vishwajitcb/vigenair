@@ -312,6 +312,7 @@ async function handleGenerateVariants() {
                 userModified: false,
                 angle: v.angle || null,
                 hook_scene: typeof v.hook_scene === 'number' ? v.hook_scene : null,
+                structure: v.structure || null,
             };
         });
 

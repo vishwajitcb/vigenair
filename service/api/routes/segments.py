@@ -34,6 +34,11 @@ from api.models.responses import (
     SplitSegmentResponse,
 )
 from config import variant_prompts
+from utils.variant_segments import (
+    DEFAULT_STRUCTURE,
+    VALID_STRUCTURES,
+    normalize_variant_segments,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -158,6 +163,13 @@ async def generate_variants(folder: str, request: GenerateVariantsRequest):
         segments_text = "\n".join(segment_descriptions)
         total_duration = sum(s.get("duration_s", 0) for s in eligible_segments)
 
+        # Build a lookup of {1-indexed-id-str: full segment dict} for the
+        # variant_segments normalizer. Matches the convention used in
+        # render.py:_transform_variants_for_combiner.
+        segments_by_id: dict[str, dict] = {}
+        for i, seg in enumerate(segments):
+            segments_by_id[str(i + 1)] = seg
+
         # Create variant generation prompt
         target_duration = request.target_duration or total_duration * 0.3
         num_variants = request.num_variants
@@ -281,31 +293,68 @@ async def generate_variants(folder: str, request: GenerateVariantsRequest):
 
         # Helper function to validate and filter variants
         def validate_variants(variants_list: list, max_duration: float) -> list:
-            """Filter variants by duration cap, then dedupe by angle and hook_scene."""
+            """Normalize segments (dedupe overlaps, reorder per structure),
+            filter by duration cap, then dedupe by angle and hook_scene."""
             duration_ok = []
             for v in variants_list:
-                seg_ids = v.get("segments", [])
-                actual_duration = calculate_variant_duration(seg_ids)
-                v["actual_duration"] = actual_duration
-                v["estimated_duration"] = actual_duration
+                raw_seg_ids = v.get("segments", [])
 
-                # Backfill hook_scene if Gemini omitted it: use first segment.
-                if not v.get("hook_scene") and seg_ids:
+                # Backfill hook_scene from first emitted segment if Gemini omitted it.
+                # Do this BEFORE normalization so we can pass the right hook to it.
+                if not v.get("hook_scene") and raw_seg_ids:
                     try:
-                        v["hook_scene"] = int(seg_ids[0])
+                        v["hook_scene"] = int(raw_seg_ids[0])
                     except (TypeError, ValueError):
                         v["hook_scene"] = None
 
-                if actual_duration <= max_duration:
+                # Resolve structure (default + validate).
+                structure = v.get("structure")
+                if structure not in VALID_STRUCTURES:
+                    if structure is not None:
+                        logger.warning(
+                            f"VARIANT_NORM_INVALID_STRUCTURE label={v.get('title')!r} "
+                            f"got={structure!r}, defaulting to {DEFAULT_STRUCTURE}"
+                        )
+                    structure = DEFAULT_STRUCTURE
+
+                # Normalize segments via shared utility.
+                try:
+                    ordered_ids, true_dur, _debug = normalize_variant_segments(
+                        segment_ids=raw_seg_ids,
+                        segments_by_id=segments_by_id,
+                        hook_scene=v.get("hook_scene"),
+                        structure=structure,
+                        variant_label=str(v.get("title", "?")),
+                    )
+                except Exception as norm_err:
+                    logger.exception(
+                        f"VARIANT_NORM_FAIL label={v.get('title')!r} error={norm_err}"
+                    )
+                    # Fall back: keep raw IDs as strings, compute duration the old way.
+                    ordered_ids = [str(s) for s in raw_seg_ids]
+                    true_dur = calculate_variant_duration(raw_seg_ids)
+
+                # Preserve original ID type (int) where Gemini emitted ints.
+                if raw_seg_ids and isinstance(raw_seg_ids[0], int):
+                    v["segments"] = [int(x) for x in ordered_ids]
+                else:
+                    v["segments"] = ordered_ids
+
+                v["structure"] = structure
+                v["actual_duration"] = true_dur
+                v["estimated_duration"] = true_dur
+
+                if true_dur <= max_duration:
                     duration_ok.append(v)
                     logger.info(
                         f"VARIANT_VALID: '{v.get('title')}' angle={v.get('angle')!r} "
-                        f"hook={v.get('hook_scene')} segs={seg_ids} dur={actual_duration:.1f}s"
+                        f"hook={v.get('hook_scene')} structure={structure} "
+                        f"segs={v['segments']} dur={true_dur:.1f}s"
                     )
                 else:
                     logger.warning(
-                        f"VARIANT_REJECTED: '{v.get('title')}' segs={seg_ids} "
-                        f"dur={actual_duration:.1f}s exceeds {max_duration:.1f}s"
+                        f"VARIANT_REJECTED: '{v.get('title')}' segs={v['segments']} "
+                        f"dur={true_dur:.1f}s exceeds {max_duration:.1f}s"
                     )
 
             seen_angles: set[str] = set()

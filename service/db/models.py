@@ -59,6 +59,7 @@ class Variant(BaseModel):
     userModified: bool = False
     angle: Optional[str] = None
     hook_scene: Optional[int] = None
+    structure: Optional[str] = None  # "chronological" | "cold_open_flashback"
 
 
 class GenerationSettings(BaseModel):
