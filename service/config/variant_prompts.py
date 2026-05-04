@@ -387,6 +387,7 @@ JSON_OUTPUT_DIRECTIVE = """
           "title": "Short title (2-4 words, may be in {{videoLanguage}})",
           "angle": "<thread> | <lead character> | <tone>",
           "hook_scene": 7,
+          "structure": "chronological",
           "segments": [7, 12, 18, 25],
           "description": "One sentence teaser, no spoilers.",
           "reasoning": "One paragraph in English: why this angle, what it teases, why it stands apart from the other variants.",
@@ -402,7 +403,10 @@ JSON_OUTPUT_DIRECTIVE = """
     *   `hook_scene`: must be the FIRST integer in `segments`. Must be the strongest available opener within this variant's chosen scenes (see Strong Hook Opening rule).
     *   `angle`: short label of form "<thread> | <character> | <tone>". MUST be unique across the variant set.
     *   `hook_scene`: MUST be unique across the variant set (no two variants open on the same scene).
-    *   `estimated_duration`: actual sum of selected segment durations in seconds.
+    *   `structure`: REQUIRED. Either `"chronological"` or `"cold_open_flashback"`. The backend will reorder `segments` according to this value, so you do NOT need to manually order setup-before/after the hook in the `segments` array — just pick the right structure label and list the scenes you want to include.
+        *   Use `"chronological"` when the hook is naturally early in the source's timeline and the story flows forward (Setup → Conflict → Cliffhanger reads in time order). Best for `character_introduction` hooks and early-act `romantic_tension` hooks.
+        *   Use `"cold_open_flashback"` when the hook is a mid-arc punch — drop the viewer into the action first, then flash back to setup that came earlier in the source's timeline, then continue forward. This is one of the highest-CPS Chai Shots structures. Best for `conflict_fight` mid-argument or `shocking_reveal` hooks.
+    *   `estimated_duration`: actual sum of selected segment durations in seconds. **Important:** the script may contain multiple segments representing the same moment with different cut boundaries (e.g. one for the visual cut, another for the dialogue cut covering nearly identical time ranges). The backend will dedupe overlapping time windows automatically — so the rendered video may be SHORTER than your raw sum if you pick overlapping segments. Pick non-overlapping coverage where possible.
     *   The total `estimated_duration` MUST fall within {{expectedDurationRange}} seconds.
     *   Do NOT select segments that would push the total above {{maxDuration}} seconds.
     *   `score`: when an ABCD rubric is in use, this is the raw total points earned (per the rubric). When no rubric is in use, it is a 1-100 narrative-coherence score.
