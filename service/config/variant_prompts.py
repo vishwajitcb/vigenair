@@ -620,7 +620,7 @@ The following character dynamics are the **strong prior** for dynamic tagging (r
 
 **Custom-category escape hatch (use sparingly):** This taxonomy is the prior, not a cage. Our data covers the patterns that converted in the *past* — a future hit could be a category we haven't seen. If a hook in this show genuinely doesn't fit any proven category, you MAY emit a custom value for `hook_type`, `emotion`, or `dynamic` — but ONLY if it is a real distinct category, not a synonym. Do NOT invent `argument` when `conflict_fight` fits. Do NOT invent `mystery` when `question_curiosity` fits. When you DO use a custom value, you must explain in the hook's `rationale` field exactly why none of the proven categories fit. **Default behavior: use the proven categories.** The escape hatch exists for genuinely novel hooks, not for variety's sake.
 
-**Universal narrative rule the report enforces:** Every winning ad follows **Setup → Conflict → Cliffhanger**. The ad establishes a premise, plants a high-stakes domestic/romantic conflict, and cuts BEFORE resolution. This "open loop" is what drives the subscription. Hooks you identify must therefore be ones that can anchor that structure — not climaxes, not resolutions.
+**Universal narrative rule the report enforces:** Every winning ad follows the **Hook → Story → Cliffhanger** shape. The clip OPENS on a scroll-stopping hook (frame 0 — no establishing shot, no setup, no orientation), spends the middle escalating the dramatic question the hook plants, and CUTS before any resolution. This "open loop" is what drives the subscription. Hooks you identify must therefore be ones that **work as a cold open in the first 1.5 seconds without prior context** — they cannot depend on setup that hasn't been seen yet. Climaxes, resolutions, slow-burn establishing scenes, and scenes that need exposition first are NOT hooks.
 
 **Task:**
 
@@ -640,9 +640,11 @@ You will be given a scene-by-scene script of a Chai Shots show. Produce a JSON i
 *   `dynamic`: prefer one of the 3 proven values above. Use `null` if the hook scene does not center on any character dynamic (e.g., a solo character_introduction). Custom dynamic values allowed when no proven dynamic fits — see escape hatch.
 *   `character_ids`: array of character ids from the character list whose presence anchors this hook.
 *   `label`: 1-line plain-English description ("wife confronts husband at door over phone call", "young woman caught in stolen-glance moment with someone she shouldn't").
-*   `strength`: `"high"` | `"medium"` | `"low"`. High means this hook is genuinely scroll-stopping in the first 1.5 seconds. Be honest — do not inflate.
-*   `open_loop_potential`: `"high"` | `"medium"` | `"low"`. Can this anchor a Setup → Conflict → Cliffhanger structure? A scene that resolves a conflict has low open-loop potential. A scene that opens or escalates a conflict has high.
-*   `suggested_setup_scenes`: up to 2 scene numbers that would play BEFORE the hook to set it up. Empty array if cold-open is stronger.
+*   `strength`: `"high"` | `"medium"` | `"low"`. **Be ruthless. Most scenes are LOW. Inflating strength produces weak ads.**
+    *   **High** means: a viewer scrolling a vertical feed would stop within 1.5 seconds because of a face, a charged emotion, a sharp action beat, or a pointed line of dialogue. The scene PUNCHES — it doesn't build to a punch.
+    *   **Medium** means: works as a hook but only after a half-second of acclimation. Decent but not a thumb-stopper.
+    *   **Low** means: it's a meaningful scene but not a cold-open punch. Most scenes are here. Recognize it.
+*   `open_loop_potential`: `"high"` | `"medium"` | `"low"`. Can this hook anchor a Hook → Story → Cliffhanger build? A scene that resolves or cools a conflict has low. A scene that opens or escalates a conflict has high. A solo character_introduction has medium — it intrigues but doesn't escalate by itself.
 *   `suggested_cliffhanger_scenes`: up to 2 scene numbers that would close the clip on an unresolved beat. Must NOT include scenes that resolve the conflict.
 *   `rationale`: 1 sentence explaining why this hook works against the report's data — reference which winning pattern it matches.
 
@@ -674,9 +676,8 @@ You will be given a scene-by-scene script of a Chai Shots show. Produce a JSON i
       "label": "wife confronts husband at door about phone call",
       "strength": "high",
       "open_loop_potential": "high",
-      "suggested_setup_scenes": [3, 5],
       "suggested_cliffhanger_scenes": [12],
-      "rationale": "Mid-argument cold-open with phone evidence — matches the 'Husband Betryal' pattern (452 subs, ₹266 CPS)."
+      "rationale": "Mid-argument cold-open with phone evidence — matches the 'Husband Betrayal' pattern (452 subs, ₹266 CPS)."
     }
   ]
 }

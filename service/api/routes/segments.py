@@ -22,6 +22,7 @@ import tempfile
 import time
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi.responses import JSONResponse
 
 import config as ConfigService
 import storage as StorageService
@@ -106,16 +107,28 @@ async def get_segments(folder: str):
         )
 
 
-@router.post("/{folder}/variants/generate", response_model=GenerateVariantsResponse)
-async def generate_variants(folder: str, request: GenerateVariantsRequest):
+@router.post("/{folder}/variants/generate")
+async def generate_variants(
+    folder: str,
+    request: GenerateVariantsRequest,
+    background_tasks: BackgroundTasks,
+):
     """Generate AI-powered variant suggestions.
+
+    Two response modes depending on USE_LANGGRAPH:
+      * Legacy (USE_LANGGRAPH=false): synchronous; returns
+        `GenerateVariantsResponse` with the variants in the body.
+      * LangGraph (USE_LANGGRAPH=true): kicks off the agent pipeline as a
+        FastAPI background task and returns 202 Accepted immediately with
+        `{"status": "generating", "folder": ...}`. The pipeline pushes
+        variants to MongoDB as they finish; the frontend polls
+        `/jobs/{folder}` and stops when `variantsGenerationStatus !=
+        "generating"`.
 
     Args:
         folder: The video folder name.
         request: GenerateVariantsRequest with prompt and settings.
-
-    Returns:
-        GenerateVariantsResponse with generated variants.
+        background_tasks: FastAPI dependency for scheduling the bg pipeline.
     """
     try:
         import config as ConfigService
@@ -183,6 +196,54 @@ async def generate_variants(folder: str, request: GenerateVariantsRequest):
 
         video_language = request.video_language or _load_video_language(folder)
         expected_range = variant_prompts.calculate_expected_duration_range(target_duration)
+        max_allowed_duration = target_duration * 1.5  # 50% overage allowed
+
+        # ---- LangGraph path (USE_LANGGRAPH=true) ----
+        # Schedule the agent pipeline as a background task and return 202.
+        # The pipeline pushes variants to MongoDB as each one finishes; the
+        # frontend polls /jobs/{folder} for live progress.
+        if ConfigService.USE_LANGGRAPH:
+            from agents.runner import run_variant_pipeline_background
+
+            logger.info(
+                f"VARIANT_GEN: scheduling LangGraph pipeline as background task "
+                f"(model={ConfigService.CONFIG_TEXT_MODEL})"
+            )
+            request_params = {
+                "prompt_option": prompt_option,
+                "custom_prompt": custom_prompt,
+                "business_objective": request.business_objective,
+                "shorten_video": request.shorten_video,
+            }
+            generation_settings = {
+                "promptOption": prompt_option,
+                "customPrompt": custom_prompt,
+                "targetDuration": float(target_duration),
+                "shortenVideo": bool(request.shorten_video),
+                "businessObjective": request.business_objective,
+            }
+            background_tasks.add_task(
+                run_variant_pipeline_background,
+                folder=folder,
+                request_params=request_params,
+                segments_text=segments_text,
+                segments_by_id=segments_by_id,
+                eligible_indices=eligible_indices,
+                num_variants=num_variants,
+                target_duration=target_duration,
+                expected_duration_range=expected_range,
+                max_allowed_duration=max_allowed_duration,
+                video_language=video_language,
+                generation_settings=generation_settings,
+            )
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "generating",
+                    "folder": folder,
+                    "message": "Variant generation started. Poll /jobs/{folder} for progress.",
+                },
+            )
 
         # ---- Pass 1: Hook & Angle Inventory ----
         # Only run for shortening mode. Aspect-ratio-only mode and crop-only
@@ -387,8 +448,8 @@ async def generate_variants(folder: str, request: GenerateVariantsRequest):
         retry_delay = 2  # seconds
         validated_variants = []
         last_error = None
-        # Allow 50% overage for flexibility, but not more
-        max_allowed_duration = target_duration * 1.5
+        # max_allowed_duration is computed earlier (top of handler) so both
+        # the LangGraph path and this legacy path use the same cap.
 
         for attempt in range(max_retries):
             try:

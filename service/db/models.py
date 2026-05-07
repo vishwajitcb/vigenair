@@ -33,6 +33,18 @@ class JobStage(str, Enum):
     RENDER_FINALIZING = "render_finalizing"
 
 
+class VariantsGenerationStatus(str, Enum):
+    """State of the variant-generation pipeline for a job.
+
+    Used by the LangGraph background worker so the frontend can poll the
+    job document instead of waiting on a long-lived HTTP request.
+    """
+    IDLE = "idle"               # never run, or explicitly cleared
+    GENERATING = "generating"   # pipeline in progress, variants[] grows live
+    COMPLETE = "complete"       # pipeline finished, all variants persisted
+    ERROR = "error"             # pipeline failed; see job.error
+
+
 class Segment(BaseModel):
     """Video segment model."""
     id: str
@@ -151,6 +163,9 @@ class Job(BaseModel):
     generationSettings: GenerationSettings = Field(default_factory=GenerationSettings)
     variants: List[Variant] = []
     selectedVariantIndex: int = 0
+    # Async-pipeline status. Frontend polls the job doc and stops when this
+    # is no longer "generating".
+    variantsGenerationStatus: VariantsGenerationStatus = VariantsGenerationStatus.IDLE
 
     # Rendering
     renderQueue: List[RenderQueueItem] = []

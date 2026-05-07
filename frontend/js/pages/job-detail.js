@@ -253,6 +253,20 @@ function renderVideoPlayer() {
 }
 
 
+// Variant-generation polling state. The backend pipeline runs as a
+// FastAPI background task (5-agent chain takes 5-10 minutes); we poll the
+// job document and render variants live as they land in MongoDB.
+let variantPollInterval = null;
+let variantPollSeenIds = new Set();
+
+function stopVariantPolling() {
+    if (variantPollInterval) {
+        clearInterval(variantPollInterval);
+        variantPollInterval = null;
+    }
+    variantPollSeenIds = new Set();
+}
+
 async function handleGenerateVariants() {
     const btn = $('#generateBtn');
     const originalText = btn.textContent;
@@ -269,6 +283,14 @@ async function handleGenerateVariants() {
 
         const prompt = promptOption === 'custom' ? customPrompt : getPromptTemplate(promptOption, shortenVideo);
 
+        // Reset local UI immediately — variants from a previous run are
+        // about to be cleared by mark_generation_started on the backend.
+        job.variants = [];
+        job.selectedVariantIndex = 0;
+        selectedVariantIndex = 0;
+        renderVariants();
+        $('#variantsSection').classList.remove('hidden');
+
         const response = await api.generateVariants(folder, {
             prompt,
             target_duration: targetDuration,
@@ -279,69 +301,121 @@ async function handleGenerateVariants() {
             shorten_video: shortenVideo,
         });
 
+        // ----- Async (LangGraph) path: status='generating' → poll -----
+        if (response && response.status === 'generating') {
+            startVariantPolling(numVariants, originalText);
+            return;
+        }
+
+        // ----- Legacy synchronous path: full variants in body -----
         if (response.error) {
             throw new Error(response.error);
         }
-
-        // Convert to our variant format
-        const variants = (response.variants || []).map((v, idx) => {
-            // Normalize score to a 0-5 star scale.
-            // Backend stamps `score_max` (17/16/18 for ABCD rubrics, 100 for narrative).
-            // Fall back to 100 for old responses that lacked the field.
-            const rawScore = typeof v.score === 'number' ? v.score : 3;
-            const scoreMax = typeof v.score_max === 'number' && v.score_max > 0 ? v.score_max : 100;
-            let normalizedScore;
-            if (rawScore <= 5 && scoreMax === 100) {
-                // Already on a 0-5 scale (legacy / fallback default).
-                normalizedScore = rawScore;
-            } else {
-                normalizedScore = Math.min(5, Math.max(0, (rawScore / scoreMax) * 5));
-            }
-            normalizedScore = Math.round(normalizedScore * 10) / 10;
-
-            const title = v.title || `Variant ${idx + 1}`;
-            const segments = (v.scenes || v.segments || []).map(s => String(s));
-            return {
-                id: hashVariantId(title, segments),
-                title,
-                description: v.description || '',
-                score: normalizedScore,
-                reasoning: v.reasoning || '',
-                segments,
-                duration: v.estimated_duration || targetDuration,
-                userModified: false,
-                angle: v.angle || null,
-                hook_scene: typeof v.hook_scene === 'number' ? v.hook_scene : null,
-                structure: v.structure || null,
-            };
-        });
-
-        // Save to MongoDB
+        const variants = (response.variants || []).map((v, idx) => convertAgentVariant(v, idx, targetDuration));
         await api.updateJobVariants(folder, variants, 0, {
-            promptOption,
-            customPrompt,
-            targetDuration,
-            shortenVideo,
-            businessObjective,
+            promptOption, customPrompt, targetDuration, shortenVideo, businessObjective,
         });
-
         job.variants = variants;
-        job.selectedVariantIndex = 0;
-        selectedVariantIndex = 0;
-
         renderVariants();
-        $('#variantsSection').classList.remove('hidden');
         $('#renderSection').classList.remove('hidden');
-
         showToast('Variants generated!', 'success');
+        btn.disabled = false;
+        btn.textContent = originalText;
 
     } catch (error) {
         showToast('Failed to generate variants', 'error');
         console.error(error);
-    } finally {
         btn.disabled = false;
         btn.textContent = originalText;
     }
+}
+
+// Convert an agent-shape variant to the storage shape the page renders.
+// Used only by the legacy sync path; the async path reads already-converted
+// variants from MongoDB (the backend does the conversion before persisting).
+function convertAgentVariant(v, idx, targetDuration) {
+    const rawScore = typeof v.score === 'number' ? v.score : 3;
+    const scoreMax = typeof v.score_max === 'number' && v.score_max > 0 ? v.score_max : 100;
+    let normalizedScore;
+    if (rawScore <= 5 && scoreMax === 100) {
+        normalizedScore = rawScore;
+    } else {
+        normalizedScore = Math.min(5, Math.max(0, (rawScore / scoreMax) * 5));
+    }
+    normalizedScore = Math.round(normalizedScore * 10) / 10;
+    const title = v.title || `Variant ${idx + 1}`;
+    const segments = (v.scenes || v.segments || []).map(s => String(s));
+    return {
+        id: hashVariantId(title, segments),
+        title,
+        description: v.description || '',
+        score: normalizedScore,
+        reasoning: v.reasoning || '',
+        segments,
+        duration: v.estimated_duration || targetDuration,
+        userModified: false,
+        angle: v.angle || null,
+        hook_scene: typeof v.hook_scene === 'number' ? v.hook_scene : null,
+        structure: v.structure || null,
+    };
+}
+
+// Poll /jobs/{folder} every 3s, render any new variants that landed,
+// and stop when variantsGenerationStatus is no longer 'generating'.
+function startVariantPolling(numVariantsRequested, btnOriginalText) {
+    stopVariantPolling();
+    const btn = $('#generateBtn');
+
+    const updateProgressLabel = (count) => {
+        btn.innerHTML = `<span class="animate-spin inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full mr-2"></span>Generating ${count}/${numVariantsRequested}...`;
+    };
+    updateProgressLabel(0);
+
+    variantPollInterval = setInterval(async () => {
+        try {
+            const data = await api.getJob(folder);
+            const j = data && data.job;
+            if (!j) return;
+
+            // Adopt server's view of variants. Append-only render — render
+            // ALL variants on each poll (idempotent), but show a toast on
+            // the first time we see a new id.
+            const serverVariants = Array.isArray(j.variants) ? j.variants : [];
+            for (const v of serverVariants) {
+                if (v && v.id && !variantPollSeenIds.has(v.id)) {
+                    variantPollSeenIds.add(v.id);
+                }
+            }
+            // Only re-render if the count or order changed to avoid flicker.
+            const localCount = (job.variants || []).length;
+            if (serverVariants.length !== localCount) {
+                job.variants = serverVariants;
+                renderVariants();
+            }
+            updateProgressLabel(serverVariants.length);
+
+            const status = j.variantsGenerationStatus;
+            if (status === 'complete') {
+                stopVariantPolling();
+                btn.disabled = false;
+                btn.textContent = btnOriginalText;
+                $('#renderSection').classList.remove('hidden');
+                if (serverVariants.length > 0) {
+                    showToast(`Generated ${serverVariants.length} variants!`, 'success');
+                } else {
+                    showToast('Generation finished but no variants survived. Check logs.', 'error');
+                }
+            } else if (status === 'error') {
+                stopVariantPolling();
+                btn.disabled = false;
+                btn.textContent = btnOriginalText;
+                showToast(j.error || 'Variant generation failed', 'error');
+            }
+        } catch (e) {
+            console.error('Polling error:', e);
+            // Don't stop polling on a single transient network error.
+        }
+    }, 3000);
 }
 
 function getPromptTemplate(option, shortenVideo = true) {

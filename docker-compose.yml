@@ -36,6 +36,9 @@ services:
       - CONFIG_MAX_UPLOAD_CONCURRENCY=${CONFIG_MAX_UPLOAD_CONCURRENCY:-6}
       - CONFIG_MAX_VARIANT_SEGMENT_DURATION=${CONFIG_MAX_VARIANT_SEGMENT_DURATION:-6}
 
+      # LangGraph variant-generation pipeline (set USE_LANGGRAPH=true in .env to enable)
+      - USE_LANGGRAPH=${USE_LANGGRAPH:-false}
+
       # CORS (adjust for production)
       - CORS_ORIGINS=${CORS_ORIGINS:-*}
 

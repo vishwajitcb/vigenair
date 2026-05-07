@@ -67,6 +67,11 @@ CONFIG_MAX_VARIANT_SEGMENT_DURATION = float(
 
 CONFIG_BACKEND_VERSION = os.environ.get('CONFIG_BACKEND_VERSION', 'v1')
 
+# Toggle the LangGraph agent-based variant-generation pipeline (vs. the
+# legacy 2-pass monolith in api/routes/segments.py:generate_variants).
+# Set USE_LANGGRAPH=true to route /variants/generate through service/agents/.
+USE_LANGGRAPH = os.environ.get('USE_LANGGRAPH', 'false').lower() == 'true'
+
 USER_AGENT_ID = f'cloud-solutions/mas-vigenair-backend-{CONFIG_BACKEND_VERSION}'
 
 # 10ms silence at the end of the fade out makes it "sound" better

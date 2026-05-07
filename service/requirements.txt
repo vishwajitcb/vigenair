@@ -24,6 +24,9 @@ google-cloud-storage>=2.14.0
 # Google GenAI SDK (Vertex AI)
 google-genai>=1.0.0
 
+# LangGraph (variant-generation pipeline orchestration)
+langgraph>=0.2.0
+
 # gRPC - pin versions together to avoid native code crashes
 grpcio>=1.60.0,<2.0.0
 grpcio-status>=1.60.0,<2.0.0
